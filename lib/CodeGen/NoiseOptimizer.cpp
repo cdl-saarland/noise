@@ -501,8 +501,6 @@ void NoiseOptimizer::PerformOptimization()
           count = atoi(args.str().c_str());
         }
 
-        // TODO: verify -> does not seem to unroll anything
-        //NoisePasses.add(new NoiseUnroller(count));
         NoisePasses.add(createIndVarSimplifyPass());
         NoisePasses.add(createLoopRotatePass());
         NoisePasses.add(createLoopUnrollPass(-1, count, false));
