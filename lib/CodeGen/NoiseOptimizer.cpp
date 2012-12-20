@@ -43,6 +43,7 @@
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
 
 #include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
 #include "llvm/DerivedTypes.h" // FunctionType
@@ -55,7 +56,27 @@ using namespace llvm;
 
 namespace llvm {
 
+// Collects all blocks between the block "block" and the end block "endBB"
+template<unsigned SetSize>
+void collectBlocks(BasicBlock* block,
+                   BasicBlock* endBB,
+                   SmallPtrSet<BasicBlock*, SetSize>& region)
+{
+  if (region.count(block)) return;
+  region.insert(block);
+
+  if (block == endBB) return;
+
+  TerminatorInst* terminator = block->getTerminator();
+  for (unsigned i=0, e=terminator->getNumSuccessors(); i<e; ++i)
+  {
+    collectBlocks<SetSize>(terminator->getSuccessor(i), endBB, region);
+  }
+}
+
 void initializeNoiseExtractorPass(PassRegistry&);
+void initializeNoiseInlinerPass(PassRegistry&);
+void initializeNoiseUnrollerPass(PassRegistry&);
 
 struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
@@ -163,36 +184,73 @@ struct NoiseExtractor : public FunctionPass {
     return true;
   }
 
-  template<unsigned SetSize>
-  void collectBlocks(BasicBlock* block,
-                     BasicBlock* endBB,
-                     SmallPtrSet<BasicBlock*, SetSize>& region)
-  {
-    if (region.count(block)) return;
-    region.insert(block);
-
-    if (block == endBB) return;
-
-    TerminatorInst* terminator = block->getTerminator();
-    for (unsigned i=0, e=terminator->getNumSuccessors(); i<e; ++i)
-    {
-      collectBlocks<SetSize>(terminator->getSuccessor(i), endBB, region);
-    }
-  }
-
   virtual void getAnalysisUsage(AnalysisUsage &AU) const {
     AU.addRequired<DominatorTree>();
   }
 };
 
+// This custom inlining pass is required since the built-in functionality
+// cannot inline functions which are in different modules
+struct NoiseInliner : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
+
+  explicit NoiseInliner()
+  : FunctionPass(ID) {
+    initializeNoiseInlinerPass(*PassRegistry::getPassRegistry());
+  }
+
+  virtual ~NoiseInliner()
+  { }
+
+  virtual bool runOnFunction(Function &F)
+  {
+    // Collect all blocks which belong to the function.
+    SmallPtrSet<BasicBlock*, 32> functionRegion;
+    collectBlocks<32>(&F.front(), &F.back(), functionRegion);
+    // Loop over the collected blocks and find all interesting call instructions
+    SmallVector<CallInst*, 32> calls;
+    for (SmallPtrSet<BasicBlock*, 32>::iterator it = functionRegion.begin(),
+         e = functionRegion.end(); it != e; ++it)
+    {
+      for(BasicBlock::iterator bit = (*it)->begin(), e = (*it)->end(); bit != e; ++bit)
+      {
+        if(!isa<CallInst>(*bit))
+          continue;
+        calls.push_back(&cast<CallInst>(*bit));
+      }
+    }
+    // inline each call
+    for(SmallVector<CallInst*, 32>::iterator it = calls.begin(),
+        e = calls.end(); it != e; ++it)
+    {
+      InlineFunctionInfo IFI;
+      InlineFunction(*it, IFI);
+    }
+
+    return true;
+  }
+
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+  }
+};
+
 char NoiseExtractor::ID = 0;
+char NoiseInliner::ID = 0;
 }
+
+// Pass declarations
 
 INITIALIZE_PASS_BEGIN(NoiseExtractor, "noise-extract",
                       "Extract code blocks into noise functions", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_END(NoiseExtractor, "noise-extract",
                     "Extract code blocks into noise functions", false, false)
+
+INITIALIZE_PASS_BEGIN(NoiseInliner, "noise-inline",
+                      "Forces inlining of calls", false, false)
+INITIALIZE_PASS_END(NoiseInliner, "noise-inline",
+                    "Forces inlining of calls", false, false)
 
 namespace llvm {
 namespace noise {
@@ -320,7 +378,7 @@ void NoiseOptimizer::PerformOptimization()
     assert (movedNoiseFn->getParent() == noiseFnMod);
 
     // Update NoiseFnInfo objects that have their mCall member point into
-    // the moved function and thus have to be updated to the new function.
+    // the moved function, and thus, have to be updated to the new function.
     // Otherwise, we can not inline the functions back in order.
     SmallVector<NoiseFnInfo*, 4> toBeUpdatedNFIs;
     for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
@@ -412,51 +470,52 @@ void NoiseOptimizer::PerformOptimization()
         opts.first.size() > 0;
         opts = opts.second.split(' '))
     {
+      // resolve current pass description
       const StringRef& pass = opts.first;
-      // Use the pass registry to resolve the pass.
-      const PassInfo* info = Registry->getPassInfo(pass);
-      if(!info)
+      // check for a custom noise "pass description"
+      if(pass.startswith("wfv"))
       {
-        // check for a custom noise "pass description"
-        if(pass.startswith("wfv"))
-        {
-          // Add preparatory passes for WFV.
-          NoisePasses.add(createLoopSimplifyPass());
-          NoisePasses.add(createLowerSwitchPass());
-          // Add induction variable simplification pass.
-          NoisePasses.add(createIndVarSimplifyPass());
-          // Add WFV pass wrapper.
-          //NoisePasses.add(createWFVRunnerPass());
+        // Add preparatory passes for WFV.
+        NoisePasses.add(createLoopSimplifyPass());
+        NoisePasses.add(createLowerSwitchPass());
+        // Add induction variable simplification pass.
+        NoisePasses.add(createIndVarSimplifyPass());
+        // Add WFV pass wrapper.
+        //NoisePasses.add(createWFVRunnerPass());
+      }
+      else if(pass.startswith("inline"))
+      {
+        // force inlining of function calls
+        NoisePasses.add(new NoiseInliner());
+      }
+      else if(pass.startswith("unroll"))
+      {
+        // loop unrolling requested
+        int count = -1;
+        // => check for additional arguments
+        int openParen = pass.find('(', 0);
+        int closeParen = pass.find(')', 0);
+        if(openParen < closeParen) {
+          // get the number of arguments
+          StringRef args = pass.substr(openParen + 1, closeParen - openParen);
+          count = atoi(args.str().c_str());
         }
-        else if(pass.startswith("inline"))
-        {
-          // inline function calls
-        }
-        else if(pass.startswith("unroll"))
-        {
-          // loop unrolling requested
-          int count = -1;
-          // => check for additional arguments
-          int openParen = pass.find('(', 0);
-          int closeParen = pass.find(')', 0);
-          if(openParen < closeParen) {
-            // get the number of arguments
-            StringRef args = pass.substr(openParen + 1, closeParen - openParen);
-            count = atoi(args.str().c_str());
-          }
 
-          // TODO: verify -> does not seem to unroll anything
-          NoisePasses.add(createLoopInstSimplifyPass());
-          NoisePasses.add(createLoopUnrollPass(-1, count));
-        }
-        else
+        // TODO: verify -> does not seem to unroll anything
+        //NoisePasses.add(new NoiseUnroller(count));
+        NoisePasses.add(createIndVarSimplifyPass());
+        NoisePasses.add(createLoopRotatePass());
+        NoisePasses.add(createLoopUnrollPass(-1, count, false));
+      }
+      else
+      {
+        // Use the pass registry to resolve the pass.
+        const PassInfo* info = Registry->getPassInfo(pass);
+        if(!info)
         {
           errs() << "ERROR: Pass not found: " << pass << "\n";
           continue;
         }
-      }
-      else
-      {
         // use the resolved LLVM pass
         NoisePasses.add(info->createPass());
       }
