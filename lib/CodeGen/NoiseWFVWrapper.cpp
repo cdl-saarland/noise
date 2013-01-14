@@ -420,15 +420,22 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
   newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
 
+  // Either we divide by the simdWidth OR we increment by it, not both :p.
+#if 0
   // Divide the RHO of the condition comparison by 'simdWidth'.
   // TODO: This should be done outside the loop (or pulled via LICM).
+  // TODO: Make sure we take the operand of the exit condition that
+  //       corresponds to the back edge.
   Value* rho = exitCond->getOperand(1);
+  // The types of indVarUpdate and rho may differ.
+  simdWidthConst = ConstantInt::get(rho->getType(), simdWidth, false);
   Instruction* newRHO = BinaryOperator::Create(Instruction::UDiv,
                                                rho,
                                                simdWidthConst,
                                                "wfv.cond.rho",
                                                exitCond);
   exitCond->setOperand(1, newRHO);
+#endif
 
   return bodyFn;
 }
