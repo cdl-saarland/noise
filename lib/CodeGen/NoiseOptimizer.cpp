@@ -83,13 +83,15 @@ struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
 
   noise::NoiseFnInfoVecType* noiseFnInfoVec;
-  SmallSet<Function*, 64> createdFunctions;
-  Module* Mod;
-  LLVMContext* Context;
-  DominatorTree* DT;
+  NamedMDNode*               MD;
+  SmallSet<Function*, 64>    createdFunctions;
+  Module*                    Mod;
+  LLVMContext*               Context;
+  DominatorTree*             DT;
 
-  explicit NoiseExtractor(noise::NoiseFnInfoVecType* noiseFuncInfoVec=0)
-  : FunctionPass(ID), noiseFnInfoVec(noiseFuncInfoVec) {
+  NoiseExtractor(noise::NoiseFnInfoVecType* noiseFuncInfoVec=0,
+                 NamedMDNode*               mdNode=0)
+  : FunctionPass(ID), noiseFnInfoVec(noiseFuncInfoVec), MD(mdNode) {
     initializeNoiseExtractorPass(*PassRegistry::getPassRegistry());
   }
 
@@ -99,6 +101,31 @@ struct NoiseExtractor : public FunctionPass {
   MDNode* getCompoundStmtNoiseMD(const BasicBlock& block)
   {
       return block.getTerminator()->getMetadata("noise_compound_stmt");
+  }
+
+  bool hasNoiseFunctionAttribute(const Function& function) const {
+    for (unsigned i=0, e=MD->getNumOperands(); i<e; ++i) {
+      MDNode* functionMDN = MD->getOperand(i);
+
+      // First operand is the function.
+      // Second operand is a special 'noise' string.
+      // Third operand is a string with the noise optimizations.
+      // TODO: Transform these into assertions if we know that all MDNodes
+      //       in the NamedMDNode are noise nodes.
+      if (functionMDN->getNumOperands() != 3) continue;
+      if (!isa<Function>(functionMDN->getOperand(0))) continue;
+      if (!isa<MDString>(functionMDN->getOperand(1))) continue;
+      if (!isa<MDString>(functionMDN->getOperand(2))) continue;
+
+      MDString* noiseString = cast<MDString>(functionMDN->getOperand(1));
+      if (!noiseString->getString().equals("noise")) continue;
+
+      Function* noiseFn = cast<Function>(functionMDN->getOperand(0));
+
+      if (noiseFn == &function) return true;
+    }
+
+    return false;
   }
 
   template<unsigned SetSize>
@@ -133,6 +160,7 @@ struct NoiseExtractor : public FunctionPass {
     SmallVector<BasicBlock*, SetSize> regionVec(region.begin(), region.end());
     CodeExtractor extractor(regionVec, DT, false);
     Function* extractedFn = extractor.extractCodeRegion();
+    extractedFn->setName(extractedFn->getName()+".extracted");
 
     // uncomment to see the extracted function
     // outs() << "extracted function: " << *extractedFn << "\n";
@@ -179,7 +207,8 @@ struct NoiseExtractor : public FunctionPass {
     for (SmallPtrSet<BasicBlock*, 32>::iterator it = functionRegion.begin(),
          e = functionRegion.end(); it != e; ++it)
     {
-      resolveMarkers(*it, visitedBlocks, true);
+      const bool isTopLevel = !hasNoiseFunctionAttribute(*(*it)->getParent());
+      resolveMarkers(*it, visitedBlocks, isTopLevel);
     }
 
     return true;
@@ -192,6 +221,7 @@ struct NoiseExtractor : public FunctionPass {
 
 // This custom inlining pass is required since the built-in functionality
 // cannot inline functions which are in different modules
+// TODO: This should not be necessary anymore.
 struct NoiseInliner : public FunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
@@ -260,6 +290,7 @@ namespace noise {
 
 NoiseOptimizer::NoiseOptimizer(llvm::Module *M)
   : Mod(M)
+  , NoiseMod(new Module("noiseMod", Mod->getContext()))
   , Registry(PassRegistry::getPassRegistry())
   , MD(Mod->getOrInsertModuleFlagsMetadata())
 { }
@@ -271,6 +302,7 @@ NoiseOptimizer::~NoiseOptimizer()
   {
     delete *it;
   }
+  delete NoiseMod;
 }
 
 struct NoisePassListener : public PassRegistrationListener {
@@ -294,7 +326,6 @@ struct NoisePassListener : public PassRegistrationListener {
 void NoiseOptimizer::PerformOptimization()
 {
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
-  LLVMContext& context = Mod->getContext();
 
   //outs() << "Module before std opts: " << *Mod;
 
@@ -317,19 +348,16 @@ void NoiseOptimizer::PerformOptimization()
   // These functions look exactly like functions with noise function attribute.
   {
     PassManager PM;
-    PM.add(new NoiseExtractor(&noiseFnInfoVec));
+    PM.add(new NoiseExtractor(&noiseFnInfoVec, MD));
     PM.run(*Mod);
   }
 
-  //outs() << "Module after noise extraction: " << *Mod;
-
-  // Move each function with noise attribute into its own module and
-  // store the requested passes string.
+  outs() << "Module after compound noise extraction: " << *Mod;
 
   // Get the corresponding noise attribute.
   // We cannot just iterate over the metadata since the order of the
   // functions is important (for nested attributes). We have to be able
-  // to iterate the modules in that same order.
+  // to iterate the extracted functions in that same order.
   for (unsigned i=0, e=MD->getNumOperands(); i<e; ++i) {
     MDNode* functionMDN = MD->getOperand(i);
 
@@ -356,7 +384,7 @@ void NoiseOptimizer::PerformOptimization()
       break;
     }
 
-    // If the function is inside noiseFnInfoVec, it was not extracted from code
+    // If the function is not inside noiseFnInfoVec, it was not extracted from code
     // but corresponds to a noise function attribute. In this case, there
     // is no NoiseFnInfo object yet.
     if (!nfi)
@@ -368,75 +396,40 @@ void NoiseOptimizer::PerformOptimization()
     nfi->mOptString = cast<MDString>(functionMDN->getOperand(2));
     assert (nfi->mOptString);
 
-    // Move the function to its own module so no optimization at
-    // all is done.
+    // Make sure that no other optimizations than the requested ones are
+    // executed on that function.
+    // To this end, we clone "top level" functions (all others are inlined
+    // after noise optimizations anyway) and delete the body of the original
+    // function.
+    // This way, there is no connection between the original code and the
+    // noise function, so the rest of the original code can still be optimized
+    // normally without affecting the noise part.
+    if (nfi->mReinline) continue;
+
     ValueToValueMapTy valueMap;
     Function* movedNoiseFn = CloneFunction(noiseFn, valueMap, false);
-
-    Module* noiseFnMod = new Module(noiseFn->getName(), context);
-
-    noiseFnMod->getFunctionList().push_back(movedNoiseFn);
-    assert (movedNoiseFn->getParent() == noiseFnMod);
+    movedNoiseFn->setName(noiseFn->getName()+".noise");
+    nfi->mMovedFn = movedNoiseFn;
+    Mod->getFunctionList().push_back(movedNoiseFn);
 
     // Update NoiseFnInfo objects that have their mCall member point into
     // the moved function, and thus, have to be updated to the new function.
     // Otherwise, we can not inline the functions back in order.
-    SmallVector<NoiseFnInfo*, 4> toBeUpdatedNFIs;
     for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
     {
       NoiseFnInfo* nfi = noiseFnInfoVec[i];
       if (!nfi->mCall) continue;
       if (nfi->mCall->getParent()->getParent() != noiseFn) continue;
-      toBeUpdatedNFIs.push_back(nfi);
       nfi->mCall = cast<CallInst>(valueMap[nfi->mCall]);
     }
 
     // Make the old function an external declaration so the rest of the
     // code is still valid and can be optimized.
     noiseFn->deleteBody();
-
-    // We have to create a dummy use to prevent deletion of the function
-    // during module pass optimization if it has no use in this module.
-    {
-      Function* dummyFn = Mod->getFunction("noise_dummy");
-      assert (!dummyFn);
-      FunctionType* fnTy = FunctionType::get(Type::getVoidTy(context), false);
-      dummyFn = Function::Create(fnTy,
-                                 GlobalValue::ExternalLinkage,
-                                 "dummy",
-                                 Mod);
-
-      BasicBlock* dummyBB = BasicBlock::Create(context,
-                                               "dummyBB",
-                                               dummyFn,
-                                               0);
-
-      SmallVector<Value*, 4> params;
-      for (Function::arg_iterator A=noiseFn->arg_begin(),
-           AE=noiseFn->arg_end(); A!=AE; ++A) {
-        Value* param = UndefValue::get(A->getType());
-        params.push_back(param);
-      }
-      CallInst::Create(noiseFn,
-                       ArrayRef<Value*>(params),
-                       noiseFn->getReturnType()->isVoidTy() ? "" : "dummyCall",
-                       dummyBB);
-
-      ReturnInst::Create(context, dummyBB);
-
-      nfi->mDummy = dummyFn;
-    }
-
-    nfi->mMovedFn = movedNoiseFn;
-
-    //outs() << "after deletion of body:" << *noiseFn << "\n";
-    //outs() << "cloned noise fn: " << *movedNoiseFn << "\n";
-    //outs() << "tmp module: " << *noiseFnMod << "\n";
-    //outs() << "old module: " << *TheModule << "\n";
   }
 
-  // Now optimize each function in its own module separately (execute the
-  // requested passes) and inline functions from nested noise attributes again.
+  // Now optimize each function separately (execute the requested passes) and
+  // inline functions from nested noise attributes again.
   // NOTE: We must not inline functions that were created from "top-level"
   //       noise attributes, since this code then would be optimized with all
   //       other optimizations again.
@@ -446,19 +439,20 @@ void NoiseOptimizer::PerformOptimization()
   for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
   {
     NoiseFnInfo* nfi   = noiseFnInfoVec[i];
-    Function* noiseFn  = nfi->mMovedFn;
-    Module*   noiseMod = noiseFn->getParent();
+    Function* noiseFn  = nfi->mReinline ? nfi->mOrigFn : nfi->mMovedFn;
     StringRef str      = nfi->mOptString->getString();
+
+    assert (!nfi->mReinline || !nfi->mMovedFn);
 
     // Display all available passes.
     //NoisePassListener list;
     //Registry->enumerateWith(&list);
     outs() << "Running noise optimizations on function '"
-      << noiseMod->getModuleIdentifier() << "': " << str << "\n";
+      << noiseFn->getName() << "': " << str << "\n";
 
     // Run requested noise passes.
-    PassManager NoisePasses;
-    NoisePasses.add(new DataLayout(noiseMod));
+    FunctionPassManager NoisePasses(Mod);
+    NoisePasses.add(new DataLayout(Mod));
 
     // Run CFG simplification upfront to remove the blocks we introduced
     // ourselves.
@@ -483,8 +477,8 @@ void NoiseOptimizer::PerformOptimization()
         NoisePasses.add(createIndVarSimplifyPass());
         // Add WFV pass wrapper.
         NoisePasses.add(new NoiseWFVWrapper());
-        // TODO: When moving functions from/to other modules,
-        //       we also have to move/copy called functions!
+        // TODO: Remove functions generated by WFV pass.
+        // TODO: Don't even link in cos_ps etc. if not necessary!
       }
       else if(pass.startswith("inline"))
       {
@@ -525,80 +519,102 @@ void NoiseOptimizer::PerformOptimization()
     }
 
     // Run the required passes
-    NoisePasses.run(*noiseMod);
+    NoisePasses.run(*noiseFn);
 
     // If this is a function that was created from a top-level noise attribute,
     // we are done.
     if (!nfi->mReinline) continue;
 
-    // Otherwise, reassemble and inline.
-    ReassembleExtractedFunction(nfi);
+    // If mCall is not set, this was a noise function attribute.
+    // Thus, we must not inline/remove anything.
+    if (!nfi->mCall) continue;
+
+    // We want to run some optimizations on the function after inlining,
+    // so we have to fetch it from the call before it is gone.
+    Function* parentFn = nfi->mCall->getParent()->getParent();
+
+    // Otherwise, inline the only call to this function.
+    InlineFunctionInfo IFI;
+    InlineFunction(nfi->mCall, IFI);
+
+    // Remove the now inlined noise function again.
+    assert (noiseFn->use_empty());
+    noiseFn->eraseFromParent();
+    nfi->mMovedFn = 0;
+
+    {
+      // Perform some standard optimizations after inlining.
+      FunctionPassManager PM(Mod);
+      PM.add(new DataLayout(Mod));
+      PM.add(createTypeBasedAliasAnalysisPass());
+      PM.add(createBasicAliasAnalysisPass());
+      PM.add(createCFGSimplificationPass());
+      PM.add(createScalarReplAggregatesPass());
+      PM.add(createEarlyCSEPass());
+      PM.run(*parentFn);
+    }
+
+    outs() << "module after reinlining: " << *Mod << "\n";
   }
-}
 
-// Copy back 'noise' functions into TheModule.
-void NoiseOptimizer::ReassembleExtractedFunction(NoiseFnInfo* nfi)
-{
-  Function* movedNoiseFn  = nfi->mMovedFn;
-  Module*   movedNoiseMod = nfi->mMovedFn->getParent();
-  assert (movedNoiseFn);
+  // At this point, all noise functions that were not "top level" are
+  // inlined and erased.
+  outs() << "module after passes: " << *Mod << "\n";
 
-  Function* decl = nfi->mOrigFn;
-  assert (decl);
-
-  assert (Mod == nfi->mOrigFn->getParent());
-
-  // Move function back to TheModule.
-  movedNoiseFn->removeFromParent();
-  Mod->getFunctionList().push_back(movedNoiseFn);
-  assert (movedNoiseFn->getParent() == Mod);
-
-  // Replace uses of declaration by function.
-  decl->replaceAllUsesWith(movedNoiseFn);
-
-  // Remove dummy function from TheModule.
-  assert (nfi->mDummy);
-  nfi->mDummy->eraseFromParent();
-  nfi->mDummy = 0;
-
-  // Make sure the function has the same name again.
-  movedNoiseFn->takeName(decl);
-
-  // Remove declaration from TheModule.
-  decl->eraseFromParent();
-
-  // We don't need the temporary module anymore.
-  delete movedNoiseMod;
-  nfi->mMovedFn = 0;
-
-  // If mCall is not set, this was a noise function attribute.
-  // Thus, we must not inline/remove anything.
-  if (!nfi->mCall) return;
-
-  // Otherwise, inline the only call to this function.
-  InlineFunctionInfo IFI;
-  InlineFunction(nfi->mCall, IFI);
-
-  // Remove the now inlined noise function again.
-  assert (movedNoiseFn->use_empty());
-  movedNoiseFn->eraseFromParent();
-
-  //outs() << "module after reinlining: " << *Mod << "\n";
-
+  // Finally, move all "top-level" noise functions into a different
+  // module and set calls to them to an external declaration. This is to
+  // prevent the standard optimizations etc. to run on noise functions.
+  // They are reassembled later.
+  for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
   {
-    // Perform some standard optimizations upfront.
-    // This is to prevent pointer aliasing in the extracted functions.
-    PassManager PM;
-    PM.add(new DataLayout(Mod));
-    PM.add(createTypeBasedAliasAnalysisPass());
-    PM.add(createBasicAliasAnalysisPass());
-    PM.add(createCFGSimplificationPass());
-    PM.add(createScalarReplAggregatesPass());
-    PM.add(createEarlyCSEPass());
-    PM.run(*Mod);
+    NoiseFnInfo* nfi      = noiseFnInfoVec[i];
+    Function*    noiseFn  = nfi->mMovedFn;
+
+    // If this is no top level function, continue.
+    if (!noiseFn) continue;
+
+    assert (!nfi->mReinline && "there should be no non-top level loop left!");
+
+    // Move function to noise module.
+    noiseFn->removeFromParent();
+    assert (!Mod->getFunction(noiseFn->getName()));
+    NoiseMod->getFunctionList().push_back(noiseFn);
+
+    // If this is a "function noise" function without use, the original
+    // function can be removed by the module optimizations.
+    // To ensure that we catch such cases, we have to do two things:
+    // - Set the original function to NULL.
+    // - Set the name of the moved noise function to the original name
+    //   so we don't lose track of it.
+    CallInst* call = nfi->mCall;
+    if (!call && nfi->mOrigFn->use_empty())
+    {
+      noiseFn->takeName(nfi->mOrigFn);
+      nfi->mOrigFn = 0;
+    }
+
+    // Update call to temporarily point to original function again
+    // (the external declaration that has not been moved).
+    // This is only valid for non-function noise.
+    if (call) call->setCalledFunction(nfi->mOrigFn);
   }
 
-  //outs() << "module after post inlining std opts: " << *Mod << "\n";
+  // If we have moved top-level functions that include calls to "compound
+  // noise" functions, we also have to move the declarations of those callees.
+  // The declarations in question are those that have a use in the NoiseMod.
+  for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
+  {
+    NoiseFnInfo* nfi      = noiseFnInfoVec[i];
+    Function*    noiseFn  = nfi->mMovedFn;
+
+    // If this is no top level function, continue.
+    if (!noiseFn) continue;
+
+
+  }
+
+  outs() << "module after outsourcing: " << *Mod << "\n";
+  outs() << "noise module after outsourcing: " << *NoiseMod << "\n";
 }
 
 void NoiseOptimizer::Reassemble()
@@ -609,7 +625,67 @@ void NoiseOptimizer::Reassemble()
     NoiseFnInfo* nfi = noiseFnInfoVec[i];
 
     if (nfi->mReinline) continue; // Has already been reassembled/inlined.
-    ReassembleExtractedFunction(nfi);
+
+    Function* movedNoiseFn = nfi->mMovedFn;
+    assert (movedNoiseFn);
+    assert (movedNoiseFn->getParent() == NoiseMod);
+
+    Function* decl = nfi->mOrigFn;
+
+    if (!decl)
+    {
+      // This is a "function noise" function without use, so it is likely that
+      // it got deleted during the "normal" optimization phase.
+      // NOTE: We have to make this query *before* moving the function!
+      decl = Mod->getFunction(movedNoiseFn->getName());
+    }
+
+    // Move function back to Mod.
+    movedNoiseFn->removeFromParent();
+    Mod->getFunctionList().push_back(movedNoiseFn);
+    assert (movedNoiseFn->getParent() == Mod);
+
+    // If the original function was indeed removed, skip everything else.
+    if (!decl) continue;
+
+    assert (Mod == nfi->mOrigFn->getParent());
+
+    // Replace uses of declaration by function.
+    decl->replaceAllUsesWith(movedNoiseFn);
+
+    // Make sure the function has the same name again.
+    movedNoiseFn->takeName(decl);
+
+    // Remove declaration from TheModule.
+    decl->eraseFromParent();
+
+    // If mCall is not set, this was a noise function attribute.
+    // Thus, we must not inline/remove anything.
+    if (!nfi->mCall) return;
+
+    // Otherwise, inline the only call to this function.
+    InlineFunctionInfo IFI;
+    InlineFunction(nfi->mCall, IFI);
+
+    // Remove the now inlined noise function again.
+    assert (movedNoiseFn->use_empty());
+    movedNoiseFn->eraseFromParent();
+
+    //outs() << "module after reinlining: " << *Mod << "\n";
+
+    {
+      // Perform some standard optimizations after inlining.
+      PassManager PM;
+      PM.add(new DataLayout(Mod));
+      PM.add(createTypeBasedAliasAnalysisPass());
+      PM.add(createBasicAliasAnalysisPass());
+      PM.add(createCFGSimplificationPass());
+      PM.add(createScalarReplAggregatesPass());
+      PM.add(createEarlyCSEPass());
+      PM.run(*Mod);
+    }
+
+    //outs() << "module after post inlining std opts: " << *Mod << "\n";
   }
 }
 

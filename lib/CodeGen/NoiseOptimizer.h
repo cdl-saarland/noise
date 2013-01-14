@@ -34,10 +34,9 @@ namespace noise {
     bool      mReinline;
     MDString* mOptString;
 
-    Function* mDummy;
-
     NoiseFnInfo(Function* origFn, CallInst* call=0, bool reinline=false)
-      : mOrigFn(origFn), mMovedFn(0), mCall(call), mReinline(reinline), mOptString(0), mDummy(0)
+      : mOrigFn(origFn), mMovedFn(0), mCall(call),
+      mReinline(reinline), mOptString(0)
     {}
   };
 
@@ -54,12 +53,11 @@ namespace noise {
 
   private:
     Module       *Mod;
+    Module       *NoiseMod;
     PassRegistry *Registry;
     NamedMDNode  *MD;
 
     NoiseFnInfoVecType noiseFnInfoVec;
-
-    void ReassembleExtractedFunction(NoiseFnInfo* nfi);
   };
 
 }  // end namespace noise
