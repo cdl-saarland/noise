@@ -1,4 +1,4 @@
-//===--- NoiseOptimizer.cpp - Noise Optimizations --------------------------===//
+//===--- NoiseWFVWrapper.cpp - Noise Optimizations ------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,9 +7,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The optimizer for noise functions
+// Noise vectorizer interface 
 //
 //===----------------------------------------------------------------------===//
+
+#ifdef COMPILE_NOISE_WFV_WRAPPER
 
 #include "NoiseWFVWrapper.h"
 
@@ -456,6 +458,8 @@ INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_END(NoiseWFVWrapper, "wfv-wrapper",
                     "wrapper pass around WFV library", false, false)
+
+#endif
 
 #if 0
 #include <dlfcn.h> // dlopen()
