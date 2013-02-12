@@ -17,4 +17,9 @@ LIBRARYNAME := clangCodeGen
 
 include $(CLANG_LEVEL)/Makefile
 
-CPP.Flags += -I$(WFV_INSTALL_DIR)/include
+
+ifeq ($(WFV_INSTALL_DIR),)
+# Do not set any special flags
+else
+CPP.Flags += -I$(WFV_INSTALL_DIR)/include -DCOMPILE_NOISE_WFV_WRAPPER
+endif
