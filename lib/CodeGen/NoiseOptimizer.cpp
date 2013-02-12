@@ -80,7 +80,7 @@ void collectBlocks(BasicBlock* block,
 
 void initializeNoiseExtractorPass(PassRegistry&);
 void initializeNoiseInlinerPass(PassRegistry&);
-void initializeNoiseUnrollerPass(PassRegistry&);
+void initializeNoiseSpecializerPass(PassRegistry&);
 
 struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
@@ -269,8 +269,41 @@ public:
   }
 };
 
+struct NoiseSpecializer : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
+
+  const StringRef            mVariable;
+  const SmallVector<int, 4>* mValues;
+
+  explicit NoiseSpecializer() : FunctionPass(ID), mVariable(""), mValues(0)
+  {
+    assert (false && "empty constructor must never be called!");
+    initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
+  }
+
+  NoiseSpecializer(StringRef&                 variable,
+                   const SmallVector<int, 4>& values)
+  : FunctionPass(ID), mVariable(variable), mValues(&values)
+  {
+    initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
+  }
+
+  virtual ~NoiseSpecializer()
+  { }
+
+  virtual bool runOnFunction(Function &F)
+  {
+    return false;
+  }
+
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+  }
+};
+
 char NoiseExtractor::ID = 0;
 char NoiseInliner::ID = 0;
+char NoiseSpecializer::ID = 0;
 }
 
 // Pass declarations
@@ -285,6 +318,11 @@ INITIALIZE_PASS_BEGIN(NoiseInliner, "noise-inline",
                       "Forces inlining of calls", false, false)
 INITIALIZE_PASS_END(NoiseInliner, "noise-inline",
                     "Forces inlining of calls", false, false)
+
+INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialize",
+                      "Specializes code for specific values of a variable", false, false)
+INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialize",
+                    "Specializes code for specific values of a variable", false, false)
 
 namespace llvm {
 namespace noise {
@@ -503,15 +541,80 @@ void NoiseOptimizer::PerformOptimization()
         // => check for additional arguments
         int openParen = pass.find('(', 0);
         int closeParen = pass.find(')', 0);
-        if(openParen < closeParen) {
+        if (closeParen - openParen == 1)
+        {
           // get the number of arguments
-          StringRef args = pass.substr(openParen + 1, closeParen - openParen);
-          count = atoi(args.str().c_str());
+          StringRef args = pass.substr(openParen + 1, closeParen - openParen - 1);
+          count = atoi(args.str().c_str()); // TODO: Use getAsInteger() (see below).
         }
 
-        NoisePasses.add(createIndVarSimplifyPass());
-        NoisePasses.add(createLoopRotatePass());
+        NoisePasses.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
+        NoisePasses.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
         NoisePasses.add(createLoopUnrollPass(-1, count, false));
+      }
+      else if (pass.startswith("specialize"))
+      {
+        // pass = "specialize (x = 1 2 3)"
+
+        // Check for additional arguments.
+        const size_t openParen = pass.find('(', 0);
+        const size_t closeParen = pass.find(')', 0);
+        if (openParen >= closeParen ||
+            openParen == pass.npos ||
+            closeParen == pass.npos)
+        {
+          errs() << "ERROR: 'specialize' requires additional parameters!\n";
+          continue;
+        }
+
+        // args = "x = 1 2 3"
+        StringRef args = pass.substr(openParen + 1, closeParen - openParen - 1);
+        assert (!args.empty());
+
+        // Get the variable to specialize.
+        std::pair<StringRef, StringRef> splitPair = args.split(" ");
+        if (splitPair.second.empty())
+        {
+          errs() << "ERROR: expected at least two arguments separated by a blank.\n";
+          continue;
+        }
+        // variable = "x", args = " = 1 2 3"
+        StringRef variable = splitPair.first;
+        args = splitPair.second;
+
+        // Strip optional " = "
+        const size_t eqPos = args.find('=', 0);
+        if (eqPos != args.npos)
+        {
+          // args = " 1 2 3"
+          args = args.substr(eqPos+1, args.npos);
+        }
+
+        // Get the values to specialize for.
+        SmallVector<StringRef, 4> valStrings;
+        args.split(valStrings, " ");
+        const unsigned numSpecializeVals = valStrings.size();
+
+        outs() << "  Values for specialization:";
+        SmallVector<int, 4> values;
+        for (unsigned i=0; i<numSpecializeVals; ++i)
+        {
+          int val;
+          const bool isInt = valStrings[i].getAsInteger(10, val);
+          if (!isInt)
+          {
+            errs() << "\nERROR: only integer arguments allowed after variable,"
+                << " found: " << valStrings[i] << "\n";
+            continue;
+          }
+          values.push_back(val);
+          outs() << " " << val;
+        }
+        outs() << "\n";
+
+        if (values.empty()) continue;
+
+        NoisePasses.add(new NoiseSpecializer(variable, values));
       }
       else
       {
