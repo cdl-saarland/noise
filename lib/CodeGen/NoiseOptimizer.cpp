@@ -368,24 +368,6 @@ void NoiseOptimizer::PerformOptimization()
 {
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
-  //outs() << "Module before std opts: " << *Mod;
-
-  // TODO: Remove. The user has explicit control over this now.
-  //       In case standard opts are desired, the NOISE() makro
-  //       includes these phases. RAWNOISE() doesn't.
-  {
-    // Perform some standard optimizations upfront.
-    // This is to prevent pointer aliasing in the extracted functions.
-    PassManager PM;
-    PM.add(new DataLayout(Mod));
-    PM.add(createTypeBasedAliasAnalysisPass());
-    PM.add(createBasicAliasAnalysisPass());
-    //PM.add(createCFGSimplificationPass()); // Removes noise attribute.
-    PM.add(createScalarReplAggregatesPass());
-    PM.add(createEarlyCSEPass());
-    PM.run(*Mod);
-  }
-
   //outs() << "Module before noise: " << *Mod;
 
   // Extract noise code regions from compound statements into separate functions.
