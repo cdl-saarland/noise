@@ -46,7 +46,7 @@ struct NoiseWFVWrapper : public FunctionPass {
   static const unsigned simdWidth = 4;
   static const bool use_avx = false;
   static const bool use_divergence_analysis = true;
-  static const bool verbose = true;
+  static const bool verbose = false;
 
   NoiseWFVWrapper();
   virtual ~NoiseWFVWrapper();

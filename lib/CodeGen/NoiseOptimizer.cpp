@@ -332,6 +332,9 @@ void NoiseOptimizer::PerformOptimization()
 
   //outs() << "Module before std opts: " << *Mod;
 
+  // TODO: Remove. The user has explicit control over this now.
+  //       In case standard opts are desired, the NOISE() makro
+  //       includes these phases. RAWNOISE() doesn't.
   {
     // Perform some standard optimizations upfront.
     // This is to prevent pointer aliasing in the extracted functions.
@@ -355,7 +358,7 @@ void NoiseOptimizer::PerformOptimization()
     PM.run(*Mod);
   }
 
-  outs() << "Module after compound noise extraction: " << *Mod;
+  //outs() << "Module after compound noise extraction: " << *Mod;
 
   // Get the corresponding noise attribute.
   // We cannot just iterate over the metadata since the order of the
@@ -485,6 +488,7 @@ void NoiseOptimizer::PerformOptimization()
         // TODO: Don't even link in cos_ps etc. if not necessary!
 #else
         outs() << "No support for WFV is available\n";
+        continue;
 #endif
       }
       else if(pass.startswith("inline"))
@@ -561,12 +565,12 @@ void NoiseOptimizer::PerformOptimization()
       PM.run(*parentFn);
     }
 
-    outs() << "module after reinlining: " << *Mod << "\n";
+    //outs() << "module after reinlining: " << *Mod << "\n";
   }
 
   // At this point, all noise functions that were not "top level" are
   // inlined and erased.
-  outs() << "module after passes: " << *Mod << "\n";
+  //outs() << "module after passes: " << *Mod << "\n";
 
   // Finally, move all "top-level" noise functions into a different
   // module and set calls to them to an external declaration. This is to
@@ -620,8 +624,8 @@ void NoiseOptimizer::PerformOptimization()
 
   }
 
-  outs() << "module after outsourcing: " << *Mod << "\n";
-  outs() << "noise module after outsourcing: " << *NoiseMod << "\n";
+  //outs() << "module after outsourcing: " << *Mod << "\n";
+  //outs() << "noise module after outsourcing: " << *NoiseMod << "\n";
 }
 
 void NoiseOptimizer::Reassemble()
@@ -682,6 +686,7 @@ void NoiseOptimizer::Reassemble()
 
     {
       // Perform some standard optimizations after inlining.
+      // TODO: This may disturb user experience.
       PassManager PM;
       PM.add(new DataLayout(Mod));
       PM.add(createTypeBasedAliasAnalysisPass());
