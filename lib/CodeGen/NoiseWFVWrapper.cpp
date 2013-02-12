@@ -165,11 +165,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // We must not vectorize the entire function but only the loop body.
   // Thus, we first have to extract the body into a new function.
   //-------------------------------------------------------------------------//
-  // TODO: Check if we can find the induction variable and exit condition.
-  //       The exit condition must be a comparison of integers so we can divide
-  //       the second operand by the simd width.
-  // TODO: Check if the loop body has no more than one header, exit, and back edge.
-  // TODO: Check if there are no dependences between loop iterations.
   // NOTE: We want to allow arbitrary optimizations before wfv, but at the
   //       same time rely on being able to extract those parts of the block
   //       that were the body (without induction variable increment, loop
@@ -187,16 +182,25 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   BasicBlock* preheaderBB = loop->getLoopPreheader();
   BasicBlock* headerBB    = loop->getHeader();
   BasicBlock* latchBB     = loop->getLoopLatch();
+  BasicBlock* exitBB      = loop->getUniqueExitBlock();
   assert (preheaderBB && headerBB && latchBB &&
           "vectorization of non-simplified loop not supported!");
+  assert (loop->isLoopSimplifyForm() &&
+          "vectorization of non-simplified loop not supported!");
+  assert (loop->isLCSSAForm(*mDomTree) &&
+          "vectorization of loops not in LCSSA form not supported!");
 
-  // TODO: These should return gracefully.
   assert (loop->getNumBackEdges() == 1 &&
           "vectorization of loops with multiple back edges not supported!");
-  SmallVector<BasicBlock*, 4> exitingBlocks;
-  loop->getExitingBlocks(exitingBlocks);
-  assert (exitingBlocks.size() == 1 &&
+  assert (exitBB &&
           "vectorization of loops with multiple exits not supported!");
+
+  // Make sure there are no values that are live across loop boundaries (LALB).
+  // This is because WFV only supports loops without loop-carried dependencies.
+  // NOTE: We rely on LCSSA here, which allows us to simply test if there is
+  //       a phi in the exit block. If so, there are dependencies.
+  assert (!isa<PHINode>(exitBB->begin()) &&
+          "vectorization of loops with loop-carried dependencies not supported!");
 
   // Do some sanity checks to test assumptions about our construction.
   assert (preheaderBB == &noiseFn->getEntryBlock());
@@ -320,7 +324,13 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // Run WFV.
   const bool vectorized = wfvInterface.run();
 
-  if (!vectorized) return false;
+  // TODO: verifyFunction() should not be necessary at some point ;).
+  if (!vectorized || llvm::verifyFunction(*simdFn, PrintMessageAction))
+  {
+    // We don't have to rollback anything, just delete the newly generated function.
+    simdFn->eraseFromParent();
+    return false;
+  }
 
   assert (mModule->getFunction(simdFnName));
   assert (simdFn == mModule->getFunction(simdFnName));
@@ -336,20 +346,39 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // -> Should only be the induction variable itself.
   // -> Already done in extractLoopBody.
 
-  // Replace the call to the extracted, scalar function by a call to the vector function.
-  CallInst* newLoopBodyFnCall = CallInst::Create(simdFn, newCallArgs, "", loopBodyCall);
-  loopBodyCall->eraseFromParent();
+  // To execute the vectorized code, we have to replace the body of the original function.
+  loopBodyFn->deleteBody();
 
-  // Inline the new call.
-  InlineFunctionInfo IFI;
-  InlineFunction(newLoopBodyFnCall, IFI);
+  ValueToValueMapTy valueMap;
+  Function::arg_iterator destI = loopBodyFn->arg_begin();
+  for (Function::const_arg_iterator I = simdFn->arg_begin(),
+          E = simdFn->arg_end(); I != E; ++I)
+  {
+      if (valueMap.count(I) == 0)          // Is this argument preserved?
+      {
+          destI->setName(I->getName()); // Copy the name over...
+          valueMap[I] = destI++;           // Add mapping to ValueMap
+      }
+  }
+  SmallVector<ReturnInst*, 10> returns;
+  ClonedCodeInfo               clonedFInfo;
+  const char*                  nameSuffix = ".";
+  CloneFunctionInto(loopBodyFn,
+                    simdFn,
+                    valueMap,
+                    false,
+                    returns,
+                    nameSuffix,
+                    &clonedFInfo);
+
+  assert (loopBodyFn);
+
+  // The generated function is not required anymore.
+  simdFn->eraseFromParent();
 
   return true;
 }
 
-// TODO: Make sure the loop is a trivial counting loop.
-// TODO: Make sure there is no LALB value.
-//       -> Do LCSSA and make sure there is no phi in any exit block.
 template<unsigned S>
 Function*
 NoiseWFVWrapper::extractLoopBody(Loop* loop,
@@ -391,6 +420,14 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   assert (indVarUpdate->getParent() == latchBB &&
           "expected induction variable update operation in latch block!");
 
+  // TODO: These should return gracefully.
+  // TODO: These should eventually be replaced by generation of fixup code.
+  assert (indVarUpdate->getOpcode() == Instruction::Add &&
+          "vectorization of loop with induction variable update operation that is no integer addition not supported!");
+  assert ((indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
+           indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
+          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
+
   // Get loop exit condition.
   assert (isa<BranchInst>(exitingBB->getTerminator()));
   BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
@@ -425,23 +462,6 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   indVarUpdate->moveBefore(newIndVarUpdate);
   indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
   newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
-
-  // Either we divide by the simdWidth OR we increment by it, not both :p.
-#if 0
-  // Divide the RHO of the condition comparison by 'simdWidth'.
-  // TODO: This should be done outside the loop (or pulled via LICM).
-  // TODO: Make sure we take the operand of the exit condition that
-  //       corresponds to the back edge.
-  Value* rho = exitCond->getOperand(1);
-  // The types of indVarUpdate and rho may differ.
-  simdWidthConst = ConstantInt::get(rho->getType(), simdWidth, false);
-  Instruction* newRHO = BinaryOperator::Create(Instruction::UDiv,
-                                               rho,
-                                               simdWidthConst,
-                                               "wfv.cond.rho",
-                                               exitCond);
-  exitCond->setOperand(1, newRHO);
-#endif
 
   return bodyFn;
 }
