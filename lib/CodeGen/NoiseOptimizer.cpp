@@ -507,10 +507,16 @@ void NoiseOptimizer::PerformOptimization()
     {
       // resolve current pass description
       const StringRef& pass = opts.first;
+
       // check for a custom noise "pass description"
       if(pass.startswith("wfv"))
       {
 #ifdef COMPILE_NOISE_WFV_WRAPPER
+        outs() << "Running pass: loop-simplify\n";
+        outs() << "Running pass: lowerswitch\n";
+        outs() << "Running pass: indvars\n";
+        outs() << "Running pass: lcssa\n";
+
         // Add preparatory passes for WFV.
         NoisePasses.add(createLoopSimplifyPass());
         NoisePasses.add(createLowerSwitchPass());
@@ -518,8 +524,68 @@ void NoiseOptimizer::PerformOptimization()
         NoisePasses.add(createIndVarSimplifyPass());
         // Convert to loop-closed SSA form to simplify applicability analysis.
         NoisePasses.add(createLCSSAPass());
+
+        // WFV may receive argument to specify vectorization width, whether to
+        // use AVX and whether to use the divergence analysis.
+        // TODO: If arguments are given, there must not be a space between them!
+        // "wfv-vectorize"          -> width 4, do not use avx, use divergence analysis (default)
+        // "wfv-vectorize (4,0,1)"  -> width 4, do not use avx, use divergence analysis (default)
+        // "wfv-vectorize (8,1,1)"  -> width 8, use avx, use divergence analysis
+        // "wfv-vectorize (8,1)"    -> width 8, use avx, use divergence analysis
+        // "wfv-vectorize (16,0,0)" -> width 16, do not use avx, do not use divergence analysis
+        unsigned   vectorizationWidth = 4;
+        bool       useAVX = false;
+        bool       useDivergenceAnalysis = true;
+        const bool verbose = false;
+
+        const size_t openParen = pass.find('(', 0);
+        const size_t closeParen = pass.find(')', 0);
+        if (closeParen > openParen)
+        {
+          StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
+
+          unsigned numArgs = 0;
+          for(std::pair<StringRef, StringRef> split = args.split(',');
+              split.first.size() > 0;
+              split = split.second.split(','), ++numArgs)
+          {
+            if (numArgs == 3)
+            {
+              errs() << "WARNING: WFV may only receive up to three parameters, "
+                << "ignoring additional ones!\n";
+              break;
+            }
+
+            // Get the current argument.
+            StringRef arg = split.first;
+            const size_t comma = arg.find(',', 0);
+            if (comma != arg.npos) arg = arg.substr(arg.find(',', 0));
+
+            unsigned val;
+            const bool error = arg.getAsInteger(10, val);
+            if (error)
+            {
+              errs() << "WARNING: only unsigned integer arguments allowed as "
+                << "WFV parameter "
+                << (numArgs == 0 ? "'vectorizationWidth'" :
+                    numArgs == 1 ? "'useAVX'" : "'useDivergenceAnalysis'")
+                << ", found: '" << arg << "'. Falling back "
+                << "to default ("
+                << (numArgs == 0 ? "4" : numArgs == 1 ? "false" : "true")
+                << ").\n";
+              continue;
+            }
+            if (numArgs == 0) vectorizationWidth = val;
+            else if (numArgs == 1) useAVX = val;
+            else if (numArgs == 2) useDivergenceAnalysis = val;
+          }
+        }
+
         // Add WFV pass wrapper.
-        NoisePasses.add(new NoiseWFVWrapper());
+        NoisePasses.add(new NoiseWFVWrapper(vectorizationWidth,
+                                            useAVX,
+                                            useDivergenceAnalysis,
+                                            verbose));
 #else
         outs() << "No support for WFV is available\n";
         continue;

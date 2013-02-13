@@ -43,12 +43,15 @@ struct NoiseWFVWrapper : public FunctionPass {
   DominatorTree* mDomTree;
   LoopInfo*      mLoopInfo;
 
-  static const unsigned simdWidth = 4;
-  static const bool use_avx = false;
-  static const bool use_divergence_analysis = true;
-  static const bool verbose = false;
+  unsigned mSIMDWidth;
+  bool mUseAVX;
+  bool mUseDivergenceAnalysis;
+  bool mVerbose;
 
-  NoiseWFVWrapper();
+  explicit NoiseWFVWrapper(const unsigned vectorizationWidth=4,
+                           const bool     useAVX=false,
+                           const bool     useDivergenceAnalysis=true,
+                           const bool     verbose=false);
   virtual ~NoiseWFVWrapper();
 
   Type* vectorizeSIMDType(Type* oldType, const unsigned simdWidth);

@@ -69,7 +69,16 @@ createNoiseWFVWrapperPass()
 #endif
 
 
-NoiseWFVWrapper::NoiseWFVWrapper() : FunctionPass(ID), mFinished(false)
+NoiseWFVWrapper::NoiseWFVWrapper(const unsigned vectorizationWidth,
+                                 const bool     useAVX,
+                                 const bool     useDivergenceAnalysis,
+                                 const bool     verbose)
+: FunctionPass(ID),
+  mFinished(false),
+  mSIMDWidth(vectorizationWidth),
+  mUseAVX(useAVX),
+  mUseDivergenceAnalysis(useDivergenceAnalysis),
+  mVerbose(verbose)
 {
   initializeNoiseWFVWrapperPass(*PassRegistry::getPassRegistry());
 }
@@ -271,10 +280,10 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                           &mModule->getContext(),
                                           loopBodyFn,
                                           simdFn,
-                                          simdWidth,
-                                          use_avx,
-                                          use_divergence_analysis,
-                                          verbose);
+                                          mSIMDWidth,
+                                          mUseAVX,
+                                          mUseDivergenceAnalysis,
+                                          mVerbose);
 
   // Add semantics to the induction variable vector.
   wfvInterface.addSIMDSemantics(*indVarArg, false, true, false, true, false, true);
@@ -411,7 +420,7 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
 
   // Now, adjust the original loop.
   // Increment by 'simdWidth' instead of 1.
-  Constant* simdWidthConst = ConstantInt::get(indVarUpdate->getType(), simdWidth, false);
+  Constant* simdWidthConst = ConstantInt::get(indVarUpdate->getType(), mSIMDWidth, false);
   Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
                                                         indVarUpdate,
                                                         simdWidthConst,
