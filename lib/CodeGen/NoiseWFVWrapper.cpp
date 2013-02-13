@@ -226,30 +226,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   CallInst* loopBodyCall = cast<CallInst>(*loopBodyFn->use_begin());
   assert (loopBodyCall->use_empty());
 
-  // Create a vector of the W induction variables that are executed in parallel.
-#if 0
-  Type* indVarVecType = vectorizeSIMDType(indVarPhi->getType(), simdWidth);
-  Value* indVarVec = UndefValue::get(indVarVecType);
-  Instruction* insertBefore = headerBB->getFirstNonPHI();
-  std::vector<Constant*> constants;
-  for (unsigned i=0; i<simdWidth; ++i)
-  {
-    ConstantInt* idxVal = ConstantInt::get(*mContext, APInt(32, i));
-    indVarVec = InsertElementInst::Create(indVarVec,
-                                          indVarPhi,
-                                          idxVal,
-                                          "",
-                                          insertBefore);
-    constants.push_back(idxVal);
-  }
-
-  indVarVec = BinaryOperator::Create(Instruction::Add,
-                                     indVarVec,
-                                     ConstantVector::get(constants),
-                                     "iv.vec",
-                                     insertBefore);
-#endif
-
   //-------------------------------------------------------------------------//
 
   // Create new function type.
@@ -267,23 +243,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     Type*  type    = loopBodyFnType->getParamType(i);
     assert (type == argOp->getType());
 
-#if 0
-    Type*  newType = type;
-    Value* newVal  = argOp;
-    if (argOp == indVarPhi)
-    {
-      assert (vectorizeSIMDType(type, simdWidth));
-      newType = vectorizeSIMDType(type, simdWidth);
-      newVal = indVarVec;
-      assert (!indVarArg && "there should be only one indunction variable!");
-      Function::arg_iterator A = loopBodyFn->arg_begin();
-      std::advance(A, i);
-      indVarArg = A;
-    }
-
-    newParamTypes.push_back(newType);
-    newCallArgs.push_back(newVal);
-#else
     newParamTypes.push_back(type);
     newCallArgs.push_back(argOp);
     if (argOp == indVarPhi)
@@ -292,7 +251,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
       std::advance(A, i);
       indVarArg = A;
     }
-#endif
   }
   assert (indVarArg);
   FunctionType* simdFnType = FunctionType::get(newReturnType, newParamTypes, false);
@@ -485,58 +443,3 @@ INITIALIZE_PASS_END(NoiseWFVWrapper, "wfv-wrapper",
 
 #endif
 
-#if 0
-#include <dlfcn.h> // dlopen()
-
-          void* wfvLibHandle;
-
-          wfvLibHandle = dlopen("libWFV.so", RTLD_LAZY);
-          if (!wfvLibHandle)
-          {
-            errs() << "ERROR: Could not load libWFV.so!\n";
-            continue;
-          }
-
-          typedef void* (*WFVInterfaceCnType)(Module*,
-                                              LLVMContext*,
-                                              Function*,
-                                              Function*,
-                                              unsigned,
-                                              bool,
-                                              bool,
-                                              bool);
-
-          // TODO: Remove ISO C++ pointer cast warning.
-          WFVInterfaceCnType wfvInterfaceCn = (WFVInterfaceCnType)dlsym(wfvLibHandle,
-                                                                        "WFVWFVInterface");
-          if (!wfvInterfaceCn)
-          {
-            errs() << "ERROR: Could not find symbol 'WFVWFVInterface': " << dlerror() << "!\n";
-            dlclose(wfvLibHandle);
-            continue;
-          }
-
-          void* wfvInterface = wfvInterfaceCn(noiseMod,
-                                              &noiseMod->getContext(),
-                                              noiseFn,
-                                              noiseFn,
-                                              4,
-                                              false,
-                                              false,
-                                              false);
-
-          
-
-          typedef void* (*WFVRunType)(void*);
-          WFVRunType wfvRun = (WFVRunType)dlsym(wfvLibHandle, "WFVRun");
-          if (!wfvRun)
-          {
-            errs() << "ERROR: Could not find symbol 'WFVRun': " << dlerror() << "!\n";
-            dlclose(wfvLibHandle);
-            continue;
-          }
-
-          wfvRun(wfvInterface);
-
-          dlclose(wfvLibHandle);
-#endif
