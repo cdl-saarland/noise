@@ -69,7 +69,7 @@ createNoiseWFVWrapperPass()
 #endif
 
 
-NoiseWFVWrapper::NoiseWFVWrapper() : FunctionPass(ID)
+NoiseWFVWrapper::NoiseWFVWrapper() : FunctionPass(ID), mFinished(false)
 {
   initializeNoiseWFVWrapperPass(*PassRegistry::getPassRegistry());
 }
