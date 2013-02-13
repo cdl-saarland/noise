@@ -343,6 +343,18 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // The generated function is not required anymore.
   simdFn->eraseFromParent();
 
+  // Finally, re-inline the loop body function into the noise function.
+  assert (loopBodyFn->getNumUses() == 1 &&
+          "There should be only one call to the extracted loop body function");
+  assert (isa<CallInst>(*loopBodyFn->use_begin()));
+  CallInst* call = cast<CallInst>(*loopBodyFn->use_begin());
+  InlineFunctionInfo IFI;
+  InlineFunction(call, IFI);
+
+  // Remove the now inlined loop body function again.
+  assert (loopBodyFn->use_empty());
+  loopBodyFn->eraseFromParent();
+
   return true;
 }
 
@@ -391,6 +403,9 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   // TODO: These should eventually be replaced by generation of fixup code.
   assert (indVarUpdate->getOpcode() == Instruction::Add &&
           "vectorization of loop with induction variable update operation that is no integer addition not supported!");
+  assert ((indVarUpdate->getOperand(0) == indVarPhi ||
+           indVarUpdate->getOperand(1) == indVarPhi) &&
+          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
   assert ((indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
            indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
           "vectorization of loop with induction variable update operation that is no simple increment not supported!");
@@ -422,7 +437,7 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   // Increment by 'simdWidth' instead of 1.
   Constant* simdWidthConst = ConstantInt::get(indVarUpdate->getType(), mSIMDWidth, false);
   Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
-                                                        indVarUpdate,
+                                                        indVarPhi,
                                                         simdWidthConst,
                                                         "wfv.inc",
                                                         indVarUpdate);

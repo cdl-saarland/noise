@@ -759,7 +759,7 @@ void NoiseOptimizer::PerformOptimization()
     // If this is no top level function, continue.
     if (!noiseFn) continue;
 
-    assert (!nfi->mReinline && "there should be no non-top level loop left!");
+    assert (!nfi->mReinline && "there should be no non-top level function left!");
 
     // Move function to noise module.
     noiseFn->removeFromParent();
@@ -796,7 +796,7 @@ void NoiseOptimizer::PerformOptimization()
     // If this is no top level function, continue.
     if (!noiseFn) continue;
 
-
+    // TODO: What is this?!
   }
 
   //outs() << "module after outsourcing: " << *Mod << "\n";
