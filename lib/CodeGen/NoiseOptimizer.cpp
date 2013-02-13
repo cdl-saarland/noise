@@ -601,14 +601,17 @@ void NoiseOptimizer::PerformOptimization()
         // loop unrolling requested
         int count = -1;
         // => check for additional arguments
-        int openParen = pass.find('(', 0);
-        int closeParen = pass.find(')', 0);
-        if (closeParen - openParen == 1)
+        const size_t openParen = pass.find('(', 0);
+        const size_t closeParen = pass.find(')', 0);
+        if (closeParen > openParen)
         {
           // get the number of arguments
-          StringRef args = pass.substr(openParen + 1, closeParen - openParen - 1);
+          StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
           count = atoi(args.str().c_str()); // TODO: Use getAsInteger() (see below).
         }
+
+        outs() << "Running pass: indvars\n";
+        outs() << "Running pass: loop-rotate\n";
 
         NoisePasses.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
         NoisePasses.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
@@ -616,7 +619,8 @@ void NoiseOptimizer::PerformOptimization()
       }
       else if (pass.startswith("specialize"))
       {
-        // pass = "specialize (x = 1 2 3)"
+        // pass = "specialize (x=1,2,3)"
+        // TODO: If arguments are given, there must not be a space between them!
 
         // Check for additional arguments.
         const size_t openParen = pass.find('(', 0);
@@ -629,50 +633,41 @@ void NoiseOptimizer::PerformOptimization()
           continue;
         }
 
-        // args = "x = 1 2 3"
-        StringRef args = pass.substr(openParen + 1, closeParen - openParen - 1);
+        // args = "x=1,2,3"
+        StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
         assert (!args.empty());
 
         // Get the variable to specialize.
-        std::pair<StringRef, StringRef> splitPair = args.split(" ");
+        std::pair<StringRef, StringRef> splitPair = args.split("=");
         if (splitPair.second.empty())
         {
           errs() << "ERROR: expected at least two arguments separated by a blank.\n";
           continue;
         }
-        // variable = "x", args = " = 1 2 3"
+        // variable = "x", args = "1,2,3"
         StringRef variable = splitPair.first;
         args = splitPair.second;
 
-        // Strip optional " = "
-        const size_t eqPos = args.find('=', 0);
-        if (eqPos != args.npos)
-        {
-          // args = " 1 2 3"
-          args = args.substr(eqPos+1, args.npos);
-        }
-
         // Get the values to specialize for.
-        SmallVector<StringRef, 4> valStrings;
-        args.split(valStrings, " ");
-        const unsigned numSpecializeVals = valStrings.size();
-
-        outs() << "  Values for specialization:";
         SmallVector<int, 4> values;
-        for (unsigned i=0; i<numSpecializeVals; ++i)
+        for(std::pair<StringRef, StringRef> split = args.split(',');
+                split.first.size() > 0;
+                split = split.second.split(','))
         {
+          StringRef& arg = split.first;
+          const size_t comma = arg.find(',', 0);
+          if (comma != arg.npos) arg = arg.substr(arg.find(',', 0));
+
           int val;
-          const bool isInt = valStrings[i].getAsInteger(10, val);
-          if (!isInt)
+          const bool error = arg.getAsInteger(10, val);
+          if (error)
           {
             errs() << "\nERROR: only integer arguments allowed after variable,"
-                << " found: " << valStrings[i] << "\n";
+              << " found: " << arg << "\n";
             continue;
           }
           values.push_back(val);
-          outs() << " " << val;
         }
-        outs() << "\n";
 
         if (values.empty()) continue;
 
