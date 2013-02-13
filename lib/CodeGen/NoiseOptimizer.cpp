@@ -370,6 +370,20 @@ void NoiseOptimizer::PerformOptimization()
 
   //outs() << "Module before noise: " << *Mod;
 
+  // Initialize all passes linked into all libraries (see InitializePasses.h).
+  // This way, they are registerd so we can add them via getPassInfo().
+  initializeCore(*PassRegistry::getPassRegistry());
+  initializeTransformUtils(*PassRegistry::getPassRegistry());
+  initializeScalarOpts(*PassRegistry::getPassRegistry());
+  initializeVectorization(*PassRegistry::getPassRegistry());
+  initializeInstCombine(*PassRegistry::getPassRegistry());
+  initializeIPO(*PassRegistry::getPassRegistry());
+  initializeInstrumentation(*PassRegistry::getPassRegistry());
+  initializeAnalysis(*PassRegistry::getPassRegistry());
+  initializeIPA(*PassRegistry::getPassRegistry());
+  initializeCodeGen(*PassRegistry::getPassRegistry());
+  initializeTarget(*PassRegistry::getPassRegistry());
+
   // Extract noise code regions from compound statements into separate functions.
   // These functions look exactly like functions with noise function attribute.
   {
