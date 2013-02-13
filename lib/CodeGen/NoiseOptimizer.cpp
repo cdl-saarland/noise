@@ -384,6 +384,21 @@ void NoiseOptimizer::PerformOptimization()
   initializeCodeGen(*PassRegistry::getPassRegistry());
   initializeTarget(*PassRegistry::getPassRegistry());
 
+  {
+    // Perform some standard optimizations upfront.
+    // NOTE: This should not interfere with the user-defined optimizations.
+    //       If we don't do this transformation to SSA here (before
+    //       extraction), later phases are unable to optimize the extracted
+    //       function because of aliasing problems (the generated function
+    //       will usually have lots of pointer parameters).
+    PassManager PM;
+    PM.add(new DataLayout(Mod));
+    PM.add(createTypeBasedAliasAnalysisPass());
+    PM.add(createBasicAliasAnalysisPass());
+    PM.add(createScalarReplAggregatesPass());
+    PM.run(*Mod);
+  }
+
   // Extract noise code regions from compound statements into separate functions.
   // These functions look exactly like functions with noise function attribute.
   {
