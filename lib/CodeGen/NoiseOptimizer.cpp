@@ -26,7 +26,6 @@
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/Verifier.h"
 #include "llvm/Analysis/LoopPass.h"
-#include "llvm/Analysis/Dominators.h"
 #include "llvm/Assembly/PrintModulePass.h"
 #include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
@@ -61,6 +60,7 @@ using namespace llvm;
 namespace llvm {
 
 // Collects all blocks between the block "block" and the end block "endBB"
+// TODO: There's functionality inside LLVM for this: llvm::Region
 template<unsigned SetSize>
 void collectBlocks(BasicBlock* block,
                    BasicBlock* endBB,
@@ -90,7 +90,6 @@ struct NoiseExtractor : public FunctionPass {
   SmallSet<Function*, 64>    createdFunctions;
   Module*                    Mod;
   LLVMContext*               Context;
-  DominatorTree*             DT;
 
   NoiseExtractor(noise::NoiseFnInfoVecType* noiseFuncInfoVec=0,
                  NamedMDNode*               mdNode=0)
@@ -132,41 +131,51 @@ struct NoiseExtractor : public FunctionPass {
   }
 
   template<unsigned SetSize>
-  void resolveMarkers(BasicBlock*                        block,
+  bool resolveMarkers(BasicBlock*                        block,
                       SmallPtrSet<BasicBlock*, SetSize>& visitedBlocks,
                       const bool                         isTopLevel)
   {
-    if (visitedBlocks.count(block)) return;
+    if (visitedBlocks.count(block)) return false;
     visitedBlocks.insert(block);
 
     MDNode* noiseMD = getCompoundStmtNoiseMD(*block);
-    if (!noiseMD) return;
+    if (!noiseMD) return false;
 
     // Handle compound statement attributes.
     assert (isa<BasicBlock>(noiseMD->getOperand(0)));
     assert (isa<BasicBlock>(noiseMD->getOperand(1)));
     assert (isa<MDString>(noiseMD->getOperand(2)));
 
-    // Create new function from the marked range.
+    // Recurse into nested noise regions (if any).
+    // To do so properly, we need to reconstruct the region after we
+    // extracted a noise region and then start iterating again.
     BasicBlock* entryBB = cast<BasicBlock>(noiseMD->getOperand(0));
     BasicBlock* exitBB  = cast<BasicBlock>(noiseMD->getOperand(1));
 
     SmallPtrSet<BasicBlock*, SetSize> region;
-    collectBlocks<SetSize>(entryBB, exitBB, region);
-
-    for (typename SmallPtrSet<BasicBlock*, SetSize>::iterator it=region.begin(),
-         E=region.end(); it!=E; ++it)
+    bool iterate = true;
+    while (iterate)
     {
-      resolveMarkers<SetSize>(*it, visitedBlocks, false);
+        iterate = false;
+        region.clear();
+        collectBlocks<SetSize>(entryBB, exitBB, region);
+
+        for (typename SmallPtrSet<BasicBlock*, SetSize>::iterator it=region.begin(),
+            E=region.end(); it!=E; ++it)
+        {
+            if (resolveMarkers<SetSize>(*it, visitedBlocks, false))
+            {
+                iterate = true;
+                break;
+            }
+        }
     }
 
+    // Create new function from the marked range.
     SmallVector<BasicBlock*, SetSize> regionVec(region.begin(), region.end());
-    CodeExtractor extractor(regionVec, DT, false);
+    CodeExtractor extractor(regionVec);
     Function* extractedFn = extractor.extractCodeRegion();
     extractedFn->setName(extractedFn->getName()+".extracted");
-
-    // uncomment to see the extracted function
-    // outs() << "extracted function: " << *extractedFn << "\n";
 
     // Create new NoiseFnInfo object.
     assert (extractedFn->getNumUses() == 1 &&
@@ -175,6 +184,9 @@ struct NoiseExtractor : public FunctionPass {
     CallInst* call = cast<CallInst>(*extractedFn->use_begin());
     noise::NoiseFnInfo* nfi = new noise::NoiseFnInfo(extractedFn, call, !isTopLevel);
     noiseFnInfoVec->push_back(nfi);
+
+    //outs() << "extracted function: " << *extractedFn << "\n";
+    //outs() << "source function: " << *call->getParent()->getParent() << "\n";
 
     // Create global (function) metadata for the new function from the statement attribute.
     assert(Mod);
@@ -187,6 +199,8 @@ struct NoiseExtractor : public FunctionPass {
     MDN->addOperand(llvm::MDNode::get(*Context, llvm::ArrayRef<llvm::Value*>(params)));
 
     createdFunctions.insert(extractedFn);
+
+    return true;
   }
 
   virtual bool runOnFunction(Function &F)
@@ -197,28 +211,34 @@ struct NoiseExtractor : public FunctionPass {
 
     Mod = F.getParent();
     Context = &F.getContext();
-    DT = &getAnalysis<DominatorTree>();
 
-    // Collect all blocks which belong to the function.
-    SmallPtrSet<BasicBlock*, 32> functionRegion;
-    collectBlocks<32>(&F.front(), &F.back(), functionRegion);
-
-    // Iterate over the blocks of the function and resolve all markers.
-    // We must not iterate over the function's blocks directly since we are
-    // modifying it on the fly.
+    // Test each block of the function for a noise marker and extract
+    // the corresponding region.
+    // We extract nested regions exactly in the order that we apply
+    // the optimizations and re-inlining later. Thus, we have to recurse
+    // *before* extracting a region.
+    // To do this properly, we need to reconstruct the region after we
+    // extracted a noise region and then start iterating again.
     SmallPtrSet<BasicBlock*, 32> visitedBlocks;
-    for (SmallPtrSet<BasicBlock*, 32>::iterator it = functionRegion.begin(),
-         e = functionRegion.end(); it != e; ++it)
+    bool iterate = true;
+    while (iterate)
     {
-      const bool isTopLevel = !hasNoiseFunctionAttribute(*(*it)->getParent());
-      resolveMarkers(*it, visitedBlocks, isTopLevel);
+      iterate = false;
+      for (Function::iterator BB = F.begin(), BBE=F.end(); BB!=BBE; ++BB)
+      {
+        const bool isTopLevel = !hasNoiseFunctionAttribute(*BB->getParent());
+        if (resolveMarkers(BB, visitedBlocks, isTopLevel))
+        {
+          iterate = true;
+          break;
+        }
+      }
     }
 
     return true;
   }
 
   virtual void getAnalysisUsage(AnalysisUsage &AU) const {
-    AU.addRequired<DominatorTree>();
   }
 };
 
@@ -310,7 +330,6 @@ char NoiseSpecializer::ID = 0;
 
 INITIALIZE_PASS_BEGIN(NoiseExtractor, "noise-extract",
                       "Extract code blocks into noise functions", false, false)
-INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_END(NoiseExtractor, "noise-extract",
                     "Extract code blocks into noise functions", false, false)
 
