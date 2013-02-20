@@ -653,7 +653,7 @@ void NoiseOptimizer::PerformOptimization()
       }
       else if (pass.startswith("specialize"))
       {
-        // pass = "specialize (x=1,2,3)"
+        // pass = "specialize(x=1,2,3)"
         // TODO: If arguments are given, there must not be a space between them!
 
         // Check for additional arguments.
@@ -749,6 +749,7 @@ void NoiseOptimizer::PerformOptimization()
 
     {
       // Perform some standard optimizations after inlining.
+      // TODO: This may disturb user experience.
       FunctionPassManager PM(Mod);
       PM.add(new DataLayout(Mod));
       PM.add(createTypeBasedAliasAnalysisPass());
