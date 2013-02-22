@@ -16,6 +16,7 @@
 #include "CGCXXABI.h"
 #include "CGDebugInfo.h"
 #include "CodeGenModule.h"
+#include "CGNoise.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
@@ -29,6 +30,7 @@
 #include "llvm/IR/Operator.h"
 using namespace clang;
 using namespace CodeGen;
+using namespace noise;
 
 CodeGenFunction::CodeGenFunction(CodeGenModule &cgm, bool suppressNewContext)
   : CodeGenTypeCache(cgm), CGM(cgm), Target(cgm.getTarget()),
@@ -61,6 +63,9 @@ CodeGenFunction::CodeGenFunction(CodeGenModule &cgm, bool suppressNewContext)
     FMF.setNoInfs();
   }
   Builder.SetFastMathFlags(FMF);
+
+  // create new noise code generator
+  NCG = new NoiseCodeGenerator(this);
 }
 
 CodeGenFunction::~CodeGenFunction() {
@@ -69,6 +74,8 @@ CodeGenFunction::~CodeGenFunction() {
   // something.
   if (FirstBlockInfo)
     destroyBlockInfos(FirstBlockInfo);
+  // destroy our noise code generator
+  delete NCG;
 }
 
 
@@ -480,6 +487,10 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
                                     const FunctionArgList &Args,
                                     SourceLocation StartLoc) {
   const Decl *D = GD.getDecl();
+
+  // register noise function for optimization pass
+  NCG->RegisterFunction(D, Fn, FnInfo, Args);
+  // TODO: check result of the computation and emit custom code
 
   DidCallStackSave = false;
   CurCodeDecl = D;

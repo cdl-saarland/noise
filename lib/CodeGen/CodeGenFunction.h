@@ -69,6 +69,10 @@ namespace clang {
   class ObjCAtSynchronizedStmt;
   class ObjCAutoreleasePoolStmt;
 
+namespace noise {
+  class NoiseCodeGenerator;
+}
+
 namespace CodeGen {
   class CodeGenTypes;
   class CGFunctionInfo;
@@ -1149,6 +1153,7 @@ public:
   llvm::Value *BuildBlockByrefAddress(llvm::Value *BaseAddr,
                                       const VarDecl *V);
 private:
+  noise::NoiseCodeGenerator *NCG;
   CGDebugInfo *DebugInfo;
   bool DisableDebugInfo;
 

@@ -23,6 +23,7 @@
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
+#include "clang/Basic/NoiseAttr.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/Lookup.h"
@@ -1741,6 +1742,11 @@ static void handleNoReturnAttr(Sema &S, Decl *D, const AttributeList &attr) {
   D->addAttr(::new (S.Context)
              NoReturnAttr(attr.getRange(), S.Context,
                           attr.getAttributeSpellingListIndex()));
+}
+
+static void handleNoiseAttr(Sema &S, Decl *D, const AttributeList &attr) {
+  if(Attr* a = noise::CreateNoiseAttr(S, attr))
+    D->addAttr(a);
 }
 
 bool Sema::CheckNoReturnAttr(const AttributeList &attr) {
@@ -4982,7 +4988,9 @@ static void ProcessInheritableDeclAttr(Sema &S, Scope *scope, Decl *D,
   case AttributeList::AT_TypeTagForDatatype:
     handleTypeTagForDatatypeAttr(S, D, Attr);
     break;
-
+  case AttributeList::AT_Noise:
+    handleNoiseAttr(S, D, Attr);
+    break;
   default:
     // Ask target about the attribute.
     const TargetAttributesSema &TargetAttrs = S.getTargetAttributesSema();

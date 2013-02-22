@@ -36,6 +36,10 @@
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/ObjCARC.h"
 #include "llvm/Transforms/Scalar.h"
+
+// noise includes
+#include "NoiseOptimizer.h"
+
 using namespace clang;
 using namespace llvm;
 
@@ -53,6 +57,7 @@ class EmitAssemblyHelper {
   mutable PassManager *CodeGenPasses;
   mutable PassManager *PerModulePasses;
   mutable FunctionPassManager *PerFunctionPasses;
+  noise::NoiseOptimizer Noiser;
 
 private:
   PassManager *getCodeGenPasses(TargetMachine *TM) const {
@@ -112,7 +117,8 @@ public:
                      Module *M)
     : Diags(_Diags), CodeGenOpts(CGOpts), TargetOpts(TOpts), LangOpts(LOpts),
       TheModule(M), CodeGenerationTime("Code Generation Time"),
-      CodeGenPasses(0), PerModulePasses(0), PerFunctionPasses(0) {}
+      CodeGenPasses(0), PerModulePasses(0), PerFunctionPasses(0),
+      Noiser(M) {}
 
   ~EmitAssemblyHelper() {
     delete CodeGenPasses;
@@ -553,6 +559,13 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
   // Before executing passes, print the final values of the LLVM options.
   cl::PrintOptionValues();
 
+  //
+  // Handle 'noise' functions.
+  //
+  Noiser.PerformOptimization();
+
+  // Now run normal optimizations on the non-noise part of TheModule.
+
   // Run passes. For now we do all passes at once, but eventually we
   // would like to have the option of streaming code generation.
 
@@ -571,6 +584,10 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
     PrettyStackTraceString CrashInfo("Per-module optimization passes");
     PerModulePasses->run(*TheModule);
   }
+
+  // Handle noise optimizations
+  Noiser.Reassemble();
+  Noiser.Finalize();
 
   if (CodeGenPasses) {
     PrettyStackTraceString CrashInfo("Code generation");

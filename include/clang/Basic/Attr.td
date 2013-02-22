@@ -494,6 +494,12 @@ def NonNull : InheritableAttr {
   } }];
 }
 
+def Noise : InheritableAttr {
+  let Spellings = [GNU<"noise">, CXX11<"","noise">];
+  let Subjects = [Function, CompoundStmt, ForStmt];
+  let Args = [StringArgument<"Opt">];
+}
+
 def NoReturn : InheritableAttr {
   let Spellings = [GNU<"noreturn">, CXX11<"gnu", "noreturn">];
   // FIXME: Does GCC allow this on the function instead?

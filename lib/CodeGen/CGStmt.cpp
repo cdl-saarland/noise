@@ -14,6 +14,7 @@
 #include "CodeGenFunction.h"
 #include "CGDebugInfo.h"
 #include "CodeGenModule.h"
+#include "CGNoise.h"
 #include "TargetInfo.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/PrettyStackTrace.h"
@@ -378,7 +379,10 @@ void CodeGenFunction::EmitLabelStmt(const LabelStmt &S) {
 }
 
 void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
-  EmitStmt(S.getSubStmt());
+  if (const NoiseAttr* noiseAttr = NCG->RegisterStmt(S))
+    NCG->EmitStmt(*noiseAttr, *S.getSubStmt());
+  else
+    EmitStmt(S.getSubStmt());
 }
 
 void CodeGenFunction::EmitGotoStmt(const GotoStmt &S) {
