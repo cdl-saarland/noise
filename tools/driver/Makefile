@@ -73,3 +73,15 @@ else
 TOOL_INFO_BUILD_VERSION := 
 endif
 endif
+
+# Things required for Noise/WFV.
+
+ifeq ($(WFV_INSTALL_DIR),)
+$(error WFV_INSTALL_DIR variable not set)
+endif
+
+LDFLAGS += -L$(WFV_INSTALL_DIR)/lib
+LIBS += -lWFV -lLLVM-3.2svn -pthread -ldl -lm
+
+# This links with the static libraries and thus does not require LLVM_SHARED_LIB_DIR, but it takes forever.
+#LIBS += -lWFV -lLLVMLinker -lLLVMArchive -lLLVMipo -lLLVMVectorize -lLLVMInstrumentation -lLLVMBitWriter -lLLVMBitReader -lLLVMAsmParser -lLLVMX86AsmParser -lLLVMX86Disassembler -lLLVMX86CodeGen -lLLVMSelectionDAG -lLLVMAsmPrinter -lLLVMMCParser -lLLVMCodeGen -lLLVMScalarOpts -lLLVMInstCombine -lLLVMTransformUtils -lLLVMipa -lLLVMAnalysis -lLLVMX86Desc -lLLVMX86Info -lLLVMTarget -lLLVMX86AsmPrinter -lLLVMMC -lLLVMObject -lLLVMX86Utils -lLLVMCore -lLLVMSupport   -lpthread -ldl -lm

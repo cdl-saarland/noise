@@ -51,6 +51,7 @@ add_clang_library(clangCodeGen
   MicrosoftCXXABI.cpp
   ModuleBuilder.cpp
   NoiseOptimizer.cpp
+  NoiseWFVWrapper.cpp
   TargetInfo.cpp
   )
 

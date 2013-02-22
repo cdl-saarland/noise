@@ -13,6 +13,7 @@
 
 #include "NoiseOptimizer.h"
 #include "CGNoise.h"
+#include "NoiseWFVWrapper.h"
 
 #include "llvm/Module.h"
 #include "llvm/Pass.h"
@@ -481,7 +482,9 @@ void NoiseOptimizer::PerformOptimization()
         // Add induction variable simplification pass.
         NoisePasses.add(createIndVarSimplifyPass());
         // Add WFV pass wrapper.
-        //NoisePasses.add(createWFVRunnerPass());
+        NoisePasses.add(new NoiseWFVWrapper());
+        // TODO: When moving functions from/to other modules,
+        //       we also have to move/copy called functions!
       }
       else if(pass.startswith("inline"))
       {

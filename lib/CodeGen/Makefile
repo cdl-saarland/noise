@@ -17,3 +17,4 @@ LIBRARYNAME := clangCodeGen
 
 include $(CLANG_LEVEL)/Makefile
 
+CPP.Flags += -I$(WFV_INSTALL_DIR)/include

@@ -1,0 +1,507 @@
+//===--- NoiseOptimizer.cpp - Noise Optimizations --------------------------===//
+//
+//                     The LLVM Compiler Infrastructure
+//
+// This file is distributed under the University of Illinois Open Source
+// License. See LICENSE.TXT for details.
+//
+//===----------------------------------------------------------------------===//
+//
+// The optimizer for noise functions
+//
+//===----------------------------------------------------------------------===//
+
+#include "NoiseWFVWrapper.h"
+
+#include "llvm/Module.h"
+#include "llvm/Pass.h"
+#include "llvm/PassManager.h"
+#include "llvm/PassRegistry.h"
+#include "llvm/PassManagers.h"
+#include "llvm/Analysis/Passes.h"
+#include "llvm/Analysis/Verifier.h"
+#include "llvm/Analysis/LoopPass.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/Dominators.h"
+#include "llvm/Assembly/PrintModulePass.h"
+#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/CodeGen/RegAllocRegistry.h"
+#include "llvm/CodeGen/SchedulerRegistry.h"
+#include "llvm/MC/SubtargetFeature.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FormattedStream.h"
+#include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/TargetRegistry.h"
+#include "llvm/Support/Timer.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/DataLayout.h"
+#include "llvm/Target/TargetLibraryInfo.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/Transforms/Instrumentation.h"
+#include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"   // extractCodeRegion()
+#include "llvm/Transforms/Utils/BasicBlockUtils.h" // SplitBlock()
+
+#include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
+#include "llvm/DerivedTypes.h" // FunctionType
+#include "llvm/Constants.h" // UndefValue
+#include "llvm/Instructions.h" // CallInst
+
+#include <sstream>
+
+#include <wfvInterface.h>
+
+using namespace llvm;
+
+namespace llvm {
+
+#if 0
+Pass*
+createNoiseWFVWrapperPass()
+{
+  return new NoiseWFVWrapper();
+}
+#endif
+
+
+NoiseWFVWrapper::NoiseWFVWrapper() : FunctionPass(ID)
+{
+  initializeNoiseWFVWrapperPass(*PassRegistry::getPassRegistry());
+}
+
+NoiseWFVWrapper::~NoiseWFVWrapper()
+{
+}
+
+// Create SIMD type from scalar type.
+// -> only 32bit-float, integers <= 32bit, pointers, arrays and structs allowed
+// -> no scalar datatypes allowed
+// -> no pointers to pointers allowed
+// TODO: i8* should not be transformed to <4 x i8>* !
+Type*
+NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned simdWidth)
+{
+  if (oldType->isFloatTy() ||
+      (oldType->isIntegerTy() && oldType->getPrimitiveSizeInBits() <= 32U))
+  {
+    return VectorType::get(oldType, simdWidth);
+  }
+
+  switch (oldType->getTypeID())
+  {
+  case Type::PointerTyID:
+    {
+      PointerType* pType = cast<PointerType>(oldType);
+      return PointerType::get(vectorizeSIMDType(pType->getElementType(), simdWidth),
+                              pType->getAddressSpace());
+    }
+  case Type::ArrayTyID:
+    {
+      ArrayType* aType = cast<ArrayType>(oldType);
+      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), simdWidth),
+                            aType->getNumElements());
+    }
+  case Type::StructTyID:
+    {
+      StructType* sType = cast<StructType>(oldType);
+      std::vector<Type*> newParams;
+      for (unsigned i=0; i<sType->getNumContainedTypes(); ++i)
+      {
+        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), simdWidth));
+      }
+      return StructType::get(oldType->getContext(), newParams, sType->isPacked());
+    }
+
+  default:
+    {
+      errs() << "\nERROR: only arguments of type float, int, pointer, "
+        << "array or struct can be vectorized, not '"
+        << *oldType << "'!\n";
+      return 0;
+    }
+  }
+}
+
+bool
+NoiseWFVWrapper::runOnFunction(Function &F)
+{
+  // Make sure we only vectorize the function that we want to vectorize.
+  if (mFinished) return false;
+  mFinished = true;
+
+  mModule   = F.getParent();
+  mContext  = &F.getContext();
+  mLoopInfo = &getAnalysis<LoopInfo>();
+  mDomTree  = &getAnalysis<DominatorTree>();
+
+  const bool success = runWFV(&F);
+
+  if (!success)
+  {
+    errs() << "ERROR: WFV failed!\n";
+  }
+
+  // If not successful, nothing changed.
+  // TODO: Make sure this is correct, e.g. by re-inlining the extracted
+  //       loop body.
+  return success;
+}
+
+bool
+NoiseWFVWrapper::runWFV(Function* noiseFn)
+{
+  assert (noiseFn);
+
+  //-------------------------------------------------------------------------//
+  // We must not vectorize the entire function but only the loop body.
+  // Thus, we first have to extract the body into a new function.
+  //-------------------------------------------------------------------------//
+  // TODO: Check if we can find the induction variable and exit condition.
+  //       The exit condition must be a comparison of integers so we can divide
+  //       the second operand by the simd width.
+  // TODO: Check if the loop body has no more than one header, exit, and back edge.
+  // TODO: Check if there are no dependences between loop iterations.
+  // NOTE: We want to allow arbitrary optimizations before wfv, but at the
+  //       same time rely on being able to extract those parts of the block
+  //       that were the body (without induction variable increment, loop
+  //       condition test, etc.).
+  //       If one of the previous optimizations does not allow us to extract
+  //       the loop body, we have to live with it for now.
+  //-------------------------------------------------------------------------//
+
+  // Get the only outermost loop of this function.
+  assert (std::distance(mLoopInfo->begin(), mLoopInfo->end()) == 1 &&
+          "expected exactly one top level loop in noise function!");
+  Loop* loop = *mLoopInfo->begin();
+  assert (loop);
+
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  BasicBlock* headerBB    = loop->getHeader();
+  BasicBlock* latchBB     = loop->getLoopLatch();
+  assert (preheaderBB && headerBB && latchBB &&
+          "vectorization of non-simplified loop not supported!");
+
+  // TODO: These should return gracefully.
+  assert (loop->getNumBackEdges() == 1 &&
+          "vectorization of loops with multiple back edges not supported!");
+  SmallVector<BasicBlock*, 4> exitingBlocks;
+  loop->getExitingBlocks(exitingBlocks);
+  assert (exitingBlocks.size() == 1 &&
+          "vectorization of loops with multiple exits not supported!");
+
+  // Do some sanity checks to test assumptions about our construction.
+  assert (preheaderBB == &noiseFn->getEntryBlock());
+  assert (preheaderBB->getTerminator()->getNumSuccessors() == 1);
+  assert (headerBB == preheaderBB->getTerminator()->getSuccessor(0));
+  assert (isa<PHINode>(headerBB->begin()));
+  assert (cast<PHINode>(headerBB->begin())->getNumIncomingValues() == 2);
+
+  // Extract the loop body.
+  // This is a non-trivial task, since the code that is not part of the body
+  // (induction variable increment etc.) in the C code is part of it in LLVM IR.
+  // This function attempts to split out only the relevant parts of the code.
+  PHINode* indVarPhi = 0;
+  SmallVector<BasicBlock*, 4> loopBody;
+  Function* loopBodyFn = extractLoopBody(loop, indVarPhi, loopBody);
+  if (!loopBodyFn || !indVarPhi)
+  {
+    errs() << "ERROR: Loop body extraction failed!\n";
+    return false;
+  }
+
+  assert (loopBodyFn->getNumUses() == 1);
+  CallInst* loopBodyCall = cast<CallInst>(*loopBodyFn->use_begin());
+  assert (loopBodyCall->use_empty());
+
+  // Create a vector of the W induction variables that are executed in parallel.
+#if 0
+  Type* indVarVecType = vectorizeSIMDType(indVarPhi->getType(), simdWidth);
+  Value* indVarVec = UndefValue::get(indVarVecType);
+  Instruction* insertBefore = headerBB->getFirstNonPHI();
+  std::vector<Constant*> constants;
+  for (unsigned i=0; i<simdWidth; ++i)
+  {
+    ConstantInt* idxVal = ConstantInt::get(*mContext, APInt(32, i));
+    indVarVec = InsertElementInst::Create(indVarVec,
+                                          indVarPhi,
+                                          idxVal,
+                                          "",
+                                          insertBefore);
+    constants.push_back(idxVal);
+  }
+
+  indVarVec = BinaryOperator::Create(Instruction::Add,
+                                     indVarVec,
+                                     ConstantVector::get(constants),
+                                     "iv.vec",
+                                     insertBefore);
+#endif
+
+  //-------------------------------------------------------------------------//
+
+  // Create new function type.
+  // The only varying parameter is the one of the loop induction variable.
+  // All other incoming values are uniform.
+  FunctionType* loopBodyFnType = loopBodyFn->getFunctionType();
+  Type*         newReturnType  = loopBodyFnType->getReturnType();
+  std::vector<Type*>  newParamTypes;
+  std::vector<Value*> newCallArgs;
+  Argument*           indVarArg = 0;
+  assert (loopBodyFnType->getNumParams() == loopBodyCall->getNumArgOperands());
+  for (unsigned i=0, e=loopBodyCall->getNumArgOperands(); i<e; ++i)
+  {
+    Value* argOp   = loopBodyCall->getArgOperand(i);
+    Type*  type    = loopBodyFnType->getParamType(i);
+    assert (type == argOp->getType());
+
+#if 0
+    Type*  newType = type;
+    Value* newVal  = argOp;
+    if (argOp == indVarPhi)
+    {
+      assert (vectorizeSIMDType(type, simdWidth));
+      newType = vectorizeSIMDType(type, simdWidth);
+      newVal = indVarVec;
+      assert (!indVarArg && "there should be only one indunction variable!");
+      Function::arg_iterator A = loopBodyFn->arg_begin();
+      std::advance(A, i);
+      indVarArg = A;
+    }
+
+    newParamTypes.push_back(newType);
+    newCallArgs.push_back(newVal);
+#else
+    newParamTypes.push_back(type);
+    newCallArgs.push_back(argOp);
+    if (argOp == indVarPhi)
+    {
+      Function::arg_iterator A = loopBodyFn->arg_begin();
+      std::advance(A, i);
+      indVarArg = A;
+    }
+#endif
+  }
+  assert (indVarArg);
+  FunctionType* simdFnType = FunctionType::get(newReturnType, newParamTypes, false);
+
+  // Create new name.
+  std::stringstream sstr;
+  sstr << loopBodyFn->getName().str() << "_SIMD";
+  const std::string& simdFnName = sstr.str();
+
+  // Create external target function for WFV.
+  Function* simdFn = Function::Create(simdFnType,
+                                      Function::ExternalLinkage,
+                                      simdFnName,
+                                      mModule);
+
+  // Set up WFV interface.
+  WFVInterface::WFVInterface wfvInterface(mModule,
+                                          &mModule->getContext(),
+                                          loopBodyFn,
+                                          simdFn,
+                                          simdWidth,
+                                          use_avx,
+                                          use_divergence_analysis,
+                                          verbose);
+
+  // Add semantics to the induction variable vector.
+  wfvInterface.addSIMDSemantics(*indVarArg, false, true, false, true, false, true);
+
+  // Run WFV.
+  const bool vectorized = wfvInterface.run();
+
+  if (!vectorized) return false;
+
+  assert (mModule->getFunction(simdFnName));
+  assert (simdFn == mModule->getFunction(simdFnName));
+
+  //-------------------------------------------------------------------------//
+
+  // Upon successful vectorization, we have to modify the loop in the original function.
+  // Adjust the increment of the induction variable (increment by simd width).
+  // Adjust the exit condition (divide by simd width).
+  // -> Already done in extractLoopBody.
+
+  // Generate code that packs all input values into vectors to match the signature.
+  // -> Should only be the induction variable itself.
+  // -> Already done in extractLoopBody.
+
+  // Replace the call to the extracted, scalar function by a call to the vector function.
+  CallInst* newLoopBodyFnCall = CallInst::Create(simdFn, newCallArgs, "", loopBodyCall);
+  loopBodyCall->eraseFromParent();
+
+  // Inline the new call.
+  InlineFunctionInfo IFI;
+  InlineFunction(newLoopBodyFnCall, IFI);
+
+  return true;
+}
+
+// TODO: Make sure the loop is a trivial counting loop.
+// TODO: Make sure there is no LALB value.
+//       -> Do LCSSA and make sure there is no phi in any exit block.
+template<unsigned S>
+Function*
+NoiseWFVWrapper::extractLoopBody(Loop* loop,
+                                 PHINode*& indVarPhi,
+                                 SmallVector<BasicBlock*, S>& loopBody)
+{
+  assert (loop);
+  assert (!indVarPhi);
+
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  BasicBlock* headerBB    = loop->getHeader();
+  BasicBlock* latchBB     = loop->getLoopLatch();
+  BasicBlock* exitingBB   = loop->getExitingBlock();
+  assert (preheaderBB && headerBB && latchBB &&
+          "vectorization of non-simplified loop not supported!");
+  assert (exitingBB &&
+          "vectorization of loop with multiple exits not supported!");
+  assert (exitingBB == headerBB &&
+          "expected exiting block to be the loop header!");
+
+  // Collect all blocks that are definitely part of the body.
+  std::vector<BasicBlock*>& blocks = loop->getBlocksVector();
+  for (unsigned i=0, e=blocks.size(); i<e; ++i)
+  {
+    BasicBlock* block = blocks[i];
+    if (block == headerBB) continue;
+    if (block == exitingBB) continue; // Redundant.
+    if (block == latchBB) continue;
+    loopBody.push_back(block);
+  }
+
+  // Get loop induction variable phi.
+  indVarPhi = loop->getCanonicalInductionVariable();
+  assert (indVarPhi &&
+          "vectorization of loops without canonical induction variable not supported!");
+  assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
+          "expected induction variable update value to be an instruction!");
+  Instruction* indVarUpdate = cast<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB));
+  assert (indVarUpdate->getParent() == latchBB &&
+          "expected induction variable update operation in latch block!");
+
+  // Get loop exit condition.
+  assert (isa<BranchInst>(exitingBB->getTerminator()));
+  BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
+
+  assert (isa<ICmpInst>(exitBr->getCondition()));
+  ICmpInst* exitCond = cast<ICmpInst>(exitBr->getCondition());
+  assert (exitCond->getParent() == exitingBB &&
+          "expected exit condition to be in exiting block!");
+  assert (exitCond->getNumUses() == 1 &&
+          "expected exit condition to have only one use in the exit branch!");
+
+  // Split latch directly before induction variable increment.
+  BasicBlock* newLatchBB = SplitBlock(latchBB, indVarUpdate, mDomTree);
+  newLatchBB->setName(latchBB->getName()+".wfv.latch");
+
+  // latchBB is now the part of the latch that is only the body.
+  loopBody.push_back(latchBB);
+
+  CodeExtractor extractor(loopBody, mDomTree, false);
+  assert (extractor.isEligible());
+  Function* bodyFn = extractor.extractCodeRegion();
+  assert (bodyFn);
+
+  // Now, adjust the original loop.
+  // Increment by 'simdWidth' instead of 1.
+  Constant* simdWidthConst = ConstantInt::get(indVarUpdate->getType(), simdWidth, false);
+  Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
+                                                        indVarUpdate,
+                                                        simdWidthConst,
+                                                        "wfv.inc",
+                                                        indVarUpdate);
+  indVarUpdate->moveBefore(newIndVarUpdate);
+  indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
+  newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
+
+  // Divide the RHO of the condition comparison by 'simdWidth'.
+  // TODO: This should be done outside the loop (or pulled via LICM).
+  Value* rho = exitCond->getOperand(1);
+  Instruction* newRHO = BinaryOperator::Create(Instruction::UDiv,
+                                               rho,
+                                               simdWidthConst,
+                                               "wfv.cond.rho",
+                                               exitCond);
+  exitCond->setOperand(1, newRHO);
+
+  return bodyFn;
+}
+
+void
+NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
+{
+  AU.addRequired<DominatorTree>();
+  AU.addRequired<LoopInfo>();
+}
+
+char NoiseWFVWrapper::ID = 0;
+} // namespace llvm
+
+INITIALIZE_PASS_BEGIN(NoiseWFVWrapper, "wfv-wrapper",
+                      "wrapper pass around WFV library", false, false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTree)
+INITIALIZE_PASS_DEPENDENCY(LoopInfo)
+INITIALIZE_PASS_END(NoiseWFVWrapper, "wfv-wrapper",
+                    "wrapper pass around WFV library", false, false)
+
+#if 0
+#include <dlfcn.h> // dlopen()
+
+          void* wfvLibHandle;
+
+          wfvLibHandle = dlopen("libWFV.so", RTLD_LAZY);
+          if (!wfvLibHandle)
+          {
+            errs() << "ERROR: Could not load libWFV.so!\n";
+            continue;
+          }
+
+          typedef void* (*WFVInterfaceCnType)(Module*,
+                                              LLVMContext*,
+                                              Function*,
+                                              Function*,
+                                              unsigned,
+                                              bool,
+                                              bool,
+                                              bool);
+
+          // TODO: Remove ISO C++ pointer cast warning.
+          WFVInterfaceCnType wfvInterfaceCn = (WFVInterfaceCnType)dlsym(wfvLibHandle,
+                                                                        "WFVWFVInterface");
+          if (!wfvInterfaceCn)
+          {
+            errs() << "ERROR: Could not find symbol 'WFVWFVInterface': " << dlerror() << "!\n";
+            dlclose(wfvLibHandle);
+            continue;
+          }
+
+          void* wfvInterface = wfvInterfaceCn(noiseMod,
+                                              &noiseMod->getContext(),
+                                              noiseFn,
+                                              noiseFn,
+                                              4,
+                                              false,
+                                              false,
+                                              false);
+
+          
+
+          typedef void* (*WFVRunType)(void*);
+          WFVRunType wfvRun = (WFVRunType)dlsym(wfvLibHandle, "WFVRun");
+          if (!wfvRun)
+          {
+            errs() << "ERROR: Could not find symbol 'WFVRun': " << dlerror() << "!\n";
+            dlclose(wfvLibHandle);
+            continue;
+          }
+
+          wfvRun(wfvInterface);
+
+          dlclose(wfvLibHandle);
+#endif
