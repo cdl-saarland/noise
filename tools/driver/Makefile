@@ -80,7 +80,7 @@ ifeq ($(WFV_INSTALL_DIR),)
 # Do not set any special flags
 else
 LDFLAGS += -L$(WFV_INSTALL_DIR)/lib
-LIBS += -lWFV -lLLVM-3.2svn -pthread -ldl -lm
+LIBS += -lWFV -lLLVM-3.3svn -pthread -ldl -lm
 endif
 
 # This links with the static libraries and thus does not require LLVM_SHARED_LIB_DIR, but it takes forever.

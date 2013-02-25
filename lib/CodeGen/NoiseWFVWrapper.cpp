@@ -15,7 +15,6 @@
 
 #include "NoiseWFVWrapper.h"
 
-#include "llvm/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -36,7 +35,6 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/DataLayout.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -46,11 +44,12 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"   // extractCodeRegion()
 #include "llvm/Transforms/Utils/BasicBlockUtils.h" // SplitBlock()
-
 #include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
-#include "llvm/DerivedTypes.h" // FunctionType
-#include "llvm/Constants.h" // UndefValue
-#include "llvm/Instructions.h" // CallInst
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h" // FunctionType
+#include "llvm/IR/Constants.h" // UndefValue
+#include "llvm/IR/Instructions.h" // CallInst
 
 #include <sstream>
 

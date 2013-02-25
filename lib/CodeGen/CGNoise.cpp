@@ -11,21 +11,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include <llvm/Metadata.h>
-
 #include "CGNoise.h"
 #include "CGDebugInfo.h"
 #include "CodeGenModule.h"
 #include "CodeGenFunction.h"
 
-#include "llvm/Module.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h" // FunctionType
+#include "llvm/IR/Constants.h" // UndefValue
+#include "llvm/IR/Instructions.h" // CallInst
+#include "llvm/IR/Intrinsics.h" // Intrinsics
+#include "llvm/IR/Metadata.h"
+#include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
 #include "llvm/PassManager.h"
 
-#include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
-#include "llvm/DerivedTypes.h" // FunctionType
-#include "llvm/Constants.h" // UndefValue
-#include "llvm/Instructions.h" // CallInst
-#include "llvm/Intrinsics.h" // Intrinsics
 
 //===----------------------------------------------------------------------===//
 //                              Noise Code Emission
@@ -54,11 +53,11 @@ bool NoiseCodeGenerator::RegisterFunction(const Decl *D, llvm::Function *Fn, con
   assert(Module);
   llvm::LLVMContext& Context = Fn->getContext();
   llvm::StringRef noiseStr = D->getAttr<NoiseAttr>()->getOpt();
-  llvm::Value* params[] = { Fn,
-                            llvm::MDString::get(Context, "noise"),
-                            llvm::MDString::get(Context, noiseStr) };
-  llvm::NamedMDNode* MD = Module->getOrInsertModuleFlagsMetadata();
+
+  llvm::Value* params[] = { Fn, llvm::MDString::get(Context, noiseStr) };
+  llvm::NamedMDNode* MD = Module->getOrInsertNamedMetadata("noise");
   MD->addOperand(llvm::MDNode::get(Context, llvm::ArrayRef<llvm::Value*>(params)));
+
   return true;
 }
 

@@ -18,7 +18,6 @@
 #include "NoiseWFVWrapper.h"
 #endif
 
-#include "llvm/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -37,7 +36,6 @@
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/DataLayout.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -47,15 +45,36 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/UnrollLoop.h"
-
 #include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
-#include "llvm/DerivedTypes.h" // FunctionType
-#include "llvm/Constants.h" // UndefValue
-#include "llvm/Instructions.h" // CallInst
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h" // FunctionType
+#include "llvm/IR/Constants.h" // UndefValue
+#include "llvm/IR/Instructions.h" // CallInst
 
 #include <iostream>
 
 using namespace llvm;
+
+namespace {
+
+Function* GetNoiseFunction(const MDNode* mdNode)
+{
+    assert (mdNode->getNumOperands() == 2);
+    // First operand is the function.
+    assert (isa<Function>(mdNode->getOperand(0)));
+    return cast<Function>(mdNode->getOperand(0));
+}
+
+MDString* GetNoiseString(const MDNode* mdNode)
+{
+    assert (mdNode->getNumOperands() == 2);
+    // Second operand is a string with the noise optimizations.
+    assert (isa<MDString>(mdNode->getOperand(1)));
+    return cast<MDString>(mdNode->getOperand(1));
+}
+
+} // unnamed namespace
 
 namespace llvm {
 
@@ -108,22 +127,7 @@ struct NoiseExtractor : public FunctionPass {
   bool hasNoiseFunctionAttribute(const Function& function) const {
     for (unsigned i=0, e=MD->getNumOperands(); i<e; ++i) {
       MDNode* functionMDN = MD->getOperand(i);
-
-      // First operand is the function.
-      // Second operand is a special 'noise' string.
-      // Third operand is a string with the noise optimizations.
-      // TODO: Transform these into assertions if we know that all MDNodes
-      //       in the NamedMDNode are noise nodes.
-      if (functionMDN->getNumOperands() != 3) continue;
-      if (!isa<Function>(functionMDN->getOperand(0))) continue;
-      if (!isa<MDString>(functionMDN->getOperand(1))) continue;
-      if (!isa<MDString>(functionMDN->getOperand(2))) continue;
-
-      MDString* noiseString = cast<MDString>(functionMDN->getOperand(1));
-      if (!noiseString->getString().equals("noise")) continue;
-
-      Function* noiseFn = cast<Function>(functionMDN->getOperand(0));
-
+      Function* noiseFn = GetNoiseFunction(functionMDN);
       if (noiseFn == &function) return true;
     }
 
@@ -192,11 +196,9 @@ struct NoiseExtractor : public FunctionPass {
     assert(Mod);
     MDString* noiseMDS = cast<MDString>(noiseMD->getOperand(2));
     llvm::StringRef noiseStr = noiseMDS->getString();
-    llvm::Value* params[] = { extractedFn,
-                              llvm::MDString::get(*Context, "noise"),
-                              llvm::MDString::get(*Context, noiseStr) };
-    llvm::NamedMDNode* MDN = Mod->getOrInsertModuleFlagsMetadata();
-    MDN->addOperand(llvm::MDNode::get(*Context, llvm::ArrayRef<llvm::Value*>(params)));
+
+    llvm::Value* params[] = { extractedFn, llvm::MDString::get(*Context, noiseStr) };
+    MD->addOperand(llvm::MDNode::get(*Context, llvm::ArrayRef<llvm::Value*>(params)));
 
     createdFunctions.insert(extractedFn);
 
@@ -352,7 +354,7 @@ NoiseOptimizer::NoiseOptimizer(llvm::Module *M)
   : Mod(M)
   , NoiseMod(new Module("noiseMod", Mod->getContext()))
   , Registry(PassRegistry::getPassRegistry())
-  , MD(Mod->getOrInsertModuleFlagsMetadata())
+  , MD(Mod->getOrInsertNamedMetadata("noise"))
 { }
 
 NoiseOptimizer::~NoiseOptimizer()
@@ -434,21 +436,7 @@ void NoiseOptimizer::PerformOptimization()
   // to iterate the extracted functions in that same order.
   for (unsigned i=0, e=MD->getNumOperands(); i<e; ++i) {
     MDNode* functionMDN = MD->getOperand(i);
-
-    // First operand is the function.
-    // Second operand is a special 'noise' string.
-    // Third operand is a string with the noise optimizations.
-    // TODO: Transform these into assertions if we know that all MDNodes
-    //       in the NamedMDNode are noise nodes.
-    if (functionMDN->getNumOperands() != 3) continue;
-    if (!isa<Function>(functionMDN->getOperand(0))) continue;
-    if (!isa<MDString>(functionMDN->getOperand(1))) continue;
-    if (!isa<MDString>(functionMDN->getOperand(2))) continue;
-
-    MDString* noiseString = cast<MDString>(functionMDN->getOperand(1));
-    if (!noiseString->getString().equals("noise")) continue;
-
-    Function* noiseFn = cast<Function>(functionMDN->getOperand(0));
+    Function* noiseFn = GetNoiseFunction(functionMDN);
 
     NoiseFnInfo* nfi = 0;
     for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
@@ -467,7 +455,7 @@ void NoiseOptimizer::PerformOptimization()
       noiseFnInfoVec.push_back(nfi);
     }
 
-    nfi->mOptString = cast<MDString>(functionMDN->getOperand(2));
+    nfi->mOptString = GetNoiseString(functionMDN);
     assert (nfi->mOptString);
 
     // Make sure that no other optimizations than the requested ones are
@@ -722,6 +710,9 @@ void NoiseOptimizer::PerformOptimization()
 
       outs() << "Running pass: " << pass << "\n";
     }
+
+    // TODO: Remove this when reaching "production" state or so.
+    NoisePasses.add(createVerifierPass());
 
     // Run the required passes
     NoisePasses.run(*noiseFn);
