@@ -496,7 +496,7 @@ def NonNull : InheritableAttr {
 
 def Noise : InheritableAttr {
   let Spellings = [GNU<"noise">, CXX11<"","noise">];
-  let Subjects = [Function, CompoundStmt, ForStmt];
+  let Subjects = [Function, CompoundStmt, ForStmt, Var];
   let Args = [StringArgument<"Opt">];
 }
 
@@ -588,7 +588,7 @@ def Overloadable : Attr {
   let Spellings = [GNU<"overloadable">];
 }
 
-def Override : InheritableAttr { 
+def Override : InheritableAttr {
   let Spellings = [];
   let SemaHandler = 0;
 }
@@ -644,7 +644,7 @@ def Endian : InheritableAttr {
 
 def WorkGroupSizeHint :  InheritableAttr {
   let Spellings = [GNU<"work_group_size_hint">];
-  let Args = [UnsignedArgument<"XDim">, 
+  let Args = [UnsignedArgument<"XDim">,
               UnsignedArgument<"YDim">,
               UnsignedArgument<"ZDim">];
 }

@@ -44,7 +44,6 @@ public:
 
 private:
   CodeGen::CodeGenFunction *Generator;
-  llvm::Constant* LoopMarker;
 };
 
 }  // end namespace noise

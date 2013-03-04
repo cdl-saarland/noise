@@ -23,8 +23,6 @@ namespace clang {
 
   Attr* CreateNoiseAttr(Sema &S, const AttributeList &attr);
 
-  typedef std::vector<const NoiseAttr*> NoiseAttrVec;
-
   }
 }
 
