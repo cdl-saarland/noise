@@ -475,6 +475,98 @@ struct NoisePassListener : public PassRegistrationListener {
   }
 };
 
+namespace {
+
+Function* createDummyFunction(Function* noiseFn)
+{
+    assert (noiseFn);
+    Module* mod = noiseFn->getParent();
+    LLVMContext& context = mod->getContext();
+
+    // Create dummy block.
+    BasicBlock* entryBB = BasicBlock::Create(context, "");
+
+    SmallVector<Value*, 4> values;
+    for (Function::iterator BB=noiseFn->begin(), BBE=noiseFn->end(); BB!=BBE; ++BB)
+    {
+      for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
+      {
+        // Handle global variables etc.
+        for (Instruction::op_iterator O=I->op_begin(), OE=I->op_end(); O!=OE; ++O)
+        {
+          Value* opVal = cast<Value>(*O);
+          if (isa<Function>(opVal)) continue;
+          if (isa<BasicBlock>(opVal)) continue;
+
+          if (!isa<GlobalValue>(opVal) &&
+              !isa<GlobalVariable>(opVal) &&
+              !isa<ConstantExpr>(opVal))
+          {
+            continue;
+          }
+          values.push_back(new LoadInst(opVal, "", entryBB));
+        }
+
+        // Handle calls to other functions.
+        if (!isa<CallInst>(I)) continue;
+
+        CallInst* call = cast<CallInst>(I);
+
+        Function* callee = call->getCalledFunction();
+        if (!callee) continue;
+
+        // Create dummy arguments.
+        SmallVector<Value*, 2> args;
+        for (unsigned i=0, e=call->getNumArgOperands(); i<e; ++i)
+        {
+          Value* oldArg = call->getArgOperand(i);
+          args.push_back(UndefValue::get(oldArg->getType()));
+        }
+
+        // Create dummy call.
+        CallInst* dummyCall = CallInst::Create(callee, args, "", entryBB);
+        if (!dummyCall->getType()->isVoidTy()) values.push_back(dummyCall);
+      }
+    }
+
+    if (entryBB->empty()) return NULL;
+
+    // Create dummy function with one parameter per dummy value.
+    SmallVector<Type*, 4> argTypes;
+    for (SmallVector<Value*, 4>::iterator it=values.begin(), E=values.end(); it!=E; ++it)
+    {
+        Type* argType = (*it)->getType();
+        assert (!argType->isVoidTy());
+        argTypes.push_back(PointerType::getUnqual(argType));
+    }
+
+    FunctionType* type = FunctionType::get(Type::getVoidTy(context), argTypes, false);
+
+    Function* dummyFn = Function::Create(type, GlobalValue::ExternalLinkage, "dummy", mod);
+
+    // Add the entry block to the function.
+    dummyFn->getBasicBlockList().push_back(entryBB);
+
+    // Create a store operation for each value to prevent deletion of the load.
+    Function::arg_iterator A = dummyFn->arg_begin();
+    for (SmallVector<Value*, 4>::iterator it=values.begin(), E=values.end(); it!=E; ++it, ++A)
+    {
+        Value* value = *it;
+        Value* ptr   = A;
+        assert (!value->getType()->isVoidTy());
+        new StoreInst(value, ptr, false, entryBB);
+    }
+
+    // Finally, create a return instruction to finish the block and function.
+    ReturnInst::Create(context, entryBB);
+
+    outs() << "dummy function: " << *dummyFn << "\n";
+
+    return dummyFn;
+}
+
+} // unnamed namespace
+
 // TODO: Support "negative" noise attributes (e.g. "subtraction" of specified
 //       passes from O3).
 void NoiseOptimizer::PerformOptimization()
@@ -680,6 +772,12 @@ void NoiseOptimizer::PerformOptimization()
 
     assert (!nfi->mReinline && "there should be no non-top level function left!");
 
+    // Before we move the function, we have to create a dummy that calls
+    // all functions that are also called in the current noise function.
+    // This is to prevent their deletion during the standard optimizations.
+    Function* dummyFn = createDummyFunction(noiseFn);
+    if (dummyFn) dummyFnVec.push_back(dummyFn);
+
     // Move function to noise module.
     noiseFn->removeFromParent();
     assert (!Mod->getFunction(noiseFn->getName()));
@@ -725,6 +823,12 @@ void NoiseOptimizer::PerformOptimization()
 void NoiseOptimizer::Reassemble()
 {
   PrettyStackTraceString CrashInfo("NOISE: reassemble module after optimizations");
+
+  for (SmallVector<Function*, 4>::iterator it=dummyFnVec.begin(),
+       E=dummyFnVec.end(); it!=E; ++it)
+  {
+    (*it)->eraseFromParent();
+  }
 
   for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i) {
     NoiseFnInfo* nfi = noiseFnInfoVec[i];

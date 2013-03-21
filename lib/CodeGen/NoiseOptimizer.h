@@ -68,6 +68,7 @@ namespace noise {
     NamedMDNode  *MD;
 
     NoiseFnInfoVecType noiseFnInfoVec;
+    SmallVector<Function*, 4> dummyFnVec;
   };
 
 }  // end namespace noise
