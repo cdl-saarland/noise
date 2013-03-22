@@ -275,12 +275,13 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                       mModule);
 
   // Set up WFV interface.
+  const int maskPosition = -1; // No mask argument.
   WFVInterface::WFVInterface wfvInterface(mModule,
                                           &mModule->getContext(),
                                           loopBodyFn,
                                           simdFn,
                                           mSIMDWidth,
-                                          mUseAVX,
+                                          maskPosition,
                                           mUseDivergenceAnalysis,
                                           mVerbose);
 
