@@ -870,13 +870,45 @@ void NoiseOptimizer::Reassemble()
     // Thus, we must not inline/remove anything.
     if (!nfi->mCall) return;
 
-    // Otherwise, inline the only call to this function.
+    // We have multiple options here.
+    // 1) We mark the parent function as "noinline" after the noise function
+    // was extracted to NoiseMod. This way, the standard optimizer would not
+    // inline it, preventing cases where we have more than one call.
+    // 2) If we don't mark it as "noinline", the parent function will often be
+    // inlined because most of the code was extracted. Thus, we could inline
+    // *all* calls to the function here, which could possibly result in too much
+    // code being inlined. Thus, we should let the inliner decide whether to
+    // inline or not, and possibly leave the new function in the module.
+    // This in turn could be confusing to the user, because the originally
+    // written function was inlined, but a new one is called.
+    // 3) Mark as "noinline", inline the (then only) call back into the original
+    // function, then run the standard inliner again on that one.
+
+    // If mCall is set, inline the call to this function.
     InlineFunctionInfo IFI;
     InlineFunction(nfi->mCall, IFI);
 
+    // There may be additional calls (see comment above).
+    // For now, we don't care and simply attempt to inline all calls (option 2).
+    SmallVector<CallInst*, 2> callVec;
+    for (Function::use_iterator U=movedNoiseFn->use_begin(),
+         UE=movedNoiseFn->use_end(); U!=UE; ++U)
+    {
+      if (!isa<CallInst>(*U)) continue;
+      callVec.push_back(cast<CallInst>(*U));
+    }
+    for (SmallVector<CallInst*, 2>::iterator it=callVec.begin(),
+         E=callVec.end(); it!=E; ++it)
+    {
+      InlineFunctionInfo IFI;
+      InlineFunction(*it, IFI);
+    }
+
     // Remove the now inlined noise function again.
-    assert (movedNoiseFn->use_empty());
-    movedNoiseFn->eraseFromParent();
+    if (movedNoiseFn->use_empty())
+    {
+      movedNoiseFn->eraseFromParent();
+    }
 
     //outs() << "module after reinlining: " << *Mod << "\n";
 
