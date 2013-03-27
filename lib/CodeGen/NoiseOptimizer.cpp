@@ -560,8 +560,6 @@ Function* createDummyFunction(Function* noiseFn)
     // Finally, create a return instruction to finish the block and function.
     ReturnInst::Create(context, entryBB);
 
-    outs() << "dummy function: " << *dummyFn << "\n";
-
     return dummyFn;
 }
 
