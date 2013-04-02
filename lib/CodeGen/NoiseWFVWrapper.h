@@ -15,6 +15,7 @@
 #include "llvm/PassRegistry.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace llvm {
 class Module;
@@ -24,6 +25,9 @@ class LoopInfo;
 class Loop;
 class Type;
 class PHINode;
+class Function;
+class Instruction;
+class Value;
 }
 
 using namespace llvm;
@@ -60,9 +64,25 @@ struct NoiseWFVWrapper : public FunctionPass {
 
   bool runWFV(Function* noiseFn);
 
+  void handleReductions(Loop*                           loop,
+                        PHINode*                        indVarPhi,
+                        const unsigned                  vectorizationFactor,
+                        DenseMap<Function*, Function*>& simdMappings);
+
+  void generateIfCascade(Instruction*   inst,
+                         Value*         mask,
+                         BasicBlock**   ifBlocks,
+                         BasicBlock**   targetBlocks,
+                         const unsigned vectorizationFactor);
+  Function* generateReductionFunction(Instruction* updateOp);
+  Function* generateReductionFunctionSIMD(Instruction*   updateOp,
+                                          const unsigned vectorizationFactor,
+                                          const bool     requiresMask);
+
   template<unsigned S>
-  Function* extractLoopBody(Loop* loop,
-                            PHINode*& indVarPhi,
+  Function* extractLoopBody(Loop*                        loop,
+                            PHINode*                     indVarPhi,
+                            Instruction*                 indVarUpdate,
                             SmallVector<BasicBlock*, S>& loopBody);
 
   virtual void getAnalysisUsage(AnalysisUsage &AU) const;

@@ -203,6 +203,31 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   assert (exitBB &&
           "vectorization of loops with multiple exits not supported!");
 
+  // Get loop induction variable phi.
+  PHINode* indVarPhi = loop->getCanonicalInductionVariable();
+  assert (indVarPhi &&
+          "vectorization of loops without canonical induction variable not supported!");
+  assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
+          "expected induction variable update value to be an instruction!");
+  Instruction* indVarUpdate = cast<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB));
+  assert (indVarUpdate->getParent() == latchBB &&
+          "expected induction variable update operation in latch block!");
+
+  // TODO: These should return gracefully.
+  // TODO: These should eventually be replaced by generation of fixup code.
+  assert (indVarUpdate->getOpcode() == Instruction::Add &&
+          "vectorization of loop with induction variable update operation that is no integer addition not supported!");
+  assert ((indVarUpdate->getOperand(0) == indVarPhi ||
+           indVarUpdate->getOperand(1) == indVarPhi) &&
+          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
+  assert ((indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
+           indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
+          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
+
+
+  DenseMap<Function*, Function*> simdMappings;
+  handleReductions(loop, indVarPhi, mVectorizationFactor, simdMappings);
+
   // Make sure there are no values that are live across loop boundaries (LALB).
   // This is because WFV only supports loops without loop-carried dependencies.
   // NOTE: We rely on LCSSA here, which allows us to simply test if there is
@@ -221,10 +246,9 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // This is a non-trivial task, since the code that is not part of the body
   // (induction variable increment etc.) in the C code is part of it in LLVM IR.
   // This function attempts to split out only the relevant parts of the code.
-  PHINode* indVarPhi = 0;
   SmallVector<BasicBlock*, 4> loopBody;
-  Function* loopBodyFn = extractLoopBody(loop, indVarPhi, loopBody);
-  if (!loopBodyFn || !indVarPhi)
+  Function* loopBodyFn = extractLoopBody(loop, indVarPhi, indVarUpdate, loopBody);
+  if (!loopBodyFn)
   {
     errs() << "ERROR: Loop body extraction failed!\n";
     return false;
@@ -283,10 +307,19 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                           mVectorizationFactor,
                                           maskPosition,
                                           mUseDivergenceAnalysis,
-                                          mVerbose);
+                                          true);
 
   // Add semantics to the induction variable vector.
   wfvInterface.addSIMDSemantics(*indVarArg, false, true, false, true, false, true);
+
+  // Add mappings for the reduction functions (if any).
+  for (DenseMap<Function*, Function*>::iterator it=simdMappings.begin(),
+       E=simdMappings.end(); it!=E; ++it)
+  {
+    const int maskIdx = it->second->getFunctionType()->getNumParams() <= 2 ? -1 : 2;
+    const bool mayHaveSideEffects = maskIdx != -1;
+    wfvInterface.addSIMDMapping(*it->first, *it->second, maskIdx, mayHaveSideEffects);
+  }
 
   // Run WFV.
   const bool vectorized = wfvInterface.run();
@@ -301,6 +334,26 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   assert (mModule->getFunction(simdFnName));
   assert (simdFn == mModule->getFunction(simdFnName));
+
+  // Inline reduction functions (if any) into the vectorized code.
+  // The "scalar" dummy reduction function can't be erased until the temporary
+  // function that served as the basis for WFV was erased.
+  for (DenseMap<Function*, Function*>::iterator it=simdMappings.begin(),
+       E=simdMappings.end(); it!=E; ++it)
+  {
+    Function* fn = it->second;
+
+    for (Function::use_iterator U=fn->use_begin(), UE=fn->use_end(); U!=UE; ++U)
+    {
+      assert (isa<CallInst>(*U));
+      CallInst* call = cast<CallInst>(*U);
+      InlineFunctionInfo IFI;
+      InlineFunction(call, IFI);
+    }
+
+    assert (fn->use_empty());
+    fn->eraseFromParent();
+  }
 
   //-------------------------------------------------------------------------//
 
@@ -358,14 +411,402 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   return true;
 }
 
+namespace {
+
+struct ReductionVariable
+{
+  ReductionVariable()
+  : mStartVal(0), mPhi(0), mUpdateOp(0), mOtherOperand(0), mResult(0), mRequiresMask(false)
+  {}
+
+  Value*       mStartVal;
+  PHINode*     mPhi;
+  Instruction* mUpdateOp;
+  Value*       mOtherOperand;
+  PHINode*     mResult;
+  bool         mRequiresMask;
+};
+
+typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
+
+void
+collectReductionVariables(Loop*                loop,
+                          PHINode*             indVarPhi,
+                          const DominatorTree& domTree,
+                          RedVarVecType&       redVars)
+{
+  assert (loop && indVarPhi);
+
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  BasicBlock* headerBB    = loop->getHeader();
+  BasicBlock* latchBB     = loop->getLoopLatch();
+  BasicBlock* exitBB      = loop->getUniqueExitBlock();
+
+  for (BasicBlock::iterator I=headerBB->begin(),
+       IE=headerBB->end(); I!=IE; ++I)
+  {
+    if (headerBB->getFirstNonPHI() == I) break;
+    if (indVarPhi == I) continue;
+
+    PHINode* phi = cast<PHINode>(I);
+    outs() << "  reduction candidate phi: " << *phi << "\n";
+
+    ReductionVariable* redVar = new ReductionVariable();
+    redVar->mPhi = phi;
+    assert (phi->getNumUses() <= 2 &&
+            "Phi should have at most two uses: the phis in the header and the exit block!");
+
+    assert (phi->getIncomingValueForBlock(preheaderBB));
+    redVar->mStartVal = phi->getIncomingValueForBlock(preheaderBB);
+    outs() << "    start value: " << *redVar->mStartVal << "\n";
+
+    assert (phi->getIncomingValueForBlock(latchBB));
+    assert (isa<Instruction>(phi->getIncomingValueForBlock(latchBB)));
+    Instruction* updateOp = cast<Instruction>(phi->getIncomingValueForBlock(latchBB));
+    outs() << "    update op: " << *updateOp << "\n";
+    assert (updateOp->isBinaryOp() && "Can only handle reductions with binary operations");
+    assert (updateOp->getNumUses() <= 2 &&
+            "Update op should have at most two uses: the phis in the header and the exit block!");
+    redVar->mUpdateOp = updateOp;
+
+    Instruction::op_iterator O = updateOp->op_begin();
+    Value* op0 = *O++;
+    Value* op1 = *O;
+    redVar->mOtherOperand = op0 == phi ? op1 : op0;
+    outs() << "    other operand: " << *redVar->mOtherOperand << "\n";
+
+    for (BasicBlock::iterator I2=exitBB->begin(),
+         IE2=exitBB->end(); I2!=IE2; ++I2)
+    {
+      if (exitBB->getFirstNonPHI() == I2) break;
+      PHINode* exitPhi = cast<PHINode>(I2);
+      assert (exitPhi->getNumIncomingValues() == 1);
+      if (exitPhi->getIncomingValue(0) != updateOp &&
+          exitPhi->getIncomingValue(0) != phi)
+      {
+        continue;
+      }
+      redVar->mResult = exitPhi;
+      break;
+    }
+    assert (redVar->mResult && "Could not find corresponding phi in exit block!");
+    outs() << "    result phi: " << *redVar->mResult << "\n";
+
+    // Determine if we require masked reduction.
+    // NOTE: It would be beneficial to have divergence information here.
+    redVar->mRequiresMask = !domTree.dominates(updateOp->getParent(), latchBB);
+    outs() << "    requires mask? " << redVar->mRequiresMask << "\n";
+
+    redVars.push_back(redVar);
+  }
+}
+
+} // unnamed namespace
+
+
+// State after execution of this function:
+// - parent block of inst is split at the position of inst
+// - first if-block is former parent block of 'inst' ("upper part")
+// - last if-block is new block containing "lower part" of former parent block of 'inst'
+// - each if-block holds mask extraction and scalar comparison if mask-instance is true
+// - each target-block only holds an unconditional branch to the next if-block
+void
+NoiseWFVWrapper::generateIfCascade(Instruction*   inst,
+                                   Value*         mask,
+                                   BasicBlock**   ifBlocks,
+                                   BasicBlock**   targetBlocks,
+                                   const unsigned vectorizationFactor)
+{
+  assert (inst && mask && ifBlocks && targetBlocks && inst->getParent());
+  assert (mask->getType()->isVectorTy());
+
+  LLVMContext& context = inst->getContext();
+
+  // Split parent block and move all instructions after inst into endBB.
+  BasicBlock* parentBB = inst->getParent();
+  BasicBlock* endBB    = parentBB->splitBasicBlock(inst, parentBB->getName()+".casc.end");
+  Function*   parentF  = parentBB->getParent();
+
+  // Newly generated branch is not needed.
+  parentBB->getTerminator()->eraseFromParent();
+
+  // Create blocks.
+  for (unsigned i=0, e=vectorizationFactor; i<e; ++i)
+  {
+    if (i>0)
+    {
+      std::stringstream sstr;
+      sstr << "casc.if" << i;
+      ifBlocks[i] = BasicBlock::Create(context, sstr.str(), parentF, endBB);
+    }
+    std::stringstream sstr;
+    sstr << "casc.exec" << i;
+    targetBlocks[i] = BasicBlock::Create(context, sstr.str(), parentF, endBB);
+  }
+
+  // Those are not really if-blocks but this simplifies iteration.
+  // - iterate until i<vectorizationFactor and use i -> first W blocks (includes parent)
+  // - iterate until i<vectorizationFactor and use i+1 -> last W blocks (includes end)
+  ifBlocks[0] = parentBB;
+  ifBlocks[vectorizationFactor] = endBB;
+
+  // Generate unconditional jump from each exec-block to next if-block.
+  for (unsigned i=0, e=vectorizationFactor; i<e; ++i)
+  {
+    BranchInst::Create(ifBlocks[i+1], targetBlocks[i]);
+  }
+
+  // Extract scalar values from entry-mask of exec-block.
+  Value** masks = new Value*[vectorizationFactor]();
+  for (unsigned i=0, e=vectorizationFactor; i<e; ++i)
+  {
+    ConstantInt* c = ConstantInt::get(context, APInt(32, i));
+    masks[i] = ExtractElementInst::Create(mask, c, "", ifBlocks[i]);
+  }
+
+  // Generate conditional jump from each if-block to next exec-block/next if-block.
+  for (unsigned i=0, e=vectorizationFactor; i<e; ++i)
+  {
+    BranchInst::Create(targetBlocks[i], ifBlocks[i+1], masks[i], ifBlocks[i]);
+  }
+
+  delete [] masks;
+}
+
+Function*
+NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp)
+{
+  assert (updateOp);
+  assert (updateOp->getParent());
+  assert (updateOp->getParent()->getParent());
+  assert (updateOp->getParent()->getParent()->getParent());
+
+  Type* type = updateOp->getType();
+  LLVMContext& context = type->getContext();
+
+  SmallVector<Type*, 2> params;
+  params.push_back(type);
+  params.push_back(PointerType::getUnqual(type));
+  FunctionType* fType = FunctionType::get(Type::getVoidTy(context), params, false);
+
+  Module* mod = updateOp->getParent()->getParent()->getParent();
+  return Function::Create(fType, Function::ExternalLinkage, "red_fn", mod);
+}
+
+Function*
+NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
+                                               const unsigned vectorizationFactor,
+                                               const bool     requiresMask)
+{
+  assert (updateOp);
+  assert (updateOp->isBinaryOp());
+  assert (updateOp->getParent());
+  assert (updateOp->getParent()->getParent());
+  assert (updateOp->getParent()->getParent()->getParent());
+
+  Type* type = updateOp->getType();
+  Type* simdType = vectorizeSIMDType(type, vectorizationFactor);
+  assert (simdType);
+  LLVMContext& context = type->getContext();
+
+  SmallVector<Type*, 2> params;
+  // Add the parameter for the operand vector.
+  params.push_back(simdType);
+  // Add the parameter for the alloca.
+  params.push_back(PointerType::getUnqual(type));
+  // Add parameter for the mask (if required).
+  if (requiresMask)
+  {
+    params.push_back(VectorType::get(Type::getInt1Ty(context), vectorizationFactor));
+  }
+  FunctionType* fType = FunctionType::get(Type::getVoidTy(context), params, false);
+
+  Module* mod = updateOp->getParent()->getParent()->getParent();
+  Function* f = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
+
+  // Find out what operation we are creating.
+  const Instruction::BinaryOps opcode = (Instruction::BinaryOps)updateOp->getOpcode();
+
+  // Create reduction code.
+  // *A <- *A (RO) O_SIMD[0] (RO) O_SIMD[1] (RO) ... (RO) O_SIMD[W-1]
+  BasicBlock* entryBB = BasicBlock::Create(context, "entry", f);
+
+  Function::arg_iterator it = f->arg_begin();
+  Argument* O = it++;
+  Argument* A = it++;
+  Argument* mask = requiresMask ? it : 0;
+  LoadInst* load = new LoadInst(A, "A", entryBB);
+
+  ReturnInst* retI = ReturnInst::Create(context, entryBB);
+
+  // If there is no mask, simply generate W extracts and W reduction operations.
+  // Otherwise, generate an if-cascade that only performs the reduction if the
+  // corresponding mask element is true.
+  Instruction* reductionOp = load;
+  if (!mask)
+  {
+    for (unsigned i=0; i<vectorizationFactor; ++i)
+    {
+        ConstantInt* c = ConstantInt::get(context, APInt(32, i));
+        Instruction* extract = ExtractElementInst::Create(O, c, "O", retI);
+        reductionOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", retI);
+    }
+  }
+  else
+  {
+    // Create if-cascade:
+    // Each if-block holds mask extraction and scalar comparison if mask-instance is true.
+    // Each use-block holds scalar use.
+    BasicBlock** ifBlocks     = new BasicBlock*[vectorizationFactor+1]();
+    BasicBlock** targetBlocks = new BasicBlock*[vectorizationFactor]();
+
+    // Start splitting at the return.
+    generateIfCascade(retI, mask, ifBlocks, targetBlocks, vectorizationFactor);
+
+    // Create reduction operations in the correct blocks.
+    for (unsigned i=0; i<vectorizationFactor; ++i)
+    {
+      Instruction* insertBefore = targetBlocks[i]->getTerminator();
+      ConstantInt* c = ConstantInt::get(context, APInt(32, i));
+      Instruction* extract = ExtractElementInst::Create(O, c, "O", insertBefore);
+      Instruction* newRedOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", insertBefore);
+
+      // Create phis in the if blocks.
+      assert (!ifBlocks[i+1]->empty());
+      Instruction* phiPos = ifBlocks[i+1]->getFirstNonPHI();
+
+      PHINode* phi = PHINode::Create(type, 2U, "", phiPos);
+      phi->addIncoming(newRedOp, targetBlocks[i]);
+      // Insert value from previous if (the load if i == 0, last phi otherwise)
+      // where the mask is 0.
+      phi->addIncoming(reductionOp, ifBlocks[i]);
+
+      reductionOp = phi;
+    }
+
+    delete [] targetBlocks;
+    delete [] ifBlocks;
+  }
+
+  new StoreInst(reductionOp, A, retI);
+
+  return f;
+}
+
+// For each reduction, Perform "reg2mem" of the variable, extract the update
+// into a function, and create a SIMD function which performs the reduction.
+void
+NoiseWFVWrapper::handleReductions(Loop*                           loop,
+                                  PHINode*                        indVarPhi,
+                                  const unsigned                  vectorizationFactor,
+                                  DenseMap<Function*, Function*>& simdMappings)
+{
+  assert (loop && indVarPhi);
+  assert (simdMappings.empty());
+
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  BasicBlock* headerBB    = loop->getHeader();
+  BasicBlock* exitBB      = loop->getUniqueExitBlock();
+
+  outs() << "function: " << *indVarPhi->getParent()->getParent() << "\n";
+
+  // Identify reduction variables.
+  // Given by phi and update operation (+,-,*,/,%,<<,>>,&,|,^,&&,||,min,max).
+  RedVarVecType redVars;
+  collectReductionVariables(loop, indVarPhi, *mDomTree, redVars);
+
+  // TODO: Make sure there is no interference between reduction variables.
+
+  // For each reduction variable phi P, start value S, update operation U,
+  // other operand O, reduction result R, reduction operator RO
+  // % U must have exactly two uses: P and R
+  // - Generate an alloca A
+  // - Generate a store in the preheader: *A <- S
+  // - Generate a reduction function F_RO(O, A)
+  // - Generate vector equivalent F_RO_SIMD(O_SIMD, A) that performs the reduction
+  //   - *A <- *A (RO) O_SIMD[0] (RO) O_SIMD[1] (RO) ... (RO) O_SIMD[W-1]
+  // - Add mapping RF -> RF_SIMD to WFV
+  // - Insert call to RF before U
+  // - Generate a load L_P in the header: L_P <- *A
+  // - Replace uses of P by L_P
+  // - Generate a load L_R in the exit block: L_R <- *A
+  // - Replace uses of R by L_R
+  // - Remove P, U, and R
+  Instruction* allocaInsertPos = headerBB->getParent()->getEntryBlock().getFirstNonPHI();
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    ReductionVariable* redVar = *it;
+    Value*       S = redVar->mStartVal;
+    PHINode*     P = redVar->mPhi;
+    Instruction* U = redVar->mUpdateOp;
+    Value*       O = redVar->mOtherOperand;
+    PHINode*     R = redVar->mResult;
+    assert (S && P && U && O && R);
+
+    const bool requiresMask = redVar->mRequiresMask;
+
+    outs() << "  S: " << *S << "\n";
+    outs() << "  P: " << *P << "\n";
+    outs() << "  U: " << *U << "\n";
+    outs() << "  O: " << *O << "\n";
+    outs() << "  R: " << *R << "\n";
+
+    Type* type = P->getType();
+
+    assert (type == S->getType());
+    assert (type == U->getType());
+    assert (type == O->getType());
+    assert (type == R->getType());
+
+    AllocaInst* A = new AllocaInst(type, "red.storage", allocaInsertPos);
+    outs() << "  alloca: " << *A << "\n";
+
+    new StoreInst(S, A, preheaderBB->getTerminator());
+
+    Function* F_RO      = generateReductionFunction(U);
+    Function* F_RO_SIMD = generateReductionFunctionSIMD(U, vectorizationFactor, requiresMask);
+    assert (F_RO && F_RO_SIMD);
+    outs() << "  F_RO: " << *F_RO << "\n";
+    outs() << "  F_RO_SIMD: " << *F_RO_SIMD << "\n";
+
+    simdMappings[F_RO] = F_RO_SIMD;
+
+    SmallVector<Value*, 2> args;
+    args.push_back(O);
+    args.push_back(A);
+    CallInst::Create(F_RO, args, "", U);
+
+    LoadInst* L_P = new LoadInst(A, "red.reload.header", headerBB->getFirstNonPHI());
+    LoadInst* L_R = new LoadInst(A, "red.reload.exit",   exitBB->getFirstNonPHI());
+    outs() << "  L_P: " << *L_P << "\n";
+    outs() << "  L_R: " << *L_R << "\n";
+
+    P->replaceAllUsesWith(L_P);
+    R->replaceAllUsesWith(L_R);
+
+    P->eraseFromParent();
+    R->eraseFromParent();
+    assert (U->use_empty() && "uses of U (= P, R) should be deleted now");
+    U->eraseFromParent();
+  }
+
+  outs() << "function after reduction transformation: " << *indVarPhi->getParent()->getParent() << "\n";
+
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    delete *it;
+  }
+}
+
 template<unsigned S>
 Function*
-NoiseWFVWrapper::extractLoopBody(Loop* loop,
-                                 PHINode*& indVarPhi,
+NoiseWFVWrapper::extractLoopBody(Loop*                        loop,
+                                 PHINode*                     indVarPhi,
+                                 Instruction*                 indVarUpdate,
                                  SmallVector<BasicBlock*, S>& loopBody)
 {
-  assert (loop);
-  assert (!indVarPhi);
+  assert (loop && indVarPhi);
+  assert (loopBody.empty());
 
   BasicBlock* preheaderBB = loop->getLoopPreheader();
   BasicBlock* headerBB    = loop->getHeader();
@@ -388,27 +829,6 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
     if (block == latchBB) continue;
     loopBody.push_back(block);
   }
-
-  // Get loop induction variable phi.
-  indVarPhi = loop->getCanonicalInductionVariable();
-  assert (indVarPhi &&
-          "vectorization of loops without canonical induction variable not supported!");
-  assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
-          "expected induction variable update value to be an instruction!");
-  Instruction* indVarUpdate = cast<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB));
-  assert (indVarUpdate->getParent() == latchBB &&
-          "expected induction variable update operation in latch block!");
-
-  // TODO: These should return gracefully.
-  // TODO: These should eventually be replaced by generation of fixup code.
-  assert (indVarUpdate->getOpcode() == Instruction::Add &&
-          "vectorization of loop with induction variable update operation that is no integer addition not supported!");
-  assert ((indVarUpdate->getOperand(0) == indVarPhi ||
-           indVarUpdate->getOperand(1) == indVarPhi) &&
-          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
-  assert ((indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
-           indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
-          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
 
   // Get loop exit condition.
   assert (isa<BranchInst>(exitingBB->getTerminator()));
