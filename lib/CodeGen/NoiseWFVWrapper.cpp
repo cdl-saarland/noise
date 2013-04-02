@@ -74,7 +74,7 @@ NoiseWFVWrapper::NoiseWFVWrapper(const unsigned vectorizationWidth,
                                  const bool     verbose)
 : FunctionPass(ID),
   mFinished(false),
-  mSIMDWidth(vectorizationWidth),
+  mVectorizationFactor(vectorizationWidth),
   mUseAVX(useAVX),
   mUseDivergenceAnalysis(useDivergenceAnalysis),
   mVerbose(verbose)
@@ -92,12 +92,12 @@ NoiseWFVWrapper::~NoiseWFVWrapper()
 // -> no pointers to pointers allowed
 // TODO: i8* should not be transformed to <4 x i8>* !
 Type*
-NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned simdWidth)
+NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
 {
   if (oldType->isFloatTy() ||
       (oldType->isIntegerTy() && oldType->getPrimitiveSizeInBits() <= 32U))
   {
-    return VectorType::get(oldType, simdWidth);
+    return VectorType::get(oldType, vectorizationFactor);
   }
 
   switch (oldType->getTypeID())
@@ -105,13 +105,13 @@ NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned simdWidth)
   case Type::PointerTyID:
     {
       PointerType* pType = cast<PointerType>(oldType);
-      return PointerType::get(vectorizeSIMDType(pType->getElementType(), simdWidth),
+      return PointerType::get(vectorizeSIMDType(pType->getElementType(), vectorizationFactor),
                               pType->getAddressSpace());
     }
   case Type::ArrayTyID:
     {
       ArrayType* aType = cast<ArrayType>(oldType);
-      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), simdWidth),
+      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), vectorizationFactor),
                             aType->getNumElements());
     }
   case Type::StructTyID:
@@ -120,7 +120,7 @@ NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned simdWidth)
       std::vector<Type*> newParams;
       for (unsigned i=0; i<sType->getNumContainedTypes(); ++i)
       {
-        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), simdWidth));
+        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), vectorizationFactor));
       }
       return StructType::get(oldType->getContext(), newParams, sType->isPacked());
     }
@@ -280,7 +280,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                           &mModule->getContext(),
                                           loopBodyFn,
                                           simdFn,
-                                          mSIMDWidth,
+                                          mVectorizationFactor,
                                           maskPosition,
                                           mUseDivergenceAnalysis,
                                           mVerbose);
@@ -434,11 +434,11 @@ NoiseWFVWrapper::extractLoopBody(Loop* loop,
   assert (bodyFn);
 
   // Now, adjust the original loop.
-  // Increment by 'simdWidth' instead of 1.
-  Constant* simdWidthConst = ConstantInt::get(indVarUpdate->getType(), mSIMDWidth, false);
+  // Increment by 'vectorizationFactor' instead of 1.
+  Constant* vecFactorConst = ConstantInt::get(indVarUpdate->getType(), mVectorizationFactor, false);
   Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
                                                         indVarPhi,
-                                                        simdWidthConst,
+                                                        vecFactorConst,
                                                         "wfv.inc",
                                                         indVarUpdate);
   indVarUpdate->moveBefore(newIndVarUpdate);
