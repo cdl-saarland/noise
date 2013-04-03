@@ -74,9 +74,10 @@ struct NoiseWFVWrapper : public FunctionPass {
                          BasicBlock**   ifBlocks,
                          BasicBlock**   targetBlocks,
                          const unsigned vectorizationFactor);
-  Function* generateReductionFunction(Instruction* updateOp);
+  Function* generateReductionFunction(Instruction* updateOp, const bool requiresRetVal);
   Function* generateReductionFunctionSIMD(Instruction*   updateOp,
                                           const unsigned vectorizationFactor,
+                                          const bool     requiresRetVal,
                                           const bool     requiresMask);
 
   template<unsigned S>

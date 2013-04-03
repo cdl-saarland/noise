@@ -316,8 +316,9 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (DenseMap<Function*, Function*>::iterator it=simdMappings.begin(),
        E=simdMappings.end(); it!=E; ++it)
   {
-    const int maskIdx = it->second->getFunctionType()->getNumParams() <= 2 ? -1 : 2;
-    const bool mayHaveSideEffects = maskIdx != -1;
+    assert (it->second->getFunctionType()->getNumParams() == 3);
+    const int maskIdx = 2;
+    const bool mayHaveSideEffects = true;
     wfvInterface.addSIMDMapping(*it->first, *it->second, maskIdx, mayHaveSideEffects);
   }
 
@@ -449,21 +450,18 @@ collectReductionVariables(Loop*                loop,
     if (indVarPhi == I) continue;
 
     PHINode* phi = cast<PHINode>(I);
-    outs() << "  reduction candidate phi: " << *phi << "\n";
 
     ReductionVariable* redVar = new ReductionVariable();
     redVar->mPhi = phi;
     assert (phi->getNumUses() <= 2 &&
-            "Phi should have at most two uses: the phis in the header and the exit block!");
+            "Phi should have at most two uses: the update op and the phi in the exit block!");
 
     assert (phi->getIncomingValueForBlock(preheaderBB));
     redVar->mStartVal = phi->getIncomingValueForBlock(preheaderBB);
-    outs() << "    start value: " << *redVar->mStartVal << "\n";
 
     assert (phi->getIncomingValueForBlock(latchBB));
     assert (isa<Instruction>(phi->getIncomingValueForBlock(latchBB)));
     Instruction* updateOp = cast<Instruction>(phi->getIncomingValueForBlock(latchBB));
-    outs() << "    update op: " << *updateOp << "\n";
     assert (updateOp->isBinaryOp() && "Can only handle reductions with binary operations");
     assert (updateOp->getNumUses() <= 2 &&
             "Update op should have at most two uses: the phis in the header and the exit block!");
@@ -472,8 +470,14 @@ collectReductionVariables(Loop*                loop,
     Instruction::op_iterator O = updateOp->op_begin();
     Value* op0 = *O++;
     Value* op1 = *O;
+    if (op0 != phi && op1 != phi)
+    {
+        errs() << "ERROR: Only simple reductions are allowed!\n";
+        errs() << "       The update operation must directly use the phi, and the phi "
+            << "must directly use the update operation without intermediate operations!\n";
+        assert (false && "not implemented");
+    }
     redVar->mOtherOperand = op0 == phi ? op1 : op0;
-    outs() << "    other operand: " << *redVar->mOtherOperand << "\n";
 
     for (BasicBlock::iterator I2=exitBB->begin(),
          IE2=exitBB->end(); I2!=IE2; ++I2)
@@ -489,13 +493,10 @@ collectReductionVariables(Loop*                loop,
       redVar->mResult = exitPhi;
       break;
     }
-    assert (redVar->mResult && "Could not find corresponding phi in exit block!");
-    outs() << "    result phi: " << *redVar->mResult << "\n";
 
     // Determine if we require masked reduction.
     // NOTE: It would be beneficial to have divergence information here.
     redVar->mRequiresMask = !domTree.dominates(updateOp->getParent(), latchBB);
-    outs() << "    requires mask? " << redVar->mRequiresMask << "\n";
 
     redVars.push_back(redVar);
   }
@@ -574,7 +575,8 @@ NoiseWFVWrapper::generateIfCascade(Instruction*   inst,
 }
 
 Function*
-NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp)
+NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp,
+                                           const bool   requiresRetVal)
 {
   assert (updateOp);
   assert (updateOp->getParent());
@@ -584,10 +586,11 @@ NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp)
   Type* type = updateOp->getType();
   LLVMContext& context = type->getContext();
 
+  Type* retType = requiresRetVal ? type : Type::getVoidTy(context);
   SmallVector<Type*, 2> params;
   params.push_back(type);
   params.push_back(PointerType::getUnqual(type));
-  FunctionType* fType = FunctionType::get(Type::getVoidTy(context), params, false);
+  FunctionType* fType = FunctionType::get(retType, params, false);
 
   Module* mod = updateOp->getParent()->getParent()->getParent();
   return Function::Create(fType, Function::ExternalLinkage, "red_fn", mod);
@@ -596,6 +599,7 @@ NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp)
 Function*
 NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
                                                const unsigned vectorizationFactor,
+                                               const bool     requiresRetVal,
                                                const bool     requiresMask)
 {
   assert (updateOp);
@@ -609,17 +613,15 @@ NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
   assert (simdType);
   LLVMContext& context = type->getContext();
 
+  Type* retType = requiresRetVal ? simdType : Type::getVoidTy(context);
   SmallVector<Type*, 2> params;
   // Add the parameter for the operand vector.
   params.push_back(simdType);
   // Add the parameter for the alloca.
   params.push_back(PointerType::getUnqual(type));
-  // Add parameter for the mask (if required).
-  if (requiresMask)
-  {
-    params.push_back(VectorType::get(Type::getInt1Ty(context), vectorizationFactor));
-  }
-  FunctionType* fType = FunctionType::get(Type::getVoidTy(context), params, false);
+  // Add parameter for the mask (always, necessary for WFV to always replace the call).
+  params.push_back(VectorType::get(Type::getInt1Ty(context), vectorizationFactor));
+  FunctionType* fType = FunctionType::get(retType, params, false);
 
   Module* mod = updateOp->getParent()->getParent()->getParent();
   Function* f = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
@@ -634,22 +636,28 @@ NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
   Function::arg_iterator it = f->arg_begin();
   Argument* O = it++;
   Argument* A = it++;
-  Argument* mask = requiresMask ? it : 0;
+  Argument* mask = it;
   LoadInst* load = new LoadInst(A, "A", entryBB);
 
-  ReturnInst* retI = ReturnInst::Create(context, entryBB);
+  // Create a return with appropriate type.
+  // The correct value is inserted after the following code gen.
+  ReturnInst* retI = requiresRetVal ?
+      ReturnInst::Create(context, UndefValue::get(simdType), entryBB) :
+      ReturnInst::Create(context, entryBB);
 
   // If there is no mask, simply generate W extracts and W reduction operations.
   // Otherwise, generate an if-cascade that only performs the reduction if the
   // corresponding mask element is true.
   Instruction* reductionOp = load;
-  if (!mask)
+  Value* retVal = UndefValue::get(simdType);
+  if (!requiresMask)
   {
     for (unsigned i=0; i<vectorizationFactor; ++i)
     {
         ConstantInt* c = ConstantInt::get(context, APInt(32, i));
         Instruction* extract = ExtractElementInst::Create(O, c, "O", retI);
         reductionOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", retI);
+        if (requiresRetVal) retVal = InsertElementInst::Create(retVal, reductionOp, c, "ret", retI);
     }
   }
   else
@@ -670,6 +678,7 @@ NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
       ConstantInt* c = ConstantInt::get(context, APInt(32, i));
       Instruction* extract = ExtractElementInst::Create(O, c, "O", insertBefore);
       Instruction* newRedOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", insertBefore);
+      if (requiresRetVal) retVal = InsertElementInst::Create(retVal, newRedOp, c, "ret", retI);
 
       // Create phis in the if blocks.
       assert (!ifBlocks[i+1]->empty());
@@ -689,6 +698,9 @@ NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
   }
 
   new StoreInst(reductionOp, A, retI);
+
+  // Now set the return value to the new vector (if required).
+  if (requiresRetVal) retI->setOperand(0, retVal);
 
   return f;
 }
@@ -725,12 +737,20 @@ NoiseWFVWrapper::handleReductions(Loop*                           loop,
   // - Generate a reduction function F_RO(O, A)
   // - Generate vector equivalent F_RO_SIMD(O_SIMD, A) that performs the reduction
   //   - *A <- *A (RO) O_SIMD[0] (RO) O_SIMD[1] (RO) ... (RO) O_SIMD[W-1]
+  //   - If there are uses of the reduction update U other than P, the function
+  //     has to return a vector of the accumulated values of the W iterations.
+  //     - X0 <- *A (RO) O_SIMD[0]
+  //     - X1 <- X0 (RO) O_SIMD[1]
+  //     - ...
+  //     - XW-1 <- XW-2 (RO) O_SIMD[W-1]
+  //     - ret <- <X0, X1, ...XW-1>
   // - Add mapping RF -> RF_SIMD to WFV
   // - Insert call to RF before U
   // - Generate a load L_P in the header: L_P <- *A
   // - Replace uses of P by L_P
   // - Generate a load L_R in the exit block: L_R <- *A
   // - Replace uses of R by L_R
+  // - If there were additional uses of U, replace them by the result of F_RO
   // - Remove P, U, and R
   Instruction* allocaInsertPos = headerBB->getParent()->getEntryBlock().getFirstNonPHI();
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
@@ -740,31 +760,49 @@ NoiseWFVWrapper::handleReductions(Loop*                           loop,
     PHINode*     P = redVar->mPhi;
     Instruction* U = redVar->mUpdateOp;
     Value*       O = redVar->mOtherOperand;
-    PHINode*     R = redVar->mResult;
-    assert (S && P && U && O && R);
+    PHINode*     R = redVar->mResult; // Can be NULL.
+    assert (S && P && U && O);
 
     const bool requiresMask = redVar->mRequiresMask;
 
-    outs() << "  S: " << *S << "\n";
-    outs() << "  P: " << *P << "\n";
-    outs() << "  U: " << *U << "\n";
-    outs() << "  O: " << *O << "\n";
-    outs() << "  R: " << *R << "\n";
+    outs() << "reduction var phi   P: " << *P << "\n";
+    outs() << "  start value       S: " << *S << "\n";
+    outs() << "  update operation  U: " << *U << "\n";
+    outs() << "  other operand     O: " << *O << "\n";
+    if (R) outs() << "  reduction result  R: " << *R << "\n";
+    else outs() << "  reduction result  R: not available\n";
+    outs() << "  requires mask     ? " << redVar->mRequiresMask << "\n\n";
 
     Type* type = P->getType();
 
     assert (type == S->getType());
     assert (type == U->getType());
     assert (type == O->getType());
-    assert (type == R->getType());
+    assert (!R || type == R->getType());
 
     AllocaInst* A = new AllocaInst(type, "red.storage", allocaInsertPos);
     outs() << "  alloca: " << *A << "\n";
 
     new StoreInst(S, A, preheaderBB->getTerminator());
 
-    Function* F_RO      = generateReductionFunction(U);
-    Function* F_RO_SIMD = generateReductionFunctionSIMD(U, vectorizationFactor, requiresMask);
+    // If U has a use other than P and R, we need the reduction function
+    // to return the result for every iteration we compute in parallel in a vector.
+    bool requiresRetVal = U->getNumUses() > 2;
+    if (!requiresRetVal)
+    {
+      for (Instruction::use_iterator U=U->use_begin(), UE=U->use_end(); U!=UE; ++U)
+      {
+        if (P == *U || R == *U) continue;
+        requiresRetVal = true;
+        break;
+      }
+    }
+
+    Function* F_RO      = generateReductionFunction(U, requiresRetVal);
+    Function* F_RO_SIMD = generateReductionFunctionSIMD(U,
+                                                        vectorizationFactor,
+                                                        requiresRetVal,
+                                                        requiresMask);
     assert (F_RO && F_RO_SIMD);
     outs() << "  F_RO: " << *F_RO << "\n";
     outs() << "  F_RO_SIMD: " << *F_RO_SIMD << "\n";
@@ -774,23 +812,36 @@ NoiseWFVWrapper::handleReductions(Loop*                           loop,
     SmallVector<Value*, 2> args;
     args.push_back(O);
     args.push_back(A);
-    CallInst::Create(F_RO, args, "", U);
+    CallInst* call = CallInst::Create(F_RO, args, "", U);
+    outs() << "  call: " << *call << "\n";
 
     LoadInst* L_P = new LoadInst(A, "red.reload.header", headerBB->getFirstNonPHI());
-    LoadInst* L_R = new LoadInst(A, "red.reload.exit",   exitBB->getFirstNonPHI());
     outs() << "  L_P: " << *L_P << "\n";
-    outs() << "  L_R: " << *L_R << "\n";
-
     P->replaceAllUsesWith(L_P);
-    R->replaceAllUsesWith(L_R);
-
     P->eraseFromParent();
-    R->eraseFromParent();
+
+    if (R)
+    {
+      LoadInst* L_R = new LoadInst(A, "red.reload.exit",   exitBB->getFirstNonPHI());
+      outs() << "  L_R: " << *L_R << "\n";
+      R->replaceAllUsesWith(L_R);
+      R->eraseFromParent();
+    }
+
+    if (requiresRetVal)
+    {
+      U->replaceAllUsesWith(call);
+    }
+
     assert (U->use_empty() && "uses of U (= P, R) should be deleted now");
     U->eraseFromParent();
   }
 
-  outs() << "function after reduction transformation: " << *indVarPhi->getParent()->getParent() << "\n";
+  if (!redVars.empty())
+  {
+    outs() << "function after reduction transformation: "
+        << *indVarPhi->getParent()->getParent() << "\n";
+  }
 
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
