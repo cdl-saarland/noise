@@ -284,7 +284,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
       indVarArg = A;
     }
   }
-  assert (indVarArg);
+  assert (indVarArg && "loop body independent of induction variable!?");
   FunctionType* simdFnType = FunctionType::get(newReturnType, newParamTypes, false);
 
   // Create new name.

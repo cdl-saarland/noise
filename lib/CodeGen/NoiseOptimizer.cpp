@@ -394,7 +394,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     Passes.add(new NoiseSpecializer(variable, values));
   } else if(pass == "wfv") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
-    outs() << "No support for WFV is available\n";
+    errs() << "ERROR: No support for WFV is available\n";
 #else
     outs() << "Running pass: loop-simplify\n";
     outs() << "Running pass: lowerswitch\n";
