@@ -55,8 +55,6 @@
 
 #include <iostream>
 
-//#define NOISE_DISABLE_NOISE
-
 using namespace llvm;
 
 namespace {
@@ -571,9 +569,8 @@ Function* createDummyFunction(Function* noiseFn)
 //       passes from O3).
 void NoiseOptimizer::PerformOptimization()
 {
-#ifdef NOISE_DISABLE_NOISE
-  return;
-#endif
+  // If there is no noise attribute, return immediately.
+  if (MD->getNumOperands() == 0) return;
 
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
@@ -826,9 +823,8 @@ void NoiseOptimizer::PerformOptimization()
 
 void NoiseOptimizer::Reassemble()
 {
-#ifdef NOISE_DISABLE_NOISE
-  return;
-#endif
+  // If there is no noise attribute, return immediately.
+  if (MD->getNumOperands() == 0) return;
 
   PrettyStackTraceString CrashInfo("NOISE: reassemble module after optimizations");
 
@@ -941,10 +937,6 @@ void NoiseOptimizer::Reassemble()
 
 void NoiseOptimizer::Finalize()
 {
-#ifdef NOISE_DISABLE_NOISE
-  return;
-#endif
-
   // Remove noise metadata from TheModule.
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
