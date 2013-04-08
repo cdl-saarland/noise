@@ -50,7 +50,7 @@ NoiseCodeGenerator::~NoiseCodeGenerator()
 bool NoiseCodeGenerator::RegisterFunction(const Decl *D, llvm::Function *Fn, const CGFunctionInfo &FnInfo,
                                           const FunctionArgList &Args)
 {
-  if(!D->hasAttr<NoiseAttr>())
+  if(!D || !D->hasAttr<NoiseAttr>())
     return false;
   llvm::Module* Module = Fn->getParent();
   assert(Module);
