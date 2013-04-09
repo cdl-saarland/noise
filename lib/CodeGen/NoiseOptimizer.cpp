@@ -569,13 +569,6 @@ Function* createDummyFunction(Function* noiseFn)
 //       passes from O3).
 void NoiseOptimizer::PerformOptimization()
 {
-  // If there is no noise attribute, return immediately.
-  if (MD->getNumOperands() == 0) return;
-
-  PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
-
-  //outs() << "Module before noise: " << *Mod;
-
   // Initialize all passes linked into all libraries (see InitializePasses.h).
   // This way, they are registerd so we can add them via getPassInfo().
   initializeCore(*PassRegistry::getPassRegistry());
@@ -589,6 +582,11 @@ void NoiseOptimizer::PerformOptimization()
   initializeIPA(*PassRegistry::getPassRegistry());
   initializeCodeGen(*PassRegistry::getPassRegistry());
   initializeTarget(*PassRegistry::getPassRegistry());
+
+  // If there is no noise attribute, return immediately.
+  if (MD->getNumOperands() == 0) return;
+
+  PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
   {
     // Perform some standard optimizations upfront.
