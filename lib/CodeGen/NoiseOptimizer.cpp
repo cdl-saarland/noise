@@ -55,7 +55,7 @@
 
 #include <iostream>
 
-#define NOISE_ANALYZE_REDUCTIONS
+//#define NOISE_ANALYZE_REDUCTIONS
 
 #ifdef NOISE_ANALYZE_REDUCTIONS
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -1188,6 +1188,30 @@ void NoiseOptimizer::PerformOptimization()
   initializeIPA(*PassRegistry::getPassRegistry());
   initializeCodeGen(*PassRegistry::getPassRegistry());
   initializeTarget(*PassRegistry::getPassRegistry());
+
+#ifdef NOISE_ANALYZE_REDUCTIONS
+  PrettyStackTraceString CrashInfoNoise("NOISE: Analyzing reductions");
+  //////////////////////////////////////////////////////////////////////////////
+  // REDUCTION ANALYZER: CATEGORIZE LOOPS IN TERMS OF THEIR VECTORIZABILITY.
+  //////////////////////////////////////////////////////////////////////////////
+  {
+    PassManager PM;
+    PM.add(new DataLayout(Mod));
+    // Perform some standard optimizations upfront.
+    PM.add(createTypeBasedAliasAnalysisPass());
+    PM.add(createBasicAliasAnalysisPass());
+    PM.add(createScalarReplAggregatesPass());
+    // Perform some transformations that ease loop vectorization.
+    PM.add(createLoopSimplifyPass());
+    PM.add(createIndVarSimplifyPass());
+    PM.add(createLCSSAPass());
+    PM.add(createScalarEvolutionAliasAnalysisPass());
+    // Now analyze the code.
+    PM.add(new NoiseReductionAnalyzer());
+    PM.run(*Mod);
+  }
+  return;
+#endif
 
   // If there is no noise attribute, return immediately.
   if (MD->getNumOperands() == 0) return;
