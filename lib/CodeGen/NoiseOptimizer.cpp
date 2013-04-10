@@ -554,7 +554,11 @@ struct NoiseReductionAnalyzer : public FunctionPass {
       if (indVarPhi == I) continue;
 
       PHINode* reductionPhi = cast<PHINode>(I);
-      assert (reductionPhi->getNumIncomingValues() == 2);
+      if (reductionPhi->getNumIncomingValues() != 2)
+      {
+        out << "  has phi with more than 2 incoming values (not in LCSSA)!\n";
+        continue;
+      }
 
       ReductionVariable* redVar = new ReductionVariable();
       redVar->mPhi = reductionPhi;
@@ -563,7 +567,12 @@ struct NoiseReductionAnalyzer : public FunctionPass {
       redVar->mStartVal = reductionPhi->getIncomingValueForBlock(preheaderBB);
 
       assert (reductionPhi->getIncomingValueForBlock(latchBB));
-      assert (isa<Instruction>(reductionPhi->getIncomingValueForBlock(latchBB)));
+      if (!isa<Instruction>(reductionPhi->getIncomingValueForBlock(latchBB)))
+      {
+        out << "  has phi with non-instruction value incoming from latch: ";
+        out << *reductionPhi << "\n";
+        continue;
+      }
       Instruction* backEdgeOp = cast<Instruction>(reductionPhi->getIncomingValueForBlock(latchBB));
 
       RedUpMapType* reductionSCC = new RedUpMapType();
@@ -574,7 +583,7 @@ struct NoiseReductionAnalyzer : public FunctionPass {
       // is the induction variable phi that could not be determined to be it).
       if (reductionSCC->empty())
       {
-        out << "Reduction SCC of phi is empty: " << *reductionPhi << "\n";
+        out << "  has empty reduction SCC for phi: " << *reductionPhi << "\n";
         continue;
       }
 
@@ -589,14 +598,25 @@ struct NoiseReductionAnalyzer : public FunctionPass {
       {
         if (exitBB->getFirstNonPHI() == I2) break;
         PHINode* exitPhi = cast<PHINode>(I2);
-        assert (exitPhi->getNumIncomingValues() == 1);
-        if (exitPhi->getIncomingValue(0) != reductionPhi)
+        if (exitPhi->getNumIncomingValues() != 1)
+        {
+          out << "  has exit phi with more than one incoming value (not in LCSSA)!\n";
+          bool found = false;
+          for (unsigned i=0, e=exitPhi->getNumIncomingValues(); i<e; ++i)
+          {
+              found |= exitPhi->getIncomingValue(i) == reductionPhi;
+          }
+          if (!found) continue;
+        }
+        else if (exitPhi->getIncomingValue(0) != reductionPhi)
         {
           continue;
         }
 
-        assert (!redVar->mResultUser &&
-                "must not have more than one reduction user outside the loop (LCSSA)!");
+        if (redVar->mResultUser)
+        {
+          out << "  has more than one reduction user outside the loop (not in LCSSA)!\n";
+        }
         redVar->mResultUser = exitPhi;
       }
 
@@ -607,8 +627,10 @@ struct NoiseReductionAnalyzer : public FunctionPass {
         assert (isa<Instruction>(*U));
         Instruction* useI = cast<Instruction>(*U);
         if (loop.contains(useI->getParent())) continue;
-        assert (useI == redVar->mResultUser &&
-                "must not have more than one reduction user outside the loop (LCSSA)!");
+        if (useI != redVar->mResultUser)
+        {
+            out << "  has more than one reduction user outside the loop (not in LCSSA)!\n";
+        }
       }
 
       redVars.push_back(redVar);
@@ -708,7 +730,7 @@ struct NoiseReductionAnalyzer : public FunctionPass {
       PHINode* phi = cast<PHINode>(I);
       Type* PhiTy = phi->getType();
 
-      // We only handle integer and pointer inductions variables.
+      // We only handle integer and pointer induction variables.
       if (!PhiTy->isIntegerTy() && !PhiTy->isPointerTy()) continue;
 
       // Check that the PHI is consecutive.
