@@ -1012,8 +1012,17 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     Passes.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
     Passes.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
     Passes.add(createLoopUnrollPass(-1, count, false));
-  }
-  else if(pass == "specialize") {
+  } else if(pass == "opt") {
+    PassManagerBuilder builder;
+    // use 2 instead of 3 in order to avoid the creation of passes which
+    // are incompatible with our pass setup
+    // during (the invocation of the populateModulePassManager method)
+    builder.OptLevel = 2U;
+    builder.SizeLevel = 0U;
+    builder.DisableUnitAtATime = true;
+    builder.populateFunctionPassManager(Passes);
+    builder.populateModulePassManager(Passes);
+  } else if(pass == "specialize") {
     // pass = "specialize(x,1,2,3)"
     StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
     SmallVector<int, 4> values;
