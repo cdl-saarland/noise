@@ -30,6 +30,8 @@ class Instruction;
 class Value;
 class AllocaInst;
 class CallInst;
+class StoreInst;
+class Argument;
 }
 
 // Forward decl.
@@ -65,14 +67,16 @@ public:
     // The update operation.
     Instruction*             mOperation;
     // The operands that are *not* part of the reduction SCC.
-    SetVector<Value*>*       mOtherOperands;
+    typedef SmallVector<Value*, 2> OtherOperandsVec;
+    OtherOperandsVec*        mOtherOperands;
     // The users of this update operation that are *not* part of the reduction SCC (if any).
-    SetVector<Instruction*>* mResultUsers;
+    typedef SetVector<Instruction*> ResultUsersVec;
+    ResultUsersVec*          mResultUsers;
     // The mask that is required for this update.
     bool                     mRequiresMask;
     // The alloca of the scalar result of this reduction operation (given
     // as output parameter to call).
-    AllocaInst*              mReductionResultPtr;
+    Instruction*             mIntermediateResultPtr;
     // The call to the scalar function that replaces the operation before WFV.
     // The result of the call is the result vector that contains the W different
     // results of each iteration.
@@ -83,6 +87,15 @@ public:
     Value*                   mMask;
     // The index of the mask parameter of mAfterWFVFunction.
     int                      mMaskIndex;
+
+    // These are only set if the update operation requires a mask.
+    Function*                mMaskDummyFn;
+    CallInst*                mMaskDummyFnCall;
+    Function*                mMaskDummyFnSIMD;
+
+    typedef SetVector<AllocaInst*> OtherOpAllocaVec;
+    OtherOpAllocaVec*        mOtherOpAllocas;
+    AllocaInst*              mMaskAlloca;
   };
 
   typedef DenseMap<Instruction*, ReductionUpdate*> RedUpMapType;
@@ -99,6 +112,18 @@ public:
     RedUpMapType* mUpdates;
     // The final reduction result user (if any).
     PHINode*      mResultUser;
+
+    // The position where the reduction operations will be performed after WFV.
+    Instruction*  mReductionPos;
+    Function*     mReductionFn;
+    CallInst*     mReductionFnCall;
+    Function*     mReductionFnSIMD;
+
+    AllocaInst*   mResultPtr;
+
+    Argument*     mPhiArg;
+    StoreInst*    mStoreBack;
+    Instruction*  mBackEdgeVal;
   };
 
   typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
@@ -119,18 +144,8 @@ public:
                                  PHINode*             indVarPhi,
                                  const Loop&          loop,
                                  const DominatorTree& domTree);
-  void prepareReductionsForWFV(RedVarVecType&                  redVars,
-                               const unsigned                  vectorizationFactor,
-                               DenseMap<Function*, Function*>& simdMappings);
-  // UNUSED
-  void demoteReductionPhisToMemory(RedVarVecType&                  redVars,
-                                   Instruction*                    indVarUpdate,
-                                   const Loop&                     loop,
-                                   DenseMap<Function*, Function*>& simdMappings);
-  void mapReductionVarInfo(RedVarVecType& redVars,
-                           Function*      scalarFn,
-                           Function*      simdFn,
-                           const Loop&    loop);
+  void generateMaskCallsForWFV(RedVarVecType& redVars,
+                                    const unsigned vectorizationFactor);
   void finishReductions(RedVarVecType& redVars,
                         const Loop&    loop);
 };
