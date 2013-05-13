@@ -52,6 +52,7 @@
 #include "llvm/IR/DerivedTypes.h" // FunctionType
 #include "llvm/IR/Constants.h" // UndefValue
 #include "llvm/IR/Instructions.h" // CallInst
+#include "llvm/Analysis/Verifier.h" // VerifyFunction
 
 #include <sstream>
 
@@ -282,12 +283,14 @@ typedef NoiseWFVWrapper::ReductionUpdate::ResultUsersVec ResultUsersVec;
 //   Otherwise, we can't do anything, so WFV fails due to a "bad" reduction.
 // NOTE: If operations require masks, this position may not be correct.
 //       However, this can only be fixed after WFV is done and masks are available.
+// TODO: We have to make sure we don't place the call in a branch that is retained
+//       during WFV!
 Instruction*
 getCallInsertPosition(const ReductionVariable& redVar,
                       Instruction*             earliestPos,
                       Instruction*             latestPos)
 {
-#if 0
+#if 0 // deprecated
   // Initialize the earliest position with the first non-phi of the first block
   // after the header (header is excluded from body extraction).
   BasicBlock* headerBB = redVar.mPhi->getParent();
@@ -309,8 +312,10 @@ getCallInsertPosition(const ReductionVariable& redVar,
   assert (earliestPos->getParent()->getParent() == f);
   assert (latestPos->getParent()->getParent() == f);
 
-  // - *After* the last "update operation" that is a phi or select.
   const RedUpMapType& updates = *redVar.mUpdates;
+#if 0
+  // - *After* the last "update operation" that is a phi or select.
+  // TODO: Not sure if this is required.
   for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
   {
     const ReductionUpdate& redUp = *it->second;
@@ -320,6 +325,7 @@ getCallInsertPosition(const ReductionVariable& redVar,
     if (isPredecessor(updateOperation, earliestPos)) continue;
     earliestPos = updateOperation;
   }
+#endif
 
   // - *After* the last "other operand" of any "update operation".
   for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
@@ -600,15 +606,20 @@ vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
 // TODO: It would be beneficial to have WFV vectorization analysis info here.
 void
 generateSIMDReductionFunction(ReductionVariable& redVar,
-                              const unsigned     vectorizationFactor)
+                              const unsigned     vectorizationFactor,
+                              Function*          loopBodyFn)
 {
   Type* type = redVar.mPhi->getType();
   LLVMContext& context = type->getContext();
 
-  SmallVector<Type*, 4> params;
+  SmallVector<Type*, 4>  params;
+  SmallVector<Twine, 4>  names;
+  SmallVector<Value*, 4> values;
 
   // Add input parameter for P.
   params.push_back(type);
+  names.push_back(redVar.mPhiArg->hasName() ? redVar.mPhiArg->getName() : "phi");
+  values.push_back(redVar.mPhiArg);
 
   // Add input parameters for "other operands".
   const RedUpMapType& updates = *redVar.mUpdates;
@@ -622,6 +633,8 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
       Value* operand = *it2;
       Type* simdType = vectorizeSIMDType(operand->getType(), vectorizationFactor);
       params.push_back(simdType);
+      names.push_back(operand->hasName() ? operand->getName() : "otherOp");
+      values.push_back(operand);
     }
   }
 
@@ -632,12 +645,18 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
     if (!redUp.mRequiresMask) continue;
     Type* simdType = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor);
     params.push_back(simdType);
+    Instruction* update = redUp.mOperation;
+    names.push_back(update->hasName() ? update->getName()+".mask" : "update.mask");
+    values.push_back(NULL); // Value does not yet exist.
   }
 
   // Add output parameter for final result.
   params.push_back(PointerType::getUnqual(type));
+  names.push_back("result.ptr");
+  values.push_back(redVar.mOutArg);
 
   // Add output parameters for "result users".
+  const unsigned firstResultUserPtrIndex = params.size();
   for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
   {
     const ReductionUpdate& redUp = *it->second;
@@ -645,16 +664,236 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
     Type* updateType = redUp.mOperation->getType();
     Type* simdType = vectorizeSIMDType(updateType, vectorizationFactor);
     params.push_back(PointerType::getUnqual(simdType));
+    names.push_back("update.result.ptr");
+    values.push_back(NULL);
   }
 
   // Add dummy mask parameter (unused, only required for WFV to prevent splitting).
   Type* maskTy = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor);
   params.push_back(maskTy);
+  names.push_back("");
+  values.push_back(NULL); // No value required.
 
   FunctionType* fType = FunctionType::get(Type::getVoidTy(context), params, false);
 
   Module* mod = redVar.mPhi->getParent()->getParent()->getParent();
-  redVar.mReductionFnSIMD = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
+  Function* simdRedFn = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
+  redVar.mReductionFnSIMD = simdRedFn;
+
+  SmallVector<Twine, 4>::const_iterator N = names.begin();
+  for (Function::arg_iterator A = simdRedFn->arg_begin(),
+      AE = simdRedFn->arg_end(); A != AE; ++A, ++N)
+  {
+      A->setName(*N);
+  }
+
+  outs() << "SIMD reduction function signature: " << *simdRedFn << "\n";
+
+  //-------------------------------------------------------------------------//
+  // Generate code for the SIMD reduction from the original function.
+  //-------------------------------------------------------------------------//
+
+  // First, specify which arguments of the old function map to arguments
+  // of the new one. By leaving all others unspecified, the corresponding
+  // code is dead and should be removed automatically.
+  // To this end, we iterate over the call to the scalar reduction function.
+  // NOTE: Since we put all "other operands" into local memory, these
+  //       arguments (if any) never map directly. Thus, the only remaining
+  //       argument is the phi arg.
+  ValueToValueMapTy valueMap;
+  ValueToValueMapTy replaceMap;
+
+  // Initialize all parameters with "undef" first.
+  // Otherwise, all arguments of loopBodyFn that are not part of
+  // any reduction will not have any mapping.
+  for (Function::const_arg_iterator A = loopBodyFn->arg_begin(),
+      AE = loopBodyFn->arg_end(); A != AE; ++A)
+  {
+    valueMap[A] = UndefValue::get(A->getType());
+  }
+
+  // Map the collected values (operands of the reduction) to
+  // the arguments of simdRedFn.
+  // This covers the mapping of the phi and all otherOps that are defined
+  // outside the loop (so they were arguments after extraction already).
+  // This does NOT cover otherOps that are defined in the body.
+  // This also does NOT correctly handle non-uniform otherOps.
+  // NOTE: This essentially only fills valueMap/replaceMap for use in the loop.
+  SmallVector<Value*, 4>::iterator V = values.begin();
+  for (Function::arg_iterator AR = simdRedFn->arg_begin(),
+      ARE = simdRedFn->arg_end(); AR != ARE; ++AR, ++V)
+  {
+    Value* value = *V;
+    if (!value) continue;
+    assert (!value ||
+            AR->getType() == value->getType() ||
+            (AR->getType()->isVectorTy() &&
+             AR->getType()->getVectorElementType() == value->getType()));
+    // We only add mappings for arguments of the original function.
+    // (This is not strictly necessary since CloneFunctionInto overwrites the information anyway).
+    if (isa<Argument>(value))
+    {
+      outs() << "original arg: " << *value << "\n";
+      outs() << "mapped arg  : " << *AR << "\n";
+      valueMap[value] = AR;
+    }
+    replaceMap[value] = AR;
+  }
+
+  SmallVector<Value*, 2> intermediateResults;
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (redUp.mResultUsers->empty()) continue;
+    Type* updateType = redUp.mOperation->getType();
+    Type* vecType = vectorizeSIMDType(updateType, vectorizationFactor);
+    intermediateResults.push_back(UndefValue::get(vecType));
+  }
+
+  Value* lastIterOut = NULL;
+  BasicBlock* lastExitBB = NULL;
+  for (unsigned i=0; i<vectorizationFactor; ++i)
+  {
+    ConstantInt* c = ConstantInt::get(context, APInt(32, i));
+
+    // Set this iteration's "input" (the reference to the phi arg) to the
+    // "output" of the last iteration.
+    // First iteration: already done by mapping phi to argument.
+    if (i != 0)
+    {
+      valueMap[redVar.mPhiArg] = lastIterOut;
+    }
+
+    // Clone the function.
+    // It is desired that some operations afterwards still have references to "undef":
+    // These are operations that are not required anymore since their result - if
+    // used at all in the SCC - is replaced by one of the "inputs" of the last iteration.
+    SmallVector<ReturnInst*, 2> returns;
+    ClonedCodeInfo              clonedFInfo;
+    const char*                 nameSuffix = ".";
+    CloneFunctionInto(simdRedFn,
+                      loopBodyFn,
+                      valueMap,
+                      false,
+                      returns,
+                      nameSuffix,
+                      &clonedFInfo);
+
+    // Replace other operands that are defined in the loop body by the respective arguments.
+    // This kills the corresponding code in the reduction function.
+    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+    {
+      const ReductionUpdate& redUp = *it->second;
+      Instruction* mappedUp = cast<Instruction>(valueMap[redUp.mOperation]);
+      OtherOperandsVec& otherOperands = *redUp.mOtherOperands;
+      for (OtherOperandsVec::const_iterator it2=otherOperands.begin(),
+           E2=otherOperands.end(); it2!=E2; ++it2)
+      {
+        Value* operand = *it2;
+        if (isa<Argument>(operand))
+        {
+          // Fix other operands that are vectorized function arguments.
+          Value* mappedArg = valueMap[operand];
+          Value* replaceArg = replaceMap[operand];
+          outs() << "operandArg: " << *operand << "\n";
+          outs() << "mappedArg : " << *mappedArg << "\n";
+          outs() << "replaceArg: " << *replaceArg << "\n";
+          if (!replaceArg->getType()->isVectorTy()) continue;
+
+          // TODO: For more complex types, we have to use generic extract function (-> WFV).
+          replaceArg = ExtractElementInst::Create(replaceArg, c, "", mappedUp);
+          // We must not replace all uses of mappedArg, since this would replace
+          // all uses of previous iterations of i as well.
+          mappedUp->replaceUsesOfWith(mappedArg, replaceArg);
+
+          continue;
+        }
+
+        Value* mappedOp = valueMap[operand];
+        Value* replaceOp = replaceMap[operand];
+        outs() << "operand  : " << *operand << "\n";
+        outs() << "mappedOp : " << *mappedOp << "\n";
+        outs() << "replaceOp: " << *replaceOp << "\n";
+        // If the operand is a vector, we have to extract the element that
+        // corresponds to the current iteration.
+        if (replaceOp->getType()->isVectorTy())
+        {
+          // TODO: For more complex types, we have to use generic extract function (-> WFV).
+          replaceOp = ExtractElementInst::Create(replaceOp, c, "", mappedUp);
+        }
+        // Here, replacing all uses is safe since the mapped operation is unique
+        // for this iteration of i.
+        mappedOp->replaceAllUsesWith(replaceOp);
+        if (Instruction* inst = dyn_cast<Instruction>(mappedOp)) inst->eraseFromParent();
+      }
+    }
+
+    // Replace return by a branch to the latest entry block.
+    // First iteration: do nothing :p.
+    if (i != 0)
+    {
+      assert (isa<ReturnInst>(lastExitBB->getTerminator()));
+      BasicBlock* entryBB = cast<BasicBlock>(valueMap[&loopBodyFn->getEntryBlock()]);
+      BranchInst::Create(entryBB, lastExitBB->getTerminator());
+      lastExitBB->getTerminator()->eraseFromParent();
+    }
+
+    // This iteration's "output" is the "input" of the next clone.
+    assert (valueMap[redVar.mStoreBack]);
+    StoreInst* storeBack = cast<StoreInst>(valueMap[redVar.mStoreBack]);
+    lastIterOut = storeBack->getValueOperand();
+    lastExitBB = storeBack->getParent();
+
+    // Remove the store operation (unless this is the last iteration).
+    if (i+1 != vectorizationFactor)
+    {
+      storeBack->eraseFromParent();
+    }
+
+    // Finally, we need to update the vectors of all intermediate results that are used
+    // outside of the SCC.
+    unsigned intermIdx = 0;
+    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+    {
+      const ReductionUpdate& redUp = *it->second;
+      if (redUp.mResultUsers->empty()) continue;
+      Value* intermRes = intermediateResults[intermIdx];
+      Instruction* mappedUp = cast<Instruction>(valueMap[redUp.mOperation]);
+      // TODO: For more complex types, we have to use generic insert function (-> WFV).
+      // TODO: Use alloca/store instead of SSA values to circumvent control-flow-related issues.
+      InsertElementInst* newIntermRes = InsertElementInst::Create(intermRes,
+                                                                  mappedUp,
+                                                                  c,
+                                                                  "",
+                                                                  mappedUp);
+      mappedUp->moveBefore(cast<Instruction>(newIntermRes));
+      intermediateResults[intermIdx] = newIntermRes;
+
+      // In the last iteration, the intermediate results have to be stored
+      // to their corresponding output arguments.
+      if (i+1 == vectorizationFactor)
+      {
+        Function::arg_iterator A = simdRedFn->arg_begin();
+        std::advance(A, firstResultUserPtrIndex+intermIdx);
+        StoreInst* store = new StoreInst(intermediateResults[intermIdx], A, newIntermRes);
+        newIntermRes->moveBefore(store);
+      }
+
+      ++intermIdx;
+    }
+
+    outs() << "simdRedFn after iteration " << i << "\n";
+    outs() << *simdRedFn << "\n";
+  } // Iterate W times.
+
+  // TODO: Remove all code that has nothing to do with the SCC.
+  for (Function::iterator BB=simdRedFn->begin(), BBE=simdRedFn->end(); BB!=BBE; ++BB)
+  {
+    for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
+    {
+
+    }
+  }
 }
 
 } // unnamed namespace
@@ -903,6 +1142,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     assert (outArg->getType()->getPointerElementType() == redVar.mPhi->getType());
     assert (outArg->getNumUses() == 1);
     assert (isa<StoreInst>(*outArg->use_begin()));
+    redVar.mOutArg = outArg;
     StoreInst* storeBack = cast<StoreInst>(*outArg->use_begin());
     assert (isa<Instruction>(storeBack->getValueOperand()));
     assert (redVar.mUpdates->count(cast<Instruction>(storeBack->getValueOperand())));
@@ -910,6 +1150,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   }
 
   outs() << "\nfunction after extraction:" << *loopBodyFn << "\n";
+  verifyFunction(*loopBodyFn);
 
   //-------------------------------------------------------------------------//
 
@@ -953,15 +1194,12 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn);
     outs() << "reduction var phi: " << *redVar.mPhi << "\n";
-
-    // Generate dummy reduction function.
-    generateSIMDReductionFunction(redVar, mVectorizationFactor);
     outs() << "  SIMD reduction function: " << *redVar.mReductionFnSIMD << "\n";
-
-    assert (redVar.mReductionFnSIMD);
+    assert (!verifyFunction(*redVar.mReductionFnSIMD));
   }
-  //assert (false && "not implemented");
+  exit(0);
 
   //-------------------------------------------------------------------------//
 
@@ -993,7 +1231,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   //-------------------------------------------------------------------------//
 
-#if 0
+#if 0 // deprecated
   // Replace dummy calls introduced for intermediate uses by correct allocas.
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
@@ -1026,14 +1264,14 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   {
     ReductionVariable& redVar = **it;
 
-#if 0
+#if 0 // deprecated
     // Replace use of mPhi by final reduction result (reload from alloca).
     Instruction* pos = loop->getExitingBlock()->getTerminator();
     LoadInst* reload = new LoadInst(redVar.mResultPtr, "red.result.reload", pos);
     redVar.mResultUser->replaceUsesOfWith(redVar.mPhi, reload);
 #endif
 
-#if 0
+#if 0 // deprecated
     // Replace incoming value from latch to mPhi by the final result of the reduction call.
     const unsigned latchIdx = redVar.mPhi->getBasicBlockIndex(loop->getLoopLatch());
     assert (isa<Instruction>(redVar.mPhi->getIncomingValue(latchIdx)));
@@ -1280,8 +1518,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                     nameSuffix,
                     &clonedFInfo);
 
-  assert (loopBodyFn);
-
   // The generated function is not required anymore.
   simdFn->eraseFromParent();
 
@@ -1500,6 +1736,7 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
     redVar->mReductionFnSIMD = NULL;
     redVar->mResultPtr = NULL;
     redVar->mPhiArg = NULL;
+    redVar->mOutArg = NULL;
     redVar->mStoreBack = NULL;
 
     redVars.push_back(redVar);
@@ -1548,7 +1785,7 @@ NoiseWFVWrapper::generateMaskCallsForWFV(RedVarVecType& redVars,
   }
 }
 
-#if 0
+#if 0 // deprecated
 // Helper functions for finishReductions().
 namespace {
 
@@ -1679,110 +1916,6 @@ generateReductionFunctionSIMD(ReductionVariable& redVar,
 
   Module* mod = redVar.mPhi->getParent()->getParent()->getParent();
   return Function::Create(fType, Function::ExternalLinkage, "red_fn_final", mod);
-
-#if 0
-  assert (updateOp);
-  assert (updateOp->isBinaryOp());
-  assert (updateOp->getParent());
-  assert (updateOp->getParent()->getParent());
-  assert (updateOp->getParent()->getParent()->getParent());
-
-  Type* type = updateOp->getType();
-  Type* simdType = vectorizeSIMDType(type, vectorizationFactor);
-  assert (simdType);
-  LLVMContext& context = type->getContext();
-
-  Type* retType = requiresRetVal ? simdType : Type::getVoidTy(context);
-  SmallVector<Type*, 2> params;
-  // Add the parameter for the operand vector.
-  params.push_back(simdType);
-  // Add the parameter for the alloca.
-  params.push_back(PointerType::getUnqual(type));
-  // Add parameter for the mask (always, necessary for WFV to always replace the call).
-  params.push_back(VectorType::get(Type::getInt1Ty(context), vectorizationFactor));
-  FunctionType* fType = FunctionType::get(retType, params, false);
-
-  Module* mod = updateOp->getParent()->getParent()->getParent();
-  Function* f = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
-
-  // Find out what operation we are creating.
-  const Instruction::BinaryOps opcode = (Instruction::BinaryOps)updateOp->getOpcode();
-
-  // Create reduction code.
-  // *A <- *A (RO) O_SIMD[0] (RO) O_SIMD[1] (RO) ... (RO) O_SIMD[W-1]
-  BasicBlock* entryBB = BasicBlock::Create(context, "entry", f);
-
-  Function::arg_iterator it = f->arg_begin();
-  Argument* O = it++;
-  Argument* A = it++;
-  Argument* mask = it;
-  LoadInst* load = new LoadInst(A, "A", entryBB);
-
-  // Create a return with appropriate type.
-  // The correct value is inserted after the following code gen.
-  ReturnInst* retI = requiresRetVal ?
-      ReturnInst::Create(context, UndefValue::get(simdType), entryBB) :
-      ReturnInst::Create(context, entryBB);
-
-  // If there is no mask, simply generate W extracts and W reduction operations.
-  // Otherwise, generate an if-cascade that only performs the reduction if the
-  // corresponding mask element is true.
-  Instruction* reductionOp = load;
-  Value* retVal = UndefValue::get(simdType);
-  if (!requiresMask)
-  {
-    for (unsigned i=0; i<vectorizationFactor; ++i)
-    {
-        ConstantInt* c = ConstantInt::get(context, APInt(32, i));
-        Instruction* extract = ExtractElementInst::Create(O, c, "O", retI);
-        reductionOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", retI);
-        if (requiresRetVal) retVal = InsertElementInst::Create(retVal, reductionOp, c, "ret", retI);
-    }
-  }
-  else
-  {
-    // Create if-cascade:
-    // Each if-block holds mask extraction and scalar comparison if mask-instance is true.
-    // Each use-block holds scalar use.
-    BasicBlock** ifBlocks     = new BasicBlock*[vectorizationFactor+1]();
-    BasicBlock** targetBlocks = new BasicBlock*[vectorizationFactor]();
-
-    // Start splitting at the return.
-    generateIfCascade(retI, mask, ifBlocks, targetBlocks, vectorizationFactor);
-
-    // Create reduction operations in the correct blocks.
-    for (unsigned i=0; i<vectorizationFactor; ++i)
-    {
-      Instruction* insertBefore = targetBlocks[i]->getTerminator();
-      ConstantInt* c = ConstantInt::get(context, APInt(32, i));
-      Instruction* extract = ExtractElementInst::Create(O, c, "O", insertBefore);
-      Instruction* newRedOp = BinaryOperator::Create(opcode, reductionOp, extract, "red", insertBefore);
-      if (requiresRetVal) retVal = InsertElementInst::Create(retVal, newRedOp, c, "ret", retI);
-
-      // Create phis in the if blocks.
-      assert (!ifBlocks[i+1]->empty());
-      Instruction* phiPos = ifBlocks[i+1]->getFirstNonPHI();
-
-      PHINode* phi = PHINode::Create(type, 2U, "", phiPos);
-      phi->addIncoming(newRedOp, targetBlocks[i]);
-      // Insert value from previous if (the load if i == 0, last phi otherwise)
-      // where the mask is 0.
-      phi->addIncoming(reductionOp, ifBlocks[i]);
-
-      reductionOp = phi;
-    }
-
-    delete [] targetBlocks;
-    delete [] ifBlocks;
-  }
-
-  new StoreInst(reductionOp, A, retI);
-
-  // Now set the return value to the new vector (if required).
-  if (requiresRetVal) retI->setOperand(0, retVal);
-
-  return f;
-#endif
 }
 
 // Transform the reduction SCC:

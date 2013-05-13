@@ -122,6 +122,7 @@ public:
     AllocaInst*   mResultPtr;
 
     Argument*     mPhiArg;
+    Argument*     mOutArg;
     StoreInst*    mStoreBack;
     Instruction*  mBackEdgeVal;
   };
