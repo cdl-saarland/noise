@@ -1200,6 +1200,20 @@ Function* createDummyFunction(Function* noiseFn)
     return dummyFn;
 }
 
+bool hasNoiseCompoundStmt(const Module& module) {
+  for (Module::const_iterator F=module.begin(),
+       FE=module.end(); F!=FE; ++F)
+  {
+    for (Function::const_iterator BB=F->begin(),
+         BBE=F->end(); BB!=BBE; ++BB)
+    {
+      if (BB->getTerminator()->getMetadata("noise_compound_stmt"))
+        return true;
+    }
+  }
+  return false;
+}
+
 } // unnamed namespace
 
 // TODO: Support "negative" noise attributes (e.g. "subtraction" of specified
@@ -1245,7 +1259,7 @@ void NoiseOptimizer::PerformOptimization()
 #endif
 
   // If there is no noise attribute, return immediately.
-  if (MD->getNumOperands() == 0) return;
+  if (MD->getNumOperands() == 0 && !hasNoiseCompoundStmt(*Mod)) return;
 
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
@@ -1600,7 +1614,7 @@ void NoiseOptimizer::Finalize()
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
   MD->eraseFromParent();
-  //outs() << "module after noise: " << *Mod;
+  outs() << "module after noise: " << *Mod;
 }
 
 }
