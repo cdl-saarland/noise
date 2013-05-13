@@ -15,6 +15,8 @@
 
 #include "NoiseWFVWrapper.h"
 
+#include "NoiseWFVMaskAnalysis.h"
+
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -59,6 +61,24 @@ using namespace llvm;
 
 namespace llvm {
 
+NoiseWFVWrapper::ReductionUpdate::~ReductionUpdate()
+{
+  mOtherOperands->clear();
+  mResultUsers->clear();
+  delete mOtherOperands;
+  delete mResultUsers;
+}
+
+NoiseWFVWrapper::ReductionVariable::~ReductionVariable()
+{
+  for (RedUpMapType::iterator it=mUpdates->begin(),
+       E=mUpdates->end(); it!=E; ++it)
+  {
+    delete it->second;
+  }
+  delete mUpdates;
+}
+
 #if 0
 Pass*
 createNoiseWFVWrapperPass()
@@ -86,55 +106,6 @@ NoiseWFVWrapper::~NoiseWFVWrapper()
 {
 }
 
-// Create SIMD type from scalar type.
-// -> only 32bit-float, integers <= 32bit, pointers, arrays and structs allowed
-// -> no scalar datatypes allowed
-// -> no pointers to pointers allowed
-// TODO: i8* should not be transformed to <4 x i8>* !
-Type*
-NoiseWFVWrapper::vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
-{
-  if (oldType->isFloatTy() ||
-      (oldType->isIntegerTy() && oldType->getPrimitiveSizeInBits() <= 32U))
-  {
-    return VectorType::get(oldType, vectorizationFactor);
-  }
-
-  switch (oldType->getTypeID())
-  {
-  case Type::PointerTyID:
-    {
-      PointerType* pType = cast<PointerType>(oldType);
-      return PointerType::get(vectorizeSIMDType(pType->getElementType(), vectorizationFactor),
-                              pType->getAddressSpace());
-    }
-  case Type::ArrayTyID:
-    {
-      ArrayType* aType = cast<ArrayType>(oldType);
-      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), vectorizationFactor),
-                            aType->getNumElements());
-    }
-  case Type::StructTyID:
-    {
-      StructType* sType = cast<StructType>(oldType);
-      std::vector<Type*> newParams;
-      for (unsigned i=0; i<sType->getNumContainedTypes(); ++i)
-      {
-        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), vectorizationFactor));
-      }
-      return StructType::get(oldType->getContext(), newParams, sType->isPacked());
-    }
-
-  default:
-    {
-      errs() << "\nERROR: only arguments of type float, int, pointer, "
-        << "array or struct can be vectorized, not '"
-        << *oldType << "'!\n";
-      return 0;
-    }
-  }
-}
-
 bool
 NoiseWFVWrapper::runOnFunction(Function &F)
 {
@@ -159,6 +130,91 @@ NoiseWFVWrapper::runOnFunction(Function &F)
   //       loop body.
   return success;
 }
+
+void
+NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
+{
+  AU.addRequired<DominatorTree>();
+  AU.addRequired<LoopInfo>();
+}
+
+
+// Helper functions for runWFV().
+namespace {
+
+template<unsigned S>
+Function*
+extractLoopBody(Loop*                        loop,
+                PHINode*                     indVarPhi,
+                Instruction*                 indVarUpdate,
+                const unsigned               vectorizationFactor,
+                DominatorTree*               domTree,
+                SmallVector<BasicBlock*, S>& loopBody)
+{
+  assert (loop && indVarPhi);
+  assert (loopBody.empty());
+
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  BasicBlock* headerBB    = loop->getHeader();
+  BasicBlock* latchBB     = loop->getLoopLatch();
+  BasicBlock* exitingBB   = loop->getExitingBlock();
+  assert (preheaderBB && headerBB && latchBB &&
+          "vectorization of non-simplified loop not supported!");
+  assert (exitingBB &&
+          "vectorization of loop with multiple exits not supported!");
+  assert (exitingBB == headerBB &&
+          "expected exiting block to be the loop header!");
+
+  // Collect all blocks that are definitely part of the body.
+  std::vector<BasicBlock*>& blocks = loop->getBlocksVector();
+  for (unsigned i=0, e=blocks.size(); i<e; ++i)
+  {
+    BasicBlock* block = blocks[i];
+    if (block == headerBB) continue;
+    if (block == exitingBB) continue; // Redundant.
+    if (block == latchBB) continue;
+    loopBody.push_back(block);
+  }
+
+  // Get loop exit condition.
+  assert (isa<BranchInst>(exitingBB->getTerminator()));
+  BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
+
+  assert (isa<ICmpInst>(exitBr->getCondition()));
+  ICmpInst* exitCond = cast<ICmpInst>(exitBr->getCondition());
+  assert (exitCond->getParent() == exitingBB &&
+          "expected exit condition to be in exiting block!");
+  assert (exitCond->getNumUses() == 1 &&
+          "expected exit condition to have only one use in the exit branch!");
+
+  // Split latch directly before induction variable increment.
+  BasicBlock* newLatchBB = SplitBlock(latchBB, indVarUpdate, domTree);
+  newLatchBB->setName(latchBB->getName()+".wfv.latch");
+
+  // latchBB is now the part of the latch that is only the body.
+  loopBody.push_back(latchBB);
+
+  CodeExtractor extractor(loopBody, domTree, false);
+  assert (extractor.isEligible());
+  Function* bodyFn = extractor.extractCodeRegion();
+  assert (bodyFn);
+
+  // Now, adjust the original loop.
+  // Increment by 'vectorizationFactor' instead of 1.
+  Constant* vecFactorConst = ConstantInt::get(indVarUpdate->getType(), vectorizationFactor, false);
+  Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
+                                                        indVarPhi,
+                                                        vecFactorConst,
+                                                        "wfv.inc",
+                                                        indVarUpdate);
+  indVarUpdate->moveBefore(newIndVarUpdate);
+  indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
+  newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
+
+  return bodyFn;
+}
+
+} // unnamed namespace
 
 // TODO: Implement generation of fixup code for cases where we either
 //       don't know the exact iteration count or where it is not an exact
@@ -204,6 +260,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
           "vectorization of loops with multiple exits not supported!");
 
   // Get loop induction variable phi.
+  // TODO: Use Scalar Evolution for that.
   PHINode* indVarPhi = loop->getCanonicalInductionVariable();
   assert (indVarPhi &&
           "vectorization of loops without canonical induction variable not supported!");
@@ -224,17 +281,6 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
            indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
           "vectorization of loop with induction variable update operation that is no simple increment not supported!");
 
-
-  DenseMap<Function*, Function*> simdMappings;
-  handleReductions(loop, indVarPhi, mVectorizationFactor, simdMappings);
-
-  // Make sure there are no values that are live across loop boundaries (LALB).
-  // This is because WFV only supports loops without loop-carried dependencies.
-  // NOTE: We rely on LCSSA here, which allows us to simply test if there is
-  //       a phi in the exit block. If so, there are dependencies.
-  assert (!isa<PHINode>(exitBB->begin()) &&
-          "vectorization of loops with loop-carried dependencies not supported!");
-
   // Do some sanity checks to test assumptions about our construction.
   assert (preheaderBB == &noiseFn->getEntryBlock());
   assert (preheaderBB->getTerminator()->getNumSuccessors() == 1);
@@ -242,12 +288,51 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   assert (isa<PHINode>(headerBB->begin()));
   assert (cast<PHINode>(headerBB->begin())->getNumIncomingValues() == 2);
 
+  //-------------------------------------------------------------------------//
+
+  // Identify reduction variables and their operations.
+  // TODO: Make sure there is no interference between reduction variables.
+  // TODO: There's a problem with store-load chains that we don't detect
+  //       to be part of the SCC!
+  RedVarVecType redVars;
+  collectReductionVariables(redVars, indVarPhi, *loop, *mDomTree);
+
+  // TODO: Make sure we stop here already if there are reductions we can't handle.
+  //assert (!isa<PHINode>(exitBB->begin()) &&
+          //"vectorization of loops with loop-carried dependencies not supported!");
+
+  //-------------------------------------------------------------------------//
+
+  DenseMap<Function*, Function*> simdMappings;
+  prepareReductionsForWFV(redVars, mVectorizationFactor, simdMappings);
+
+  //-------------------------------------------------------------------------//
+
+  // Before going on with WFV, we have to transform all reductions to go through
+  // memory. This is because otherwise, WFV will see a disallowed store to a
+  // scalar pointer with varying value (due to the calls to the reduction
+  // update functions being varying).
+  // All we have to do to work around this is to introduce an alloca for the
+  // reduction phi, replace all uses of the phi (the reduction function calls)
+  // by a load, and store the value of the last reduction operation at the end
+  // of the loop. All those three operations remain outside the code that is
+  // extracted, so WFV only sees an incoming pointer to a scalar that is only
+  // used by the reduction functions.
+  //demoteReductionPhisToMemory(redVars, indVarUpdate, *loop, simdMappings);
+
+  //-------------------------------------------------------------------------//
+
   // Extract the loop body.
   // This is a non-trivial task, since the code that is not part of the body
   // (induction variable increment etc.) in the C code is part of it in LLVM IR.
   // This function attempts to split out only the relevant parts of the code.
   SmallVector<BasicBlock*, 4> loopBody;
-  Function* loopBodyFn = extractLoopBody(loop, indVarPhi, indVarUpdate, loopBody);
+  Function* loopBodyFn = extractLoopBody(loop,
+                                         indVarPhi,
+                                         indVarUpdate,
+                                         mVectorizationFactor,
+                                         mDomTree,
+                                         loopBody);
   if (!loopBodyFn)
   {
     errs() << "ERROR: Loop body extraction failed!\n";
@@ -316,8 +401,9 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (DenseMap<Function*, Function*>::iterator it=simdMappings.begin(),
        E=simdMappings.end(); it!=E; ++it)
   {
-    assert (it->second->getFunctionType()->getNumParams() == 3);
-    const int maskIdx = 2;
+    // The mask is always the last parameter (by construction in prepareReductionsForWFV()).
+    const unsigned numParams = it->second->getFunctionType()->getNumParams();
+    const int maskIdx = numParams-1;
     const bool mayHaveSideEffects = true;
     wfvInterface.addSIMDMapping(*it->first, *it->second, maskIdx, mayHaveSideEffects);
   }
@@ -336,6 +422,20 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   assert (mModule->getFunction(simdFnName));
   assert (simdFn == mModule->getFunction(simdFnName));
 
+  //-------------------------------------------------------------------------//
+
+  // Map reduction variable information to the vectorized function.
+  mapReductionVarInfo(redVars, loopBodyFn, simdFn, *loop);
+
+  //-------------------------------------------------------------------------//
+
+  finishReductions(redVars, *loop);
+
+  //-------------------------------------------------------------------------//
+
+  // Create calls to all reduction functions & inline them immediately.
+  assert (false && "not implemented");
+  // TODO: Remove/Adapt the following loop.
   // Inline reduction functions (if any) into the vectorized code.
   // The "scalar" dummy reduction function can't be erased until the temporary
   // function that served as the basis for WFV was erased.
@@ -409,39 +509,144 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   assert (loopBodyFn->use_empty());
   loopBodyFn->eraseFromParent();
 
+  // Delete reduction variable data structure.
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    delete *it;
+  }
+
   return true;
 }
 
+// Helper functions for collectReductionVariables().
 namespace {
 
-struct ReductionVariable
+typedef NoiseWFVWrapper::RedUpMapType RedUpMapType;
+typedef NoiseWFVWrapper::RedVarVecType RedVarVecType;
+typedef NoiseWFVWrapper::ReductionUpdate ReductionUpdate;
+typedef NoiseWFVWrapper::ReductionVariable ReductionVariable;
+
+// TODO: There's a problem with store-load chains that we don't detect
+//       to be part of the SCC!
+bool
+findReductionSCC(Instruction*                  curInst,
+                 PHINode*                      reductionPhi,
+                 const Loop&                   loop,
+                 RedUpMapType&                 reductionSCC,
+                 SmallPtrSet<Instruction*, 8>& visitedInsts)
 {
-  ReductionVariable()
-  : mStartVal(0), mPhi(0), mUpdateOp(0), mOtherOperand(0), mResult(0), mRequiresMask(false)
-  {}
+  assert (curInst && reductionPhi);
 
-  Value*       mStartVal;
-  PHINode*     mPhi;
-  Instruction* mUpdateOp;
-  Value*       mOtherOperand;
-  PHINode*     mResult;
-  bool         mRequiresMask;
-};
+  if (visitedInsts.count(curInst)) return false;
+  visitedInsts.insert(curInst);
 
-typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
+  if (reductionSCC.count(curInst)) return true;
+  if (curInst == reductionPhi) return true;
+
+  // Recurse into the operands and see if we can find the reduction phi or
+  // another instruction that is already part of the SCC.
+  bool isInSCC = false;
+  for (Instruction::op_iterator O=curInst->op_begin(),
+       OE=curInst->op_end(); O!=OE; ++O)
+  {
+    // Don't recurse into non-instruction operands.
+    if (!isa<Instruction>(*O)) continue;
+    Instruction* opInst = cast<Instruction>(*O);
+
+    // If this predecessor is already in the SCC, don't recurse into it.
+    if (reductionPhi == opInst || reductionSCC.count(opInst))
+    {
+      isInSCC = true;
+      continue;
+    }
+
+    // Don't recurse into blocks that are not in the loop.
+    BasicBlock* opBB = opInst->getParent();
+    if (!loop.contains(opBB)) continue;
+
+    // Recurse.
+    isInSCC |= findReductionSCC(opInst, reductionPhi, loop, reductionSCC, visitedInsts);
+  }
+
+  if (!isInSCC) return false;
+
+  ReductionUpdate* redUp = new ReductionUpdate();
+  redUp->mOperation = curInst;
+
+  reductionSCC[curInst] = redUp;
+
+  return true;
+}
 
 void
-collectReductionVariables(Loop*                loop,
-                          PHINode*             indVarPhi,
-                          const DominatorTree& domTree,
-                          RedVarVecType&       redVars)
+gatherReductionUpdateInfo(RedUpMapType&        reductionSCC,
+                          const PHINode*       reductionPhi,
+                          const BasicBlock*    latchBB,
+                          const DominatorTree& domTree)
 {
-  assert (loop && indVarPhi);
+  for (RedUpMapType::iterator it=reductionSCC.begin(),
+       E=reductionSCC.end(); it!=E; ++it)
+  {
+    ReductionUpdate& redUp = *it->second;
+    Instruction* updateOp = redUp.mOperation;
 
-  BasicBlock* preheaderBB = loop->getLoopPreheader();
-  BasicBlock* headerBB    = loop->getHeader();
-  BasicBlock* latchBB     = loop->getLoopLatch();
-  BasicBlock* exitBB      = loop->getUniqueExitBlock();
+    // Add all operands that are not part of the SCC to the "other operands" set.
+    SetVector<Value*>* otherOps = new SetVector<Value*>();
+    for (Instruction::op_iterator O=updateOp->op_begin(),
+         OE=updateOp->op_end(); O!=OE; ++O)
+    {
+      if (Instruction* opInst = dyn_cast<Instruction>(*O))
+      {
+        if (reductionPhi == opInst) continue;
+        if (reductionSCC.count(opInst)) continue;
+      }
+      otherOps->insert(*O);
+    }
+    redUp.mOtherOperands = otherOps;
+
+    // Add all users that are not part of the SCC to the "result users" set.
+    SetVector<Instruction*>* resultUsers = new SetVector<Instruction*>();
+    for (Instruction::use_iterator U=updateOp->use_begin(),
+         UE=updateOp->use_end(); U!=UE; ++U)
+    {
+      assert (isa<Instruction>(*U));
+      Instruction* useI = cast<Instruction>(*U);
+      if (reductionPhi == useI) continue;
+      if (reductionSCC.count(useI)) continue;
+
+      resultUsers->insert(useI);
+    }
+    redUp.mResultUsers = resultUsers;
+
+    // Find out if this operation may require masked reduction.
+    // NOTE: It would be beneficial to have WFV divergence information here.
+    redUp.mRequiresMask = isa<PHINode>(updateOp) || isa<SelectInst>(updateOp) ||
+        !domTree.dominates(updateOp->getParent(), latchBB);
+
+    // The other information is only inserted later.
+    redUp.mReductionResultPtr = NULL;
+    redUp.mScalarCall = NULL;
+    redUp.mAfterWFVFunction = NULL;
+    redUp.mMask = NULL;
+    redUp.mMaskIndex = -1;
+  }
+}
+
+} // unnamed namespace
+
+// TODO: Make sure there is no interference between reduction variables.
+void
+NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
+                                           PHINode*             indVarPhi,
+                                           const Loop&          loop,
+                                           const DominatorTree& domTree)
+{
+  assert (indVarPhi);
+
+  BasicBlock* preheaderBB = loop.getLoopPreheader();
+  BasicBlock* headerBB    = loop.getHeader();
+  BasicBlock* latchBB     = loop.getLoopLatch();
+  BasicBlock* exitBB      = loop.getUniqueExitBlock();
 
   for (BasicBlock::iterator I=headerBB->begin(),
        IE=headerBB->end(); I!=IE; ++I)
@@ -449,61 +654,572 @@ collectReductionVariables(Loop*                loop,
     if (headerBB->getFirstNonPHI() == I) break;
     if (indVarPhi == I) continue;
 
-    PHINode* phi = cast<PHINode>(I);
+    PHINode* reductionPhi = cast<PHINode>(I);
+    assert (reductionPhi->getNumIncomingValues() == 2);
 
     ReductionVariable* redVar = new ReductionVariable();
-    redVar->mPhi = phi;
-    assert (phi->getNumUses() <= 2 &&
-            "Phi should have at most two uses: the update op and the phi in the exit block!");
+    redVar->mPhi = reductionPhi;
 
-    assert (phi->getIncomingValueForBlock(preheaderBB));
-    redVar->mStartVal = phi->getIncomingValueForBlock(preheaderBB);
+    assert (reductionPhi->getIncomingValueForBlock(preheaderBB));
+    redVar->mStartVal = reductionPhi->getIncomingValueForBlock(preheaderBB);
 
-    assert (phi->getIncomingValueForBlock(latchBB));
-    assert (isa<Instruction>(phi->getIncomingValueForBlock(latchBB)));
-    Instruction* updateOp = cast<Instruction>(phi->getIncomingValueForBlock(latchBB));
-    assert (updateOp->isBinaryOp() && "Can only handle reductions with binary operations");
-    assert (updateOp->getNumUses() <= 2 &&
-            "Update op should have at most two uses: the phis in the header and the exit block!");
-    redVar->mUpdateOp = updateOp;
+    assert (reductionPhi->getIncomingValueForBlock(latchBB));
+    assert (isa<Instruction>(reductionPhi->getIncomingValueForBlock(latchBB)));
+    Instruction* backEdgeOp = cast<Instruction>(reductionPhi->getIncomingValueForBlock(latchBB));
 
-    Instruction::op_iterator O = updateOp->op_begin();
-    Value* op0 = *O++;
-    Value* op1 = *O;
-    if (op0 != phi && op1 != phi)
-    {
-        errs() << "ERROR: Only simple reductions are allowed!\n";
-        errs() << "       The update operation must directly use the phi, and the phi "
-            << "must directly use the update operation without intermediate operations!\n";
-        assert (false && "not implemented");
-    }
-    redVar->mOtherOperand = op0 == phi ? op1 : op0;
+    RedUpMapType* reductionSCC = new RedUpMapType();
+    SmallPtrSet<Instruction*, 8> visitedInsts;
+    findReductionSCC(backEdgeOp, reductionPhi, loop, *reductionSCC, visitedInsts);
 
+    assert (!reductionSCC->empty());
+    gatherReductionUpdateInfo(*reductionSCC, reductionPhi, latchBB, domTree);
+
+    redVar->mUpdates = reductionSCC;
+
+    // There does not need to be a result user, but there may be one.
+    redVar->mResultUser = 0;
     for (BasicBlock::iterator I2=exitBB->begin(),
          IE2=exitBB->end(); I2!=IE2; ++I2)
     {
       if (exitBB->getFirstNonPHI() == I2) break;
       PHINode* exitPhi = cast<PHINode>(I2);
       assert (exitPhi->getNumIncomingValues() == 1);
-      if (exitPhi->getIncomingValue(0) != updateOp &&
-          exitPhi->getIncomingValue(0) != phi)
+      if (exitPhi->getIncomingValue(0) != reductionPhi)
       {
         continue;
       }
-      redVar->mResult = exitPhi;
-      break;
+
+      assert (!redVar->mResultUser &&
+              "must not have more than one reduction user outside the loop!");
+      redVar->mResultUser = exitPhi;
     }
 
-    // Determine if we require masked reduction.
-    // NOTE: It would be beneficial to have divergence information here.
-    redVar->mRequiresMask = !domTree.dominates(updateOp->getParent(), latchBB);
+    // Sanity check.
+    for (Instruction::use_iterator U=reductionPhi->use_begin(),
+         UE=reductionPhi->use_end(); U!=UE; ++U)
+    {
+      assert (isa<Instruction>(*U));
+      Instruction* useI = cast<Instruction>(*U);
+      if (loop.contains(useI->getParent())) continue;
+      assert (useI == redVar->mResultUser &&
+              "must not have more than one reduction user outside the loop!");
+    }
 
     redVars.push_back(redVar);
   }
 }
 
+// Helper functions for prepareReductionsForWFV().
+namespace {
+
+// Create SIMD type from scalar type.
+// -> only 32bit-float, integers <= 32bit, pointers, arrays and structs allowed
+// -> no scalar datatypes allowed
+// -> no pointers to pointers allowed
+// TODO: i8* should not be transformed to <4 x i8>* !
+Type*
+vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
+{
+  if (oldType->isFloatTy() ||
+      (oldType->isIntegerTy() && oldType->getPrimitiveSizeInBits() <= 32U))
+  {
+    return VectorType::get(oldType, vectorizationFactor);
+  }
+
+  switch (oldType->getTypeID())
+  {
+  case Type::PointerTyID:
+    {
+      PointerType* pType = cast<PointerType>(oldType);
+      return PointerType::get(vectorizeSIMDType(pType->getElementType(), vectorizationFactor),
+                              pType->getAddressSpace());
+    }
+  case Type::ArrayTyID:
+    {
+      ArrayType* aType = cast<ArrayType>(oldType);
+      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), vectorizationFactor),
+                            aType->getNumElements());
+    }
+  case Type::StructTyID:
+    {
+      StructType* sType = cast<StructType>(oldType);
+      std::vector<Type*> newParams;
+      for (unsigned i=0; i<sType->getNumContainedTypes(); ++i)
+      {
+        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), vectorizationFactor));
+      }
+      return StructType::get(oldType->getContext(), newParams, sType->isPacked());
+    }
+
+  default:
+    {
+      errs() << "\nERROR: only arguments of type float, int, pointer, "
+        << "array or struct can be vectorized, not '"
+        << *oldType << "'!\n";
+      return 0;
+    }
+  }
+}
+
+// Generate a reduction function F_RO_U:
+// - Return type is the type of U.
+// - One input parameter per "in-SCC operand".
+// - One input parameter per "other operand".
+// - One input parameter if a mask is required.
+// - One output parameter if U has at least one "result user".
+Function*
+generateReductionFunctionU(const ReductionUpdate& redUp)
+{
+  LLVMContext& context = redUp.mOperation->getContext();
+
+  Type* updateOpType = redUp.mOperation->getType();
+
+  SmallVector<Type*, 4> params;
+
+  // Add input parameters for each "in-SCC operand".
+  // Add input parameters for each "other operand".
+  // = Simply add all operands.
+  Instruction* update = redUp.mOperation;
+  for (Instruction::op_iterator O=update->op_begin(),
+       OE=update->op_end(); O!=OE; ++O)
+  {
+    Value* operand = *O;
+    params.push_back(operand->getType());
+  }
+
+  // Add output parameter for the updated reduction variable (to be used by
+  // subsequent "in-SCC" operations).
+  params.push_back(PointerType::getUnqual(updateOpType));
+
+  // We don't need a mask parameter for the scalar reduction function, as the
+  // mask is added automatically to the replaced call by WFV if the target
+  // function of the mapping has an additional mask parameter.
+
+  // Set return type if there is at least one "result user".
+  Type* retType = redUp.mResultUsers->empty() ?
+      Type::getVoidTy(context) :
+      updateOpType;
+
+  FunctionType* fType = FunctionType::get(retType, params, false);
+
+  Module* mod = redUp.mOperation->getParent()->getParent()->getParent();
+  Function* f = Function::Create(fType, Function::ExternalLinkage, "red_up_fn", mod);
+
+  // Create code for the function.
+  BasicBlock* entryBB = BasicBlock::Create(context, "entry", f);
+
+  Instruction* clone = redUp.mOperation->clone();
+  Function::arg_iterator A = f->arg_begin();
+  for (unsigned i=0, e=clone->getNumOperands(); i<e; ++i, ++A)
+  {
+    clone->setOperand(i, A);
+  }
+
+  ReturnInst* retI = redUp.mResultUsers->empty() ?
+      ReturnInst::Create(context, entryBB) :
+      ReturnInst::Create(context, clone, entryBB);
+
+  clone->insertBefore(retI);
+
+  return f;
+}
+
+// Insert call to F_RO_U at the place of U.
+CallInst*
+generateReductionCallU(Function*        F_RO_U,
+                       ReductionUpdate& redUp)
+{
+  assert (F_RO_U);
+  Instruction* update = redUp.mOperation;
+
+  SmallVector<Value*, 4> args;
+
+  // Add "in-SCC operands".
+  // Add "other operands".
+  // = Add all operands.
+  for (Instruction::op_iterator O=update->op_begin(),
+       OE=update->op_end(); O!=OE; ++O)
+  {
+    args.push_back(*O);
+  }
+
+  // Generate and add alloca for the reduction result output.
+  Function* f = update->getParent()->getParent();
+  Instruction* allocaInsertPos = f->getEntryBlock().getFirstNonPHI();
+  Type* updateType = update->getType();
+  AllocaInst* alloca = new AllocaInst(updateType, "redup.interm.storage", allocaInsertPos);
+  args.push_back(alloca);
+  redUp.mReductionResultPtr = alloca;
+
+  CallInst* call = CallInst::Create(F_RO_U, args, "", update);
+
+  redUp.mScalarCall = call;
+
+  return call;
+}
+
+// Transform the reduction SCC:
+// - Replace all "in-SCC users" of U with the call's return value.
+// - Replace all "result users" of U with the output parameter of the call.
+// - Remove U.
+void
+transformReductionSCCU(ReductionUpdate& redUp)
+{
+    Instruction* update = redUp.mOperation;
+
+    // We must not use the iterator for the actual "replacement iteration",
+    // since this disturbs iteration.
+    SmallVector<Instruction*, 2> useVec;
+    for (Instruction::use_iterator U=update->use_begin(),
+         UE=update->use_end(); U!=UE; ++U)
+    {
+      assert (isa<Instruction>(*U));
+      useVec.push_back(cast<Instruction>(*U));
+    }
+
+    for (unsigned i=0, e=useVec.size(); i<e; ++i)
+    {
+      Instruction* useI = useVec[i];
+      Instruction* replaceI;
+      if (redUp.mResultUsers->count(useI))
+      {
+        // This is a "result user".
+        // -> Replace with "intermediate result" (return value of call, is a vector after WFV).
+        replaceI = redUp.mScalarCall;
+      }
+      else
+      {
+        // This is an "in-SCC user".
+        // -> Replace with reduction result (output param, still scalar after WFV).
+
+        // Create reload before the use.
+        LoadInst* load = new LoadInst(redUp.mReductionResultPtr, "redup.interm.reload", useI);
+        replaceI = load;
+      }
+
+      useI->replaceUsesOfWith(update, replaceI);
+    }
+
+    assert (update->use_empty());
+    update->eraseFromParent();
+    redUp.mOperation = NULL;
+}
+
+// Generate vector equivalent F_RO_U_SIMD:
+// - Return type remains scalar (same as the return type of F_RO).
+// - The input parameters for the "in-SCC operands" remain scalar.
+// - The input parameters for the "other operands" are vectorized.
+// - The (additional, optional) input parameter for the "update operation mask" is vectorized.
+// - The output parameter for the "result users" is vectorized.
+Function*
+generateReductionFunctionSIMDU(ReductionUpdate& redUp,
+                               const unsigned   vectorizationFactor)
+{
+  Instruction* updateOp = redUp.mOperation;
+
+  assert (updateOp);
+  assert (updateOp->getParent());
+  assert (updateOp->getParent()->getParent());
+  assert (updateOp->getParent()->getParent()->getParent());
+
+  Type* type = updateOp->getType();
+  Type* simdType = vectorizeSIMDType(type, vectorizationFactor);
+  assert (simdType);
+  LLVMContext& context = type->getContext();
+
+  SmallVector<Type*, 2> params;
+
+  for (Instruction::op_iterator O=updateOp->op_begin(),
+       OE=updateOp->op_end(); O!=OE; ++O)
+  {
+    assert (isa<Value>(*O));
+    Value* useVal = cast<Value>(*O);
+    Type* useType = useVal->getType();
+    if (redUp.mOtherOperands->count(useVal))
+    {
+      // This is an "other operand". -> Input parameter is vectorized.
+      params.push_back(vectorizeSIMDType(useType, vectorizationFactor));
+    }
+    else
+    {
+      // This is an "in-SCC operand". -> Input parameter remains scalar.
+      params.push_back(useType);
+    }
+  }
+
+  // Add the parameter for the scalar alloca.
+  params.push_back(PointerType::getUnqual(type));
+
+  // Set return type if there is at least one "result user".
+  Type* retType = redUp.mResultUsers->empty() ?
+      Type::getVoidTy(context) :
+      simdType;
+
+  // Add parameter for the mask (always, necessary for WFV to always replace the call).
+  Type* vecMaskType = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor);
+  params.push_back(vecMaskType);
+  redUp.mMaskIndex = params.size();
+
+  FunctionType* fType = FunctionType::get(retType, params, false);
+
+  Module* mod = updateOp->getParent()->getParent()->getParent();
+  Function* f = Function::Create(fType, Function::ExternalLinkage, "red_fn_SIMD", mod);
+  redUp.mAfterWFVFunction = f;
+
+  return f;
+}
+
 } // unnamed namespace
 
+// For each reduction, extract the update into a function and create a SIMD
+// function mapping. The actual reduction code is created later.
+//
+// Detailed description:
+// For each reduction SCC:
+// - For each "update operation" U:
+//
+//   - Generate a reduction function F_RO_U:
+//     - Return type is the type of U.
+//     - One input parameter per "in-SCC operand".
+//     - One input parameter per "other operand".
+//     - One input parameter if a mask is required.
+//     - One output parameter if U has at least one "result user".
+//
+//     - The function contains a clone of U as code.
+//
+//   - Insert call to F_RO_U at the place of U.
+//
+//   - Generate vector equivalent F_RO_U_SIMD:
+//     - Return type remains scalar (same as the return type of F_RO).
+//     - The input parameters for the "in-SCC operands" remain scalar.
+//     - The input parameters for the "other operands" are vectorized.
+//     - The (additional, optional) input parameter for the "update operation mask" is vectorized.
+//     - The output parameter for the "result users" is vectorized.
+//
+//   - Add mapping F_RO_U -> F_RO_U_SIMD to WFV.
+//
+//   - Transform the reduction SCC:
+//     - Replace all "in-SCC users" of U with the call's return value.
+//     - Replace all "result users" of U with the output parameter of the call.
+//     - Remove U.
+void
+NoiseWFVWrapper::prepareReductionsForWFV(RedVarVecType&                  redVars,
+                                         const unsigned                  vectorizationFactor,
+                                         DenseMap<Function*, Function*>& simdMappings)
+{
+  assert (simdMappings.empty());
+
+  if (redVars.empty()) return;
+
+  outs() << "function: " << *(*redVars.begin())->mPhi->getParent()->getParent() << "\n";
+
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    ReductionVariable& redVar = **it;
+    PHINode*      P = redVar.mPhi;
+    Value*        S = redVar.mStartVal;
+    RedUpMapType* U = redVar.mUpdates;
+    PHINode*      R = redVar.mResultUser; // Can be NULL.
+    assert (P && S && U);
+
+    outs() << "reduction var phi  P: " << *P << "\n";
+    outs() << "  start value      S: " << *S << "\n";
+    if (R) outs() << "  reduction result R: " << *R << "\n";
+    else outs() << "  reduction result R: not available\n";
+
+    Type* type = P->getType();
+
+    assert (type == S->getType());
+    assert (!R || type == R->getType());
+
+    const RedUpMapType& updates = *redVar.mUpdates;
+    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+    {
+      ReductionUpdate& redUp = *it->second;
+
+      outs() << "  update operation O: " << *redUp.mOperation << "\n";
+
+      // - Generate a reduction function F_RO_U:
+      Function* F_RO_U = generateReductionFunctionU(redUp);
+      outs() << "  F_RO_U: " << *F_RO_U;
+
+      // - Insert call to F_RO_U:
+      CallInst* call = generateReductionCallU(F_RO_U, redUp);
+      outs() << "  call: " << *call << "\n";
+
+      // - Generate vector equivalent F_RO_U_SIMD:
+      Function* F_RO_U_SIMD = generateReductionFunctionSIMDU(redUp, vectorizationFactor);
+      outs() << "  F_RO_U_SIMD: " << *F_RO_U_SIMD << "\n";
+
+      // - Add mapping F_RO_U -> F_RO_U_SIMD to WFV:
+      simdMappings[F_RO_U] = F_RO_U_SIMD;
+
+      // - Transform the reduction SCC:
+      transformReductionSCCU(redUp);
+    }
+  }
+
+  outs() << "function after reduction transformation: "
+      << *(*redVars.begin())->mPhi->getParent()->getParent() << "\n";
+}
+
+// Transform all reductions to go through memory:
+// - Introduce an alloca for the reduction phi.
+// - Store the start value in the preheader of the loop.
+// - Replace all uses of the reduction phi (the reduction function calls) by a load in the header.
+// - Store the return value at the end of the loop.
+// - Replace all uses of the result user (if any) by a load after the loop.
+// UNUSED
+void
+NoiseWFVWrapper::demoteReductionPhisToMemory(RedVarVecType&                  redVars,
+                                             Instruction*                    indVarUpdate,
+                                             const Loop&                     loop,
+                                             DenseMap<Function*, Function*>& simdMappings)
+{
+  if (redVars.empty()) return;
+
+  BasicBlock* preheaderBB = loop.getLoopPreheader();
+  BasicBlock* headerBB    = loop.getHeader();
+  BasicBlock* latchBB     = loop.getLoopLatch();
+  BasicBlock* exitBB      = loop.getUniqueExitBlock();
+
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    ReductionVariable& redVar = **it;
+    PHINode*      P = redVar.mPhi;
+    Value*        S = redVar.mStartVal;
+    RedUpMapType* U = redVar.mUpdates;
+    PHINode*      R = redVar.mResultUser; // Can be NULL.
+    assert (P && S && U);
+
+    Type* type = P->getType();
+
+    Function* f = P->getParent()->getParent();
+    Instruction* allocaInsertPos = f->getEntryBlock().getFirstNonPHI();
+    AllocaInst* alloca = new AllocaInst(type, "redvar.storage", allocaInsertPos);
+
+    new StoreInst(S, alloca, preheaderBB->getTerminator());
+
+    LoadInst* loadHeader = new LoadInst(alloca, "redvar.reload", headerBB->getFirstNonPHI());
+    P->replaceAllUsesWith(loadHeader);
+
+#if 1
+    new StoreInst(P->getIncomingValueForBlock(latchBB), alloca, latchBB->getTerminator());
+#else
+  LLVMContext& context = preheaderBB->getContext();
+
+    // We have to capsulate the store at the end of the loop iteration in an
+    // additional "reduction update" call so that WFV doesn't get confused.
+    Value* storeVal = P->getIncomingValueForBlock(latchBB);
+    SmallVector<Type*, 2> params;
+    params.push_back(storeVal->getType());
+    params.push_back(alloca->getType());
+    FunctionType* storeFnTy = FunctionType::get(Type::getVoidTy(context), params, false);
+    Function* storeFn = Function::Create(storeFnTy,
+                                         GlobalVariable::ExternalLinkage,
+                                         "red_store_fn",
+                                         preheaderBB->getParent()->getParent());
+    BasicBlock* entryBB = BasicBlock::Create(context, "entry", storeFn);
+
+    Function::arg_iterator A = storeFn->arg_begin();
+    new StoreInst(A, ++A, entryBB);
+    ReturnInst::Create(context, entryBB);
+
+    // Call the store function.
+    // The call has to happen *before* the induction variable increment,
+    // otherwise the call is not extracted into the body function.
+    SmallVector<Value*, 2> args;
+    args.push_back(storeVal);
+    args.push_back(alloca);
+    CallInst::Create(storeFn, args, "", indVarUpdate);
+
+#if 0
+    // Create SIMD equivalent for the store call mapping.
+    // Add parameter for the mask (always, necessary for WFV to always replace the call).
+    params.clear();
+    params.push_back(vectorizeSIMDType(storeVal->getType(), vectorizationFactor));
+    params.push_back(alloca->getType());
+    Type* vecMaskType = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor);
+    params.push_back(vecMaskType);
+    redUp.mMaskIndex = params.size();
+
+    FunctionType* storeFnTySIMD = FunctionType::get(Type::getVoidTy(context), params, false);
+
+    Module* mod = updateOp->getParent()->getParent()->getParent();
+    Function* storeFnSIMD = Function::Create(storeFnTySIMD,
+                                             Function::ExternalLinkage,
+                                             "red_store_fn_SIMD",
+                                             mod);
+
+    // Add mapping for WFV.
+    simdMappings[storeFn] = storeFnSIMD;
+#endif
+#endif
+
+    if (R)
+    {
+      LoadInst* loadPostLoop = new LoadInst(alloca, "redvar.reload", exitBB->getFirstNonPHI());
+      R->replaceAllUsesWith(loadPostLoop);
+      assert (R->use_empty());
+      R->eraseFromParent();
+      redVar.mResultUser = NULL;
+    }
+
+    assert (P->use_empty());
+    P->eraseFromParent();
+    redVar.mPhi = NULL;
+  }
+
+  outs() << "function after reduction phi demotion: "
+      << *preheaderBB->getParent() << "\n";
+}
+
+void
+NoiseWFVWrapper::mapReductionVarInfo(RedVarVecType& redVars,
+                                     Function*      scalarFn,
+                                     Function*      simdFn,
+                                     const Loop&    loop)
+{
+    assert (scalarFn && simdFn);
+
+    for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+    {
+        ReductionVariable& redVar = **it;
+        PHINode* P = redVar.mPhi;
+        PHINode* R = redVar.mResultUser;
+        Value*   S = redVar.mStartVal;
+        RedUpMapType& updates = *redVar.mUpdates;
+
+        for (RedUpMapType::iterator it2=updates.begin(), E=updates.end(); it2!=E; ++it2)
+        {
+            ReductionUpdate& redUp = *it2->second;
+            Function* simdRedFn = redUp.mAfterWFVFunction;
+            assert (simdRedFn->getNumUses() == 1);
+            assert (isa<Instruction>(*simdRedFn->use_begin()));
+            assert (cast<Instruction>(*simdRedFn->use_begin())->getParent()->getParent() == simdFn);
+
+            SetVector<Value*>& otherOps = *redUp.mOtherOperands;
+            for (SetVector<Value*>::iterator it3=otherOps.begin(), E=otherOps.end(); it3!=E; ++it3)
+            {
+                Value* otherOp = *it3;
+                if (!isa<Instruction>(otherOp)) continue;
+                Instruction* opI = cast<Instruction>(otherOp);
+                if (opI != P && loop.getHeader() == opI->getParent())
+                {
+                    assert (P->getParent()->getParent() == scalarFn &&
+                            "phi operand already found!");
+                    assert (isa<PHINode>(opI));
+                    redVar.mPhi = cast<PHINode>(opI);
+                    outs() << "  mapped P: " << *P << " -> " << *opI << "\n";
+                }
+            }
+        }
+
+    }
+}
+
+// Helper functions for finishReductions().
+namespace {
 
 // State after execution of this function:
 // - parent block of inst is split at the position of inst
@@ -512,7 +1228,7 @@ collectReductionVariables(Loop*                loop,
 // - each if-block holds mask extraction and scalar comparison if mask-instance is true
 // - each target-block only holds an unconditional branch to the next if-block
 void
-NoiseWFVWrapper::generateIfCascade(Instruction*   inst,
+generateIfCascade(Instruction*   inst,
                                    Value*         mask,
                                    BasicBlock**   ifBlocks,
                                    BasicBlock**   targetBlocks,
@@ -574,34 +1290,302 @@ NoiseWFVWrapper::generateIfCascade(Instruction*   inst,
   delete [] masks;
 }
 
-Function*
-NoiseWFVWrapper::generateReductionFunction(Instruction* updateOp,
-                                           const bool   requiresRetVal)
+// This works analogously to parameter generation in generateReductionFunction().
+void
+getCallArgs(const ReductionVariable& redVar,
+            SmallVector<Value*, 4>&  args)
 {
-  assert (updateOp);
-  assert (updateOp->getParent());
-  assert (updateOp->getParent()->getParent());
-  assert (updateOp->getParent()->getParent()->getParent());
+  // Add P.
+  args.push_back(redVar.mPhi);
 
-  Type* type = updateOp->getType();
+  // Add "other operands".
+  const RedUpMapType& updates = *redVar.mUpdates;
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    const SetVector<Value*>& otherOperands = *redUp.mOtherOperands;
+    for (SetVector<Value*>::const_iterator it2=otherOperands.begin(),
+         E2=otherOperands.end(); it2!=E2; ++it2)
+    {
+      args.push_back(*it2);
+    }
+  }
+
+  // Add masks.
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (!redUp.mRequiresMask) continue;
+    assert (false && "not implemented");
+    args.push_back(redUp.mMask); // TODO: mMask was never set.
+  }
+
+  // Generate and add allocas for "result users".
+  Function* f = redVar.mPhi->getParent()->getParent();
+  Instruction* allocaInsertPos = f->getEntryBlock().getFirstNonPHI();
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (redUp.mResultUsers->empty()) continue;
+    Type* updateType = redUp.mOperation->getType();
+    AllocaInst* alloca = new AllocaInst(updateType, "red.user.storage", allocaInsertPos);
+    args.push_back(alloca);
+  }
+}
+
+bool
+isPredecessor(const BasicBlock*                  bbA,
+              const BasicBlock*                  bbB,
+              SmallPtrSet<const BasicBlock*, 8>& visitedBlocks)
+{
+  assert (bbA && bbB);
+
+  if (visitedBlocks.count(bbB)) return false;
+  visitedBlocks.insert(bbB);
+
+  if (bbA == bbB) return false;
+
+  for (const_pred_iterator P=pred_begin(bbB), PE=pred_end(bbB); P!=PE; ++P)
+  {
+    const BasicBlock* predBB = *P;
+
+    if (predBB == bbA) return true;
+    if (isPredecessor(bbA, predBB, visitedBlocks)) return true;
+  }
+
+  return false;
+}
+
+bool
+isPredecessor(const Instruction* instA, const Instruction* instB)
+{
+  assert (instA && instB);
+
+  if (instA == instB) return false;
+
+  const BasicBlock* parentB = instB->getParent();
+
+  // Search B's list for the first occurrence of A or B.
+  const BasicBlock::InstListType& instList = parentB->getInstList();
+  for (BasicBlock::InstListType::const_iterator it=instList.begin(),
+       E=instList.end(); it!=E; ++it)
+  {
+    const Instruction* curInst = &(*it);
+
+    // Stop as soon as we see B.
+    if (curInst == instB) break;
+
+    // If we see A, it comes before B, so A is predecessor of B.
+    if (curInst == instA) return true;
+  }
+
+  // A was not found, so we now test whether parentA is a predecessor of parentB.
+  const BasicBlock* parentA = instA->getParent();
+  SmallPtrSet<const BasicBlock*, 8> visitedBlocks;
+  return isPredecessor(parentA, parentB, visitedBlocks);
+}
+
+// Determine a valid position for the call (if any):
+// - *After* the last "update operation" that is a phi or select.
+// - *After* the last "other operand" of any "update operation".
+// - *Before* the first "result user" of any "update operation".
+// - If that is not possible, we may try to move instructions.
+//   Otherwise, we can't do anything, so WFV fails due to a "bad" reduction.
+Instruction*
+getCallInsertPosition(const ReductionVariable& redVar, const Loop& loop)
+{
+  Instruction* earliestPos = redVar.mPhi->getParent()->getFirstNonPHI();
+
+  // - *After* the last "update operation" that is a phi or select.
+  const RedUpMapType& updates = *redVar.mUpdates;
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    Instruction* updateOperation = redUp.mOperation;
+    if (!isa<PHINode>(updateOperation) && !isa<SelectInst>(updateOperation)) continue;
+    if (isPredecessor(updateOperation, earliestPos)) continue;
+    earliestPos = updateOperation;
+  }
+
+  // - *After* the last "other operand" of any "update operation".
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    const SetVector<Value*>& otherOperands = *redUp.mOtherOperands;
+    for (SetVector<Value*>::const_iterator it2=otherOperands.begin(),
+         E2=otherOperands.end(); it2!=E2; ++it2)
+    {
+      if (!isa<Instruction>(*it2)) continue;
+      Instruction* otherOperand = cast<Instruction>(*it2);
+      if (isPredecessor(otherOperand, earliestPos)) continue;
+      earliestPos = otherOperand;
+    }
+  }
+
+  // - *Before* the first "result user" of any "update operation".
+  Instruction* latestPos = loop.getLoopLatch()->getTerminator();
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    const SetVector<Instruction*>& resultUsers = *redUp.mResultUsers;
+    if (resultUsers.empty()) continue;
+    for (SetVector<Instruction*>::const_iterator it2=resultUsers.begin(),
+         E2=resultUsers.end(); it2!=E2; ++it2)
+    {
+      Instruction* resultUser = *it2;
+      if (isPredecessor(latestPos, resultUser)) continue;
+      latestPos = resultUser;
+    }
+  }
+
+  if (!isPredecessor(earliestPos, latestPos))
+  {
+    errs() << "ERROR: Bad reduction found: There is no valid single position"
+        << " to perform all operations connected to reduction variable:\n"
+        << *redVar.mPhi << "\n";
+    assert (false && "Bad reduction found!");
+    return 0;
+  }
+
+  return earliestPos;
+}
+
+// Insert call to F_RO:
+// - *After* the last "update operation" that is a phi or select.
+// - *After* the last "other operand" of any "update operation".
+// - *Before* the first "result user" of any "update operation".
+// - If that is not possible, we may try to move instructions.
+//   Otherwise, we can't do anything, so WFV fails due to a "bad" reduction.
+CallInst*
+generateReductionCall(const ReductionVariable& redVar,
+                      Function*                F_RO,
+                      const Loop&              loop)
+{
+  SmallVector<Value*, 4> args;
+  getCallArgs(redVar, args);
+
+  Instruction* callInsertPos = getCallInsertPosition(redVar, loop);
+  if (!callInsertPos) return 0;
+
+  return CallInst::Create(F_RO, args, "", callInsertPos);
+}
+
+// Generate a reduction function F_RO:
+// - Return type is the type of the reduction.
+// - One input parameter for P.
+// - One input parameter per "other operand" per "update operation".
+// - One input parameter per "update operation" that requires a mask.
+// - One output parameter per "update operation" that has at least one "result user".
+Function*
+generateReductionFunction(const ReductionVariable& redVar)
+{
+  Type* type = redVar.mPhi->getType();
   LLVMContext& context = type->getContext();
 
-  Type* retType = requiresRetVal ? type : Type::getVoidTy(context);
-  SmallVector<Type*, 2> params;
+  Type* retType = redVar.mResultUser ? type : Type::getVoidTy(context);
+
+  SmallVector<Type*, 4> params;
+
+  // Add input parameter for P.
   params.push_back(type);
-  params.push_back(PointerType::getUnqual(type));
+
+  // Add input parameters for "other operands".
+  const RedUpMapType& updates = *redVar.mUpdates;
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    const SetVector<Value*>& otherOperands = *redUp.mOtherOperands;
+    for (SetVector<Value*>::const_iterator it2=otherOperands.begin(),
+         E2=otherOperands.end(); it2!=E2; ++it2)
+    {
+      Value* operand = *it2;
+      params.push_back(operand->getType());
+    }
+  }
+
+  // Add input parameters for masks.
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (!redUp.mRequiresMask) continue;
+    params.push_back(Type::getInt1Ty(context));
+  }
+
+  // Add output parameters for "result users".
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (redUp.mResultUsers->empty()) continue;
+    Type* updateType = redUp.mOperation->getType();
+    params.push_back(PointerType::getUnqual(updateType));
+  }
+
   FunctionType* fType = FunctionType::get(retType, params, false);
 
-  Module* mod = updateOp->getParent()->getParent()->getParent();
+  Module* mod = redVar.mPhi->getParent()->getParent()->getParent();
   return Function::Create(fType, Function::ExternalLinkage, "red_fn", mod);
 }
 
+// - Generate function F_RO_SIMD that performs all updates in a vector context:
+//   - Return type is the scalar return type of P.
+//   - One input parameter for P.
+//   - One input parameter per "other operand" per "update operation".
+//   - One input parameter per "update operation" that requires a mask.
+//   - One output parameter per "update operation" that has at least one "result user".
+//   - Copy the calls to the SCC functions into F_RO.
+//   - Wire the new calls to inputs/outputs/other calls.
 Function*
-NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
-                                               const unsigned vectorizationFactor,
-                                               const bool     requiresRetVal,
-                                               const bool     requiresMask)
+generateReductionFunctionSIMD(ReductionVariable& redVar,
+                              const unsigned     vectorizationFactor)
 {
+  assert (false && "not implemented");
+  Type* type = redVar.mPhi->getType();
+  LLVMContext& context = type->getContext();
+
+  Type* retType = redVar.mResultUser ? type : Type::getVoidTy(context);
+
+  SmallVector<Type*, 4> params;
+
+  // Add input parameter for P.
+  params.push_back(type);
+
+  // Add input parameters for "other operands".
+  const RedUpMapType& updates = *redVar.mUpdates;
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    const SetVector<Value*>& otherOperands = *redUp.mOtherOperands;
+    for (SetVector<Value*>::const_iterator it2=otherOperands.begin(),
+         E2=otherOperands.end(); it2!=E2; ++it2)
+    {
+      Value* operand = *it2;
+      params.push_back(operand->getType());
+    }
+  }
+
+  // Add input parameters for masks.
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (!redUp.mRequiresMask) continue;
+    params.push_back(Type::getInt1Ty(context));
+  }
+
+  // Add output parameters for "result users".
+  for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+  {
+    const ReductionUpdate& redUp = *it->second;
+    if (redUp.mResultUsers->empty()) continue;
+    Type* updateType = redUp.mOperation->getType();
+    params.push_back(PointerType::getUnqual(updateType));
+  }
+
+  FunctionType* fType = FunctionType::get(retType, params, false);
+
+  Module* mod = redVar.mPhi->getParent()->getParent()->getParent();
+  return Function::Create(fType, Function::ExternalLinkage, "red_fn_final", mod);
+
+#if 0
   assert (updateOp);
   assert (updateOp->isBinaryOp());
   assert (updateOp->getParent());
@@ -703,228 +1687,85 @@ NoiseWFVWrapper::generateReductionFunctionSIMD(Instruction*   updateOp,
   if (requiresRetVal) retI->setOperand(0, retVal);
 
   return f;
+#endif
 }
 
-// For each reduction, Perform "reg2mem" of the variable, extract the update
-// into a function, and create a SIMD function which performs the reduction.
+// Transform the reduction SCC:
+// - Replace all "result users" of all "update operations" with the corresponding
+//   result of the call.
+// - Replace the "update operation" operand of P with the call's return value.
+// - Replace the single "result user" behind the loop with the call's return value.
+//   - NOTE: I don't think so: That user still refers to P, which should be okay.
+// - Remove all "update operations".
 void
-NoiseWFVWrapper::handleReductions(Loop*                           loop,
-                                  PHINode*                        indVarPhi,
-                                  const unsigned                  vectorizationFactor,
-                                  DenseMap<Function*, Function*>& simdMappings)
+transformReductionSCC(const ReductionVariable& redVar)
 {
-  assert (loop && indVarPhi);
-  assert (simdMappings.empty());
+  assert (false && "not implemented");
+}
 
-  BasicBlock* preheaderBB = loop->getLoopPreheader();
-  BasicBlock* headerBB    = loop->getHeader();
-  BasicBlock* exitBB      = loop->getUniqueExitBlock();
+} // unnamed namespace
 
-  outs() << "function: " << *indVarPhi->getParent()->getParent() << "\n";
+// Create the actual reduction code by moving the mapped update function calls
+// to one location and merging their code to produce a correctly reduced result
+// and (if required) intermediate values for other users.
+//
+// For every reduction phi P:
+//
+//   - Generate function F_RO_SIMD that performs all updates in a vector context:
+//     - Return type is the scalar return type of P.
+//     - One input parameter for P.
+//     - One input parameter per "other operand" per "update operation".
+//     - One input parameter per "update operation" that requires a mask.
+//     - One output parameter per "update operation" that has at least one "result user".
+//     - Copy the calls to the SCC functions into F_RO.
+//     - Wire the new calls to inputs/outputs/other calls.
+//
+//
+// - Insert call to F_RO:
+//   - *After* the last "update operation" that is a phi or select.
+//   - *After* the last "other operand" of any "update operation".
+//   - *Before* the first "result user" of any "update operation".
+//   - If that is not possible, we may try to move instructions.
+//     Otherwise, we can't do anything, so WFV fails due to a "bad" reduction.
+//   - Inline the call.
+//
+// - Transform the reduction SCC (TODO: Update):
+//   - Replace all "result users" of all "update operations" with the corresponding
+//     result of the call.
+//   - Replace the "update operation" operand of P with the call's return value.
+//   - Replace the single "result user" behind the loop with the call's return value.
+//     - NOTE: I don't think so: That user still refers to P, which should be okay.
+//   - Remove all "update operations".
+void
+NoiseWFVWrapper::finishReductions(RedVarVecType& redVars,
+                                  const Loop&    loop)
+{
+  if (redVars.empty()) return;
 
-  // Identify reduction variables.
-  // Given by phi and update operation (+,-,*,/,%,<<,>>,&,|,^,&&,||,min,max).
-  RedVarVecType redVars;
-  collectReductionVariables(loop, indVarPhi, *mDomTree, redVars);
-
-  // TODO: Make sure there is no interference between reduction variables.
-
-  // For each reduction variable phi P, start value S, update operation U,
-  // other operand O, reduction result R, reduction operator RO
-  // % U must have exactly two uses: P and R
-  // - Generate an alloca A
-  // - Generate a store in the preheader: *A <- S
-  // - Generate a reduction function F_RO(O, A)
-  // - Generate vector equivalent F_RO_SIMD(O_SIMD, A) that performs the reduction
-  //   - *A <- *A (RO) O_SIMD[0] (RO) O_SIMD[1] (RO) ... (RO) O_SIMD[W-1]
-  //   - If there are uses of the reduction update U other than P, the function
-  //     has to return a vector of the accumulated values of the W iterations.
-  //     - X0 <- *A (RO) O_SIMD[0]
-  //     - X1 <- X0 (RO) O_SIMD[1]
-  //     - ...
-  //     - XW-1 <- XW-2 (RO) O_SIMD[W-1]
-  //     - ret <- <X0, X1, ...XW-1>
-  // - Add mapping RF -> RF_SIMD to WFV
-  // - Insert call to RF before U
-  // - Generate a load L_P in the header: L_P <- *A
-  // - Replace uses of P by L_P
-  // - Generate a load L_R in the exit block: L_R <- *A
-  // - Replace uses of R by L_R
-  // - If there were additional uses of U, replace them by the result of F_RO
-  // - Remove P, U, and R
-  Instruction* allocaInsertPos = headerBB->getParent()->getEntryBlock().getFirstNonPHI();
-  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
-  {
-    ReductionVariable* redVar = *it;
-    Value*       S = redVar->mStartVal;
-    PHINode*     P = redVar->mPhi;
-    Instruction* U = redVar->mUpdateOp;
-    Value*       O = redVar->mOtherOperand;
-    PHINode*     R = redVar->mResult; // Can be NULL.
-    assert (S && P && U && O);
-
-    const bool requiresMask = redVar->mRequiresMask;
-
-    outs() << "reduction var phi   P: " << *P << "\n";
-    outs() << "  start value       S: " << *S << "\n";
-    outs() << "  update operation  U: " << *U << "\n";
-    outs() << "  other operand     O: " << *O << "\n";
-    if (R) outs() << "  reduction result  R: " << *R << "\n";
-    else outs() << "  reduction result  R: not available\n";
-    outs() << "  requires mask     ? " << redVar->mRequiresMask << "\n\n";
-
-    Type* type = P->getType();
-
-    assert (type == S->getType());
-    assert (type == U->getType());
-    assert (type == O->getType());
-    assert (!R || type == R->getType());
-
-    AllocaInst* A = new AllocaInst(type, "red.storage", allocaInsertPos);
-    outs() << "  alloca: " << *A << "\n";
-
-    new StoreInst(S, A, preheaderBB->getTerminator());
-
-    // If U has a use other than P and R, we need the reduction function
-    // to return the result for every iteration we compute in parallel in a vector.
-    bool requiresRetVal = U->getNumUses() > 2;
-    if (!requiresRetVal)
-    {
-      for (Instruction::use_iterator U=U->use_begin(), UE=U->use_end(); U!=UE; ++U)
-      {
-        if (P == *U || R == *U) continue;
-        requiresRetVal = true;
-        break;
-      }
-    }
-
-    Function* F_RO      = generateReductionFunction(U, requiresRetVal);
-    Function* F_RO_SIMD = generateReductionFunctionSIMD(U,
-                                                        vectorizationFactor,
-                                                        requiresRetVal,
-                                                        requiresMask);
-    assert (F_RO && F_RO_SIMD);
-    outs() << "  F_RO: " << *F_RO << "\n";
-    outs() << "  F_RO_SIMD: " << *F_RO_SIMD << "\n";
-
-    simdMappings[F_RO] = F_RO_SIMD;
-
-    SmallVector<Value*, 2> args;
-    args.push_back(O);
-    args.push_back(A);
-    CallInst* call = CallInst::Create(F_RO, args, "", U);
-    outs() << "  call: " << *call << "\n";
-
-    LoadInst* L_P = new LoadInst(A, "red.reload.header", headerBB->getFirstNonPHI());
-    outs() << "  L_P: " << *L_P << "\n";
-    P->replaceAllUsesWith(L_P);
-    P->eraseFromParent();
-
-    if (R)
-    {
-      LoadInst* L_R = new LoadInst(A, "red.reload.exit",   exitBB->getFirstNonPHI());
-      outs() << "  L_R: " << *L_R << "\n";
-      R->replaceAllUsesWith(L_R);
-      R->eraseFromParent();
-    }
-
-    if (requiresRetVal)
-    {
-      U->replaceAllUsesWith(call);
-    }
-
-    assert (U->use_empty() && "uses of U (= P, R) should be deleted now");
-    U->eraseFromParent();
-  }
-
-  if (!redVars.empty())
-  {
-    outs() << "function after reduction transformation: "
-        << *indVarPhi->getParent()->getParent() << "\n";
-  }
+  BasicBlock* preheaderBB = loop.getLoopPreheader();
+  BasicBlock* headerBB    = loop.getHeader();
+  BasicBlock* latchBB     = loop.getLoopLatch();
+  BasicBlock* exitBB      = loop.getUniqueExitBlock();
 
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
-    delete *it;
+    ReductionVariable& redVar = **it;
+    assert (redVar.mPhi && redVar.mStartVal && redVar.mUpdates);
+
+    // Generate function F_RO_SIMD:
+    Function* F_RO_SIMD = generateReductionFunctionSIMD(redVar, mVectorizationFactor);
+
+    // Create call if possible.
+    // TODO: Decide whether it is impossible to place the call BEFORE starting all
+    //       the transformations!
+    assert (false && "not implemented");
+    CallInst* call = generateReductionCall(redVar, F_RO_SIMD, loop);
+
+    // Replace uses etc.
+    transformReductionSCC(redVar);
   }
 }
 
-template<unsigned S>
-Function*
-NoiseWFVWrapper::extractLoopBody(Loop*                        loop,
-                                 PHINode*                     indVarPhi,
-                                 Instruction*                 indVarUpdate,
-                                 SmallVector<BasicBlock*, S>& loopBody)
-{
-  assert (loop && indVarPhi);
-  assert (loopBody.empty());
-
-  BasicBlock* preheaderBB = loop->getLoopPreheader();
-  BasicBlock* headerBB    = loop->getHeader();
-  BasicBlock* latchBB     = loop->getLoopLatch();
-  BasicBlock* exitingBB   = loop->getExitingBlock();
-  assert (preheaderBB && headerBB && latchBB &&
-          "vectorization of non-simplified loop not supported!");
-  assert (exitingBB &&
-          "vectorization of loop with multiple exits not supported!");
-  assert (exitingBB == headerBB &&
-          "expected exiting block to be the loop header!");
-
-  // Collect all blocks that are definitely part of the body.
-  std::vector<BasicBlock*>& blocks = loop->getBlocksVector();
-  for (unsigned i=0, e=blocks.size(); i<e; ++i)
-  {
-    BasicBlock* block = blocks[i];
-    if (block == headerBB) continue;
-    if (block == exitingBB) continue; // Redundant.
-    if (block == latchBB) continue;
-    loopBody.push_back(block);
-  }
-
-  // Get loop exit condition.
-  assert (isa<BranchInst>(exitingBB->getTerminator()));
-  BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
-
-  assert (isa<ICmpInst>(exitBr->getCondition()));
-  ICmpInst* exitCond = cast<ICmpInst>(exitBr->getCondition());
-  assert (exitCond->getParent() == exitingBB &&
-          "expected exit condition to be in exiting block!");
-  assert (exitCond->getNumUses() == 1 &&
-          "expected exit condition to have only one use in the exit branch!");
-
-  // Split latch directly before induction variable increment.
-  BasicBlock* newLatchBB = SplitBlock(latchBB, indVarUpdate, mDomTree);
-  newLatchBB->setName(latchBB->getName()+".wfv.latch");
-
-  // latchBB is now the part of the latch that is only the body.
-  loopBody.push_back(latchBB);
-
-  CodeExtractor extractor(loopBody, mDomTree, false);
-  assert (extractor.isEligible());
-  Function* bodyFn = extractor.extractCodeRegion();
-  assert (bodyFn);
-
-  // Now, adjust the original loop.
-  // Increment by 'vectorizationFactor' instead of 1.
-  Constant* vecFactorConst = ConstantInt::get(indVarUpdate->getType(), mVectorizationFactor, false);
-  Instruction* newIndVarUpdate = BinaryOperator::Create(Instruction::Add,
-                                                        indVarPhi,
-                                                        vecFactorConst,
-                                                        "wfv.inc",
-                                                        indVarUpdate);
-  indVarUpdate->moveBefore(newIndVarUpdate);
-  indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
-  newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
-
-  return bodyFn;
-}
-
-void
-NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
-{
-  AU.addRequired<DominatorTree>();
-  AU.addRequired<LoopInfo>();
-}
 
 char NoiseWFVWrapper::ID = 0;
 } // namespace llvm

@@ -82,6 +82,38 @@ llvm::MDNode* GetNoiseOptDesc(const MDNode* mdNode)
     return cast<llvm::MDNode>(mdNode->getOperand(1));
 }
 
+MDNode* getCompoundStmtNoiseMD(const BasicBlock& block)
+{
+  return block.getTerminator()->getMetadata("noise_compound_stmt");
+}
+
+bool hasNoiseFunctionAttribute(const Function&    function,
+                               const NamedMDNode& MD)
+{
+  for (unsigned i=0, e=MD.getNumOperands(); i<e; ++i) {
+    const MDNode* functionMDN = MD.getOperand(i);
+    const Function* noiseFn = GetNoiseFunction(functionMDN);
+    if (noiseFn == &function) return true;
+  }
+
+  return false;
+}
+
+bool hasNoiseAttribute(const Module&      mod,
+                       const NamedMDNode& MD)
+{
+  for (Module::const_iterator F=mod.begin(), FE=mod.end(); F!=FE; ++F)
+  {
+    if (hasNoiseFunctionAttribute(*F, MD)) return true;
+
+    for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
+    {
+      if (getCompoundStmtNoiseMD(*BB)) return true;
+    }
+  }
+  return false;
+}
+
 } // unnamed namespace
 
 namespace llvm {
@@ -129,21 +161,6 @@ struct NoiseExtractor : public FunctionPass {
 
   virtual ~NoiseExtractor()
   { }
-
-  MDNode* getCompoundStmtNoiseMD(const BasicBlock& block)
-  {
-      return block.getTerminator()->getMetadata("noise_compound_stmt");
-  }
-
-  bool hasNoiseFunctionAttribute(const Function& function) const {
-    for (unsigned i=0, e=MD->getNumOperands(); i<e; ++i) {
-      MDNode* functionMDN = MD->getOperand(i);
-      Function* noiseFn = GetNoiseFunction(functionMDN);
-      if (noiseFn == &function) return true;
-    }
-
-    return false;
-  }
 
   template<unsigned SetSize>
   bool resolveMarkers(BasicBlock*                        block,
@@ -235,9 +252,9 @@ struct NoiseExtractor : public FunctionPass {
     while (iterate)
     {
       iterate = false;
+      const bool isTopLevel = !hasNoiseFunctionAttribute(F, *MD);
       for (Function::iterator BB = F.begin(), BBE=F.end(); BB!=BBE; ++BB)
       {
-        const bool isTopLevel = !hasNoiseFunctionAttribute(*BB->getParent());
         if (resolveMarkers(BB, visitedBlocks, isTopLevel))
         {
           iterate = true;
@@ -1031,7 +1048,8 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     Passes.add(new NoiseSpecializer(variable, values));
   } else if(pass == "wfv") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
-    errs() << "ERROR: No support for WFV is available\n";
+    errs() << "ERROR: No support for WFV is available!\n";
+    assert (false && "no support for WFV available\n");
 #else
     outs() << "Running pass: loop-simplify\n";
     outs() << "Running pass: lowerswitch\n";
@@ -1200,20 +1218,6 @@ Function* createDummyFunction(Function* noiseFn)
     return dummyFn;
 }
 
-bool hasNoiseCompoundStmt(const Module& module) {
-  for (Module::const_iterator F=module.begin(),
-       FE=module.end(); F!=FE; ++F)
-  {
-    for (Function::const_iterator BB=F->begin(),
-         BBE=F->end(); BB!=BBE; ++BB)
-    {
-      if (BB->getTerminator()->getMetadata("noise_compound_stmt"))
-        return true;
-    }
-  }
-  return false;
-}
-
 } // unnamed namespace
 
 // TODO: Support "negative" noise attributes (e.g. "subtraction" of specified
@@ -1221,7 +1225,7 @@ bool hasNoiseCompoundStmt(const Module& module) {
 void NoiseOptimizer::PerformOptimization()
 {
   // Initialize all passes linked into all libraries (see InitializePasses.h).
-  // This way, they are registerd so we can add them via getPassInfo().
+  // This way, they are registered so we can add them via getPassInfo().
   initializeCore(*PassRegistry::getPassRegistry());
   initializeTransformUtils(*PassRegistry::getPassRegistry());
   initializeScalarOpts(*PassRegistry::getPassRegistry());
@@ -1259,7 +1263,7 @@ void NoiseOptimizer::PerformOptimization()
 #endif
 
   // If there is no noise attribute, return immediately.
-  if (MD->getNumOperands() == 0 && !hasNoiseCompoundStmt(*Mod)) return;
+  if (!hasNoiseAttribute(*Mod, *MD)) return;
 
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
