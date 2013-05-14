@@ -1046,7 +1046,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     for(size_t i = 0, e = values.size(); i < e; ++i)
       values.push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
     Passes.add(new NoiseSpecializer(variable, values));
-  } else if(pass == "wfv") {
+  } else if(pass == "wfv" || pass == "wfv-vectorize") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
     errs() << "ERROR: No support for WFV is available!\n";
     assert (false && "no support for WFV available\n");
@@ -1618,7 +1618,7 @@ void NoiseOptimizer::Finalize()
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
   MD->eraseFromParent();
-  outs() << "module after noise: " << *Mod;
+  outs() << "\nmodule after noise: " << *Mod;
 }
 
 }

@@ -132,10 +132,6 @@ public:
                                  PHINode*             indVarPhi,
                                  const Loop&          loop,
                                  const DominatorTree& domTree);
-  void generateMaskCallsForWFV(RedVarVecType& redVars,
-                                    const unsigned vectorizationFactor);
-  void finishReductions(RedVarVecType& redVars,
-                        const Loop&    loop);
 };
 
 }
