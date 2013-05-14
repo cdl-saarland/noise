@@ -65,21 +65,16 @@ public:
     ~ReductionUpdate();
 
     // The update operation.
-    Instruction*             mOperation;
+    Instruction*      mOperation;
     // The operands that are *not* part of the reduction SCC.
     typedef SmallVector<Value*, 2> OtherOperandsVec;
-    OtherOperandsVec*        mOtherOperands;
+    OtherOperandsVec* mOtherOperands;
     // The users of this update operation that are *not* part of the reduction SCC (if any).
     typedef SetVector<Instruction*> ResultUsersVec;
-    ResultUsersVec*          mResultUsers;
-    // The mask that is required for this update.
-    bool                     mRequiresMask;
+    ResultUsersVec*   mResultUsers;
     // The alloca of the scalar result of this reduction operation (given
     // as output parameter to call).
-    Instruction*             mIntermediateResultPtr;
-
-    typedef SetVector<AllocaInst*> OtherOpAllocaVec;
-    OtherOpAllocaVec*        mOtherOpAllocas;
+    Instruction*      mIntermediateResultPtr;
   };
 
   typedef DenseMap<Instruction*, ReductionUpdate*> RedUpMapType;
@@ -99,15 +94,23 @@ public:
 
     // The position where the reduction operations will be performed after WFV.
     Instruction*  mReductionPos;
+    // The scalar reduction function (dummy declaration only).
     Function*     mReductionFn;
+    // The call to the scalar reduction function.
     CallInst*     mReductionFnCall;
+    // The SIMD reduction function.
     Function*     mReductionFnSIMD;
 
+    // The alloca that stores the final reduction result in the original function.
     AllocaInst*   mResultPtr;
 
+    // The argument of the SIMD reduction function that corresponds to the reduction phi.
     Argument*     mPhiArg;
+    // The argument of the SIMD reduction function that corresponds to the result pointer.
     Argument*     mOutArg;
+    // The store instruction that writes back the final reduction result to mOutArg.
     StoreInst*    mStoreBack;
+    // The value that goes back to the reduction phi from the latch in the original function.
     Instruction*  mBackEdgeVal;
   };
 
