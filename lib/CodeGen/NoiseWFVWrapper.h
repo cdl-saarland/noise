@@ -77,25 +77,9 @@ public:
     // The alloca of the scalar result of this reduction operation (given
     // as output parameter to call).
     Instruction*             mIntermediateResultPtr;
-    // The call to the scalar function that replaces the operation before WFV.
-    // The result of the call is the result vector that contains the W different
-    // results of each iteration.
-    CallInst*                mScalarCall;
-    // The target function that corresponds to this operation (has a single call only after WFV).
-    Function*                mAfterWFVFunction;
-    // The mask that is required for this update (valid after call merging after WFV).
-    Value*                   mMask;
-    // The index of the mask parameter of mAfterWFVFunction.
-    int                      mMaskIndex;
-
-    // These are only set if the update operation requires a mask.
-    Function*                mMaskDummyFn;
-    CallInst*                mMaskDummyFnCall;
-    Function*                mMaskDummyFnSIMD;
 
     typedef SetVector<AllocaInst*> OtherOpAllocaVec;
     OtherOpAllocaVec*        mOtherOpAllocas;
-    AllocaInst*              mMaskAlloca;
   };
 
   typedef DenseMap<Instruction*, ReductionUpdate*> RedUpMapType;
