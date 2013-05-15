@@ -1086,7 +1086,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   collectReductionVariables(redVars, indVarPhi, *loop, *mDomTree);
 
   // Print info & check sanity.
-  assert (noiseFn == (*redVars.begin())->mPhi->getParent()->getParent());
+  assert (redVars.empty() || noiseFn == (*redVars.begin())->mPhi->getParent()->getParent());
   DEBUG_NOISE_WFV( DEBUG_NOISE_WFV( outs() << "\nfunction:" << *noiseFn << "\n"; ); );
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
