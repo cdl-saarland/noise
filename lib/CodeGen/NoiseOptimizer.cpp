@@ -13,6 +13,7 @@
 
 #include "NoiseOptimizer.h"
 #include "CGNoise.h"
+#include "NoiseOptimization.h"
 
 #ifdef COMPILE_NOISE_WFV_WRAPPER
 #include "NoiseWFVWrapper.h"
@@ -66,12 +67,12 @@ Function* GetNoiseFunction(const MDNode* mdNode)
     return cast<Function>(mdNode->getOperand(0));
 }
 
-MDString* GetNoiseString(const MDNode* mdNode)
+llvm::MDNode* GetNoiseOptDesc(const MDNode* mdNode)
 {
     assert (mdNode->getNumOperands() == 2);
-    // Second operand is a string with the noise optimizations.
-    assert (isa<MDString>(mdNode->getOperand(1)));
-    return cast<MDString>(mdNode->getOperand(1));
+    // Second operand is the noise-optimization metadata.
+    assert (isa<llvm::MDNode>(mdNode->getOperand(1)));
+    return cast<llvm::MDNode>(mdNode->getOperand(1));
 }
 
 } // unnamed namespace
@@ -148,7 +149,7 @@ struct NoiseExtractor : public FunctionPass {
     // Handle compound statement attributes.
     assert (isa<BasicBlock>(noiseMD->getOperand(0)));
     assert (isa<BasicBlock>(noiseMD->getOperand(1)));
-    assert (isa<MDString>(noiseMD->getOperand(2)));
+    assert (isa<MDNode>(noiseMD->getOperand(2)));
 
     // Recurse into nested noise regions (if any).
     // To do so properly, we need to reconstruct the region after we
@@ -194,10 +195,8 @@ struct NoiseExtractor : public FunctionPass {
 
     // Create global (function) metadata for the new function from the statement attribute.
     assert(Mod);
-    MDString* noiseMDS = cast<MDString>(noiseMD->getOperand(2));
-    llvm::StringRef noiseStr = noiseMDS->getString();
 
-    llvm::Value* params[] = { extractedFn, llvm::MDString::get(*Context, noiseStr) };
+    llvm::Value* params[] = { extractedFn, noiseMD->getOperand(2) };
     MD->addOperand(llvm::MDNode::get(*Context, llvm::ArrayRef<llvm::Value*>(params)));
 
     createdFunctions.insert(extractedFn);
@@ -348,6 +347,99 @@ INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialize",
 namespace llvm {
 namespace noise {
 
+// NoiseFnInfo
+
+void NoiseFnInfo::UpdateOptDesc(MDNode* OptDesc)
+{
+  // according to the description from NoiseOptimization.h
+  size_t numOps = OptDesc->getNumOperands();
+  for(size_t i = 0; i < numOps; ++i)
+    assert( isa<NoiseOptimization>(OptDesc->getOperand(i)) && "invalid noise opt" );
+
+  mOptDesc = OptDesc;
+}
+
+NoiseOptimization* NoiseFnInfo::GetOptimization(size_t i) {
+  assert( isa<NoiseOptimization>(mOptDesc->getOperand(i)) );
+  return cast<NoiseOptimization>(mOptDesc->getOperand(i));
+}
+
+size_t NoiseFnInfo::GetNumOptimizations() const {
+  return mOptDesc->getNumOperands();
+}
+
+void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Registry,
+                                     FunctionPassManager& Passes)
+{
+  const StringRef pass = GetPassName(Opt);
+  if(pass == "inline")
+    Passes.add(new NoiseInliner());
+  else if(pass == "unroll") {
+    const int count = NoiseOptimizations::HasPassArg(Opt, 0U) ?
+      NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : -1;
+
+    outs() << "Running pass: indvars\n";
+    outs() << "Running pass: loop-rotate\n";
+
+    Passes.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
+    Passes.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
+    Passes.add(createLoopUnrollPass(-1, count, false));
+  }
+  else if(pass == "specialize") {
+    // pass = "specialize(x,1,2,3)"
+    StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
+    SmallVector<int, 4> values;
+    for(size_t i = 0, e = values.size(); i < e; ++i)
+      values.push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
+    Passes.add(new NoiseSpecializer(variable, values));
+  } else if(pass == "wfv") {
+#ifndef COMPILE_NOISE_WFV_WRAPPER
+    outs() << "No support for WFV is available\n";
+#else
+    outs() << "Running pass: loop-simplify\n";
+    outs() << "Running pass: lowerswitch\n";
+    outs() << "Running pass: indvars\n";
+    outs() << "Running pass: lcssa\n";
+
+    // Add preparatory passes for WFV.
+    Passes.add(createLoopSimplifyPass());
+    Passes.add(createLowerSwitchPass());
+    // Add induction variable simplification pass.
+    Passes.add(createIndVarSimplifyPass());
+    // Convert to loop-closed SSA form to simplify applicability analysis.
+    Passes.add(createLCSSAPass());
+
+    // WFV may receive argument to specify vectorization width, whether to
+    // use AVX and whether to use the divergence analysis.
+    // "wfv-vectorize"          -> width 4, do not use avx, use divergence analysis (default)
+    // "wfv-vectorize (4,0,1)"  -> width 4, do not use avx, use divergence analysis (default)
+    // "wfv-vectorize (8,1,1)"  -> width 8, use avx, use divergence analysis
+    // "wfv-vectorize (8,1)"    -> width 8, use avx, use divergence analysis
+    // "wfv-vectorize (16,0,0)" -> width 16, do not use avx, do not use divergence analysis
+    unsigned   vectorizationWidth = NoiseOptimizations::HasPassArg(Opt, 0U) ?
+        (unsigned)NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : 4U;
+    bool       useAVX = NoiseOptimizations::HasPassArg(Opt, 1U) &&
+        NoiseOptimizations::GetPassArgAsInt(Opt, 1U);
+    bool       useDivergenceAnalysis = NoiseOptimizations::HasPassArg(Opt, 2U) ?
+        NoiseOptimizations::GetPassArgAsInt(Opt, 2U) : true;
+    const bool verbose = false;
+
+    // Add WFV pass wrapper.
+    Passes.add(new NoiseWFVWrapper(vectorizationWidth,
+                                   useAVX,
+                                   useDivergenceAnalysis,
+                                   verbose));
+#endif
+  } else {
+    const PassInfo* info = Registry->getPassInfo(pass);
+    if(!info) {
+      errs() << "ERROR: Pass not found: " << pass << "\n";
+      return;
+    }
+    Passes.add(info->createPass());
+  }
+}
+
 // Noise Optimizer
 
 NoiseOptimizer::NoiseOptimizer(llvm::Module *M)
@@ -455,8 +547,8 @@ void NoiseOptimizer::PerformOptimization()
       noiseFnInfoVec.push_back(nfi);
     }
 
-    nfi->mOptString = GetNoiseString(functionMDN);
-    assert (nfi->mOptString);
+    nfi->UpdateOptDesc(GetNoiseOptDesc(functionMDN));
+    assert (nfi->mOptDesc);
 
     // Make sure that no other optimizations than the requested ones are
     // executed on that function.
@@ -500,9 +592,8 @@ void NoiseOptimizer::PerformOptimization()
   //       with the parents.
   for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
   {
-    NoiseFnInfo* nfi   = noiseFnInfoVec[i];
-    Function* noiseFn  = nfi->mReinline ? nfi->mOrigFn : nfi->mMovedFn;
-    StringRef str      = nfi->mOptString->getString();
+    NoiseFnInfo*   nfi    = noiseFnInfoVec[i];
+    Function*     noiseFn = nfi->mReinline ? nfi->mOrigFn : nfi->mMovedFn;
 
     assert (!nfi->mReinline || !nfi->mMovedFn);
 
@@ -510,7 +601,7 @@ void NoiseOptimizer::PerformOptimization()
     //NoisePassListener list;
     //Registry->enumerateWith(&list);
     outs() << "Running noise optimizations on function '"
-      << noiseFn->getName() << "': " << str << "\n";
+      << noiseFn->getName() << "': \n";
 
     // Run requested noise passes.
     FunctionPassManager NoisePasses(Mod);
@@ -522,193 +613,10 @@ void NoiseOptimizer::PerformOptimization()
     //       blocks and instructions we introduced so the user is not confused.
     NoisePasses.add(createCFGSimplificationPass());
 
-    // Parse attributes.
-    for(std::pair<StringRef, StringRef> opts = str.split(' ');
-        opts.first.size() > 0;
-        opts = opts.second.split(' '))
-    {
-      // resolve current pass description
-      const StringRef& pass = opts.first;
-
-      // check for a custom noise "pass description"
-      if(pass.startswith("wfv"))
-      {
-#ifdef COMPILE_NOISE_WFV_WRAPPER
-        outs() << "Running pass: loop-simplify\n";
-        outs() << "Running pass: lowerswitch\n";
-        outs() << "Running pass: indvars\n";
-        outs() << "Running pass: lcssa\n";
-
-        // Add preparatory passes for WFV.
-        NoisePasses.add(createLoopSimplifyPass());
-        NoisePasses.add(createLowerSwitchPass());
-        // Add induction variable simplification pass.
-        NoisePasses.add(createIndVarSimplifyPass());
-        // Convert to loop-closed SSA form to simplify applicability analysis.
-        NoisePasses.add(createLCSSAPass());
-
-        // WFV may receive argument to specify vectorization width, whether to
-        // use AVX and whether to use the divergence analysis.
-        // TODO: If arguments are given, there must not be a space between them!
-        // "wfv-vectorize"          -> width 4, do not use avx, use divergence analysis (default)
-        // "wfv-vectorize (4,0,1)"  -> width 4, do not use avx, use divergence analysis (default)
-        // "wfv-vectorize (8,1,1)"  -> width 8, use avx, use divergence analysis
-        // "wfv-vectorize (8,1)"    -> width 8, use avx, use divergence analysis
-        // "wfv-vectorize (16,0,0)" -> width 16, do not use avx, do not use divergence analysis
-        unsigned   vectorizationWidth = 4;
-        bool       useAVX = false;
-        bool       useDivergenceAnalysis = true;
-        const bool verbose = false;
-
-        const size_t openParen = pass.find('(', 0);
-        const size_t closeParen = pass.find(')', 0);
-        if (closeParen > openParen)
-        {
-          StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
-
-          unsigned numArgs = 0;
-          for(std::pair<StringRef, StringRef> split = args.split(',');
-              split.first.size() > 0;
-              split = split.second.split(','), ++numArgs)
-          {
-            if (numArgs == 3)
-            {
-              errs() << "WARNING: WFV may only receive up to three parameters, "
-                << "ignoring additional ones!\n";
-              break;
-            }
-
-            // Get the current argument.
-            StringRef arg = split.first;
-            const size_t comma = arg.find(',', 0);
-            if (comma != arg.npos) arg = arg.substr(arg.find(',', 0));
-
-            unsigned val;
-            const bool error = arg.getAsInteger(10, val);
-            if (error)
-            {
-              errs() << "WARNING: only unsigned integer arguments allowed as "
-                << "WFV parameter "
-                << (numArgs == 0 ? "'vectorizationWidth'" :
-                    numArgs == 1 ? "'useAVX'" : "'useDivergenceAnalysis'")
-                << ", found: '" << arg << "'. Falling back "
-                << "to default ("
-                << (numArgs == 0 ? "4" : numArgs == 1 ? "false" : "true")
-                << ").\n";
-              continue;
-            }
-            if (numArgs == 0) vectorizationWidth = val;
-            else if (numArgs == 1) useAVX = val;
-            else if (numArgs == 2) useDivergenceAnalysis = val;
-          }
-        }
-
-        // Add WFV pass wrapper.
-        NoisePasses.add(new NoiseWFVWrapper(vectorizationWidth,
-                                            useAVX,
-                                            useDivergenceAnalysis,
-                                            verbose));
-#else
-        outs() << "No support for WFV is available\n";
-        continue;
-#endif
-      }
-      else if(pass.startswith("inline"))
-      {
-        // force inlining of function calls
-        NoisePasses.add(new NoiseInliner());
-      }
-      else if(pass.startswith("unroll"))
-      {
-        // loop unrolling requested
-        int count = -1;
-        // => check for additional arguments
-        const size_t openParen = pass.find('(', 0);
-        const size_t closeParen = pass.find(')', 0);
-        if (closeParen > openParen)
-        {
-          // get the number of arguments
-          StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
-          count = atoi(args.str().c_str()); // TODO: Use getAsInteger() (see below).
-        }
-
-        outs() << "Running pass: indvars\n";
-        outs() << "Running pass: loop-rotate\n";
-
-        NoisePasses.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
-        NoisePasses.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
-        NoisePasses.add(createLoopUnrollPass(-1, count, false));
-      }
-      else if (pass.startswith("specialize"))
-      {
-        // pass = "specialize(x=1,2,3)"
-        // TODO: If arguments are given, there must not be a space between them!
-
-        // Check for additional arguments.
-        const size_t openParen = pass.find('(', 0);
-        const size_t closeParen = pass.find(')', 0);
-        if (openParen >= closeParen ||
-            openParen == pass.npos ||
-            closeParen == pass.npos)
-        {
-          errs() << "ERROR: 'specialize' requires additional parameters!\n";
-          continue;
-        }
-
-        // args = "x=1,2,3"
-        StringRef args = pass.substr(openParen + 1, (closeParen - openParen) - 1);
-        assert (!args.empty());
-
-        // Get the variable to specialize.
-        std::pair<StringRef, StringRef> splitPair = args.split("=");
-        if (splitPair.second.empty())
-        {
-          errs() << "ERROR: expected at least two arguments separated by a blank.\n";
-          continue;
-        }
-        // variable = "x", args = "1,2,3"
-        StringRef variable = splitPair.first;
-        args = splitPair.second;
-
-        // Get the values to specialize for.
-        SmallVector<int, 4> values;
-        for(std::pair<StringRef, StringRef> split = args.split(',');
-                split.first.size() > 0;
-                split = split.second.split(','))
-        {
-          StringRef& arg = split.first;
-          const size_t comma = arg.find(',', 0);
-          if (comma != arg.npos) arg = arg.substr(arg.find(',', 0));
-
-          int val;
-          const bool error = arg.getAsInteger(10, val);
-          if (error)
-          {
-            errs() << "\nERROR: only integer arguments allowed after variable,"
-              << " found: " << arg << "\n";
-            continue;
-          }
-          values.push_back(val);
-        }
-
-        if (values.empty()) continue;
-
-        NoisePasses.add(new NoiseSpecializer(variable, values));
-      }
-      else
-      {
-        // Use the pass registry to resolve the pass.
-        const PassInfo* info = Registry->getPassInfo(pass);
-        if(!info)
-        {
-          errs() << "ERROR: Pass not found: " << pass << "\n";
-          continue;
-        }
-        // use the resolved LLVM pass
-        NoisePasses.add(info->createPass());
-      }
-
-      outs() << "Running pass: " << pass << "\n";
+    for(size_t i = 0, e = nfi->GetNumOptimizations(); i < e; ++i) {
+      NoiseOptimization* noiseOpt = nfi->GetOptimization(i);
+      outs() << "Running pass: " << NoiseOptimizations::GetPassName(noiseOpt) << "\n";
+      NoiseOptimizations::Instantiate(noiseOpt, Registry, NoisePasses);
     }
 
     // TODO: Remove this when reaching "production" state or so.

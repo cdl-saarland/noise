@@ -15,6 +15,7 @@
 #define CLANG_CODEGEN_CODEGENNOISE_H
 
 #include "clang/Basic/NoiseAttr.h"
+#include "NoiseAttrParser.h"
 #include "CodeGenFunction.h"
 #include "CGBuilder.h"
 
@@ -32,11 +33,11 @@ public:
                         const CodeGen::CGFunctionInfo &FnInfo,
                         const CodeGen::FunctionArgList &Args);
 
-  const NoiseAttr* RegisterStmt(const AttributedStmt &S);
+  llvm::MDNode* RegisterStmt(const AttributedStmt &S);
 
   // Code emission phase
 
-  void EmitStmt(const NoiseAttr& Attrs, const Stmt &S);
+  void EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S);
 
   llvm::Function* GetFunction() { return Generator->CurFn; }
   llvm::Module& GetModule() { return Generator->CGM.getModule(); }
@@ -44,6 +45,7 @@ public:
 
 private:
   CodeGen::CodeGenFunction *Generator;
+  llvm::noise::NoiseAttrParser AttrParser;
 };
 
 }  // end namespace noise

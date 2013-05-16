@@ -12,6 +12,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "CGNoise.h"
+#include "NoiseAttrParser.h"
+
 #include "CGDebugInfo.h"
 #include "CodeGenModule.h"
 #include "CodeGenFunction.h"
@@ -37,6 +39,7 @@ using namespace CodeGen;
 
 NoiseCodeGenerator::NoiseCodeGenerator(CodeGen::CodeGenFunction *generator)
   : Generator(generator)
+  , AttrParser(generator->getLLVMContext())
 {
 }
 
@@ -52,16 +55,16 @@ bool NoiseCodeGenerator::RegisterFunction(const Decl *D, llvm::Function *Fn, con
   llvm::Module* Module = Fn->getParent();
   assert(Module);
   llvm::LLVMContext& Context = Fn->getContext();
-  llvm::StringRef noiseStr = D->getAttr<NoiseAttr>()->getOpt();
 
-  llvm::Value* params[] = { Fn, llvm::MDString::get(Context, noiseStr) };
+  llvm::MDNode* noiseOpt = AttrParser.Parse(*D->getAttr<NoiseAttr>());
+  llvm::Value* params[] = { Fn, noiseOpt };
   llvm::NamedMDNode* MD = Module->getOrInsertNamedMetadata("noise");
   MD->addOperand(llvm::MDNode::get(Context, llvm::ArrayRef<llvm::Value*>(params)));
 
   return true;
 }
 
-const NoiseAttr* NoiseCodeGenerator::RegisterStmt(const AttributedStmt &S)
+llvm::MDNode* NoiseCodeGenerator::RegisterStmt(const AttributedStmt &S)
 {
   // check attribute
   const ArrayRef<const Attr*> &attrs = S.getAttrs();
@@ -75,10 +78,12 @@ const NoiseAttr* NoiseCodeGenerator::RegisterStmt(const AttributedStmt &S)
     }
     noiseAttr = cast<NoiseAttr>(*it);
   }
-  return noiseAttr;
+  assert( noiseAttr && "noiseAttr must be set here" );
+  // parse our noise attribute
+  return AttrParser.Parse(*noiseAttr);
 }
 
-void NoiseCodeGenerator::EmitStmt(const NoiseAttr& noiseAttr, const Stmt &S)
+void NoiseCodeGenerator::EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S)
 {
   assert( (S.getStmtClass() == Stmt::CompoundStmtClass ||
            S.getStmtClass() == Stmt::ForStmtClass) &&
@@ -117,8 +122,7 @@ void NoiseCodeGenerator::EmitStmt(const NoiseAttr& noiseAttr, const Stmt &S)
 
   assert( &entry->back() == entryInstr );
   // create our marker node
-  llvm::StringRef noiseStr = noiseAttr.getOpt();
-  llvm::Value* params[] = { entry, exit, llvm::MDString::get(Context, noiseStr) };
+  llvm::Value* params[] = { entry, exit, NoiseDesc };
   entryInstr->setMetadata("noise_compound_stmt",
                           llvm::MDNode::get(Context, llvm::ArrayRef<llvm::Value*>(params)));
 }

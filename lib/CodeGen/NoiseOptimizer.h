@@ -15,15 +15,20 @@
 #define CLANG_CODEGEN_NOISEOPTIMIZER_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "NoiseOptimization.h"
 
 namespace llvm {
 
+  class Value;
   class Module;
   class Function;
   class NamedMDNode;
+  class Pass;
   class PassRegistry;
   class CallInst;
-  class MDString;
+  class MDNode;
+  class StringRef;
+  class FunctionPassManager;
 
 namespace noise {
 
@@ -32,12 +37,17 @@ namespace noise {
     Function* mMovedFn;
     CallInst* mCall;
     bool      mReinline;
-    MDString* mOptString;
+    MDNode*   mOptDesc;
 
     NoiseFnInfo(Function* origFn, CallInst* call=0, bool reinline=false)
       : mOrigFn(origFn), mMovedFn(0), mCall(call),
-      mReinline(reinline), mOptString(0)
+      mReinline(reinline), mOptDesc(0)
     {}
+
+    void UpdateOptDesc(MDNode* OptDesc);
+
+    size_t GetNumOptimizations() const;
+    NoiseOptimization* GetOptimization(size_t i);
   };
 
   typedef SmallVector<NoiseFnInfo*, 4> NoiseFnInfoVecType;
