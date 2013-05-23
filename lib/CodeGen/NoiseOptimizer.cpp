@@ -1618,7 +1618,8 @@ void NoiseOptimizer::Finalize()
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
   MD->eraseFromParent();
-  outs() << "\nmodule after noise: " << *Mod;
+
+  if (!noiseFnInfoVec.empty()) outs() << "\nmodule after noise: " << *Mod;
 }
 
 }
