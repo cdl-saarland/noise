@@ -1508,12 +1508,18 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
     // Get start/end for scalar start loop:
     // - start = startVal (no change to cloned loop required)
-    // - end   = startVal + startVal % W
+    // - end   = startVal + (W - (startVal % W)
+    //           13       + (4 - (13       % 4) = 16
     Value* firstEndVal = BinaryOperator::Create(Instruction::URem,
                                                 startVal,
                                                 constW,
                                                 "",
                                                 preheaderBB->getTerminator());
+    firstEndVal = BinaryOperator::Create(Instruction::Sub,
+                                         constW,
+                                         firstEndVal,
+                                         "",
+                                         preheaderBB->getTerminator());
     firstEndVal = BinaryOperator::Create(Instruction::Add,
                                          startVal,
                                          firstEndVal,
