@@ -39,6 +39,7 @@
 
 // noise includes
 #include "NoiseOptimizer.h"
+#include "llvm/IR/Instructions.h"
 
 using namespace clang;
 using namespace llvm;
@@ -127,6 +128,7 @@ public:
   }
 
   void EmitAssembly(BackendAction Action, raw_ostream *OS);
+  void NoiseEmitAssembly(BackendAction Action, raw_ostream *OS);
 };
 
 // We need this wrapper to access LangOpts and CGOpts from extension functions
@@ -526,7 +528,52 @@ bool EmitAssemblyHelper::AddEmitPasses(BackendAction Action,
   return true;
 }
 
-void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
+namespace {
+Function* GetNoiseFunction(const MDNode* mdNode)
+{
+    assert (mdNode->getNumOperands() == 2);
+    // First operand is the function.
+    assert (isa<Function>(mdNode->getOperand(0)));
+    return cast<Function>(mdNode->getOperand(0));
+}
+
+MDNode* getCompoundStmtNoiseMD(const BasicBlock& block) {
+  return block.getTerminator()->getMetadata("noise_compound_stmt");
+}
+
+bool hasNoiseFunctionAttribute(const Function&    function,
+                               const NamedMDNode& MD) {
+  for (unsigned i=0, e=MD.getNumOperands(); i<e; ++i) {
+    const MDNode* functionMDN = MD.getOperand(i);
+    const Function* noiseFn = GetNoiseFunction(functionMDN);
+    if (noiseFn == &function) return true;
+  }
+
+  return false;
+}
+
+bool hasNoiseAttribute(Module* mod) {
+  NamedMDNode *MD = mod->getOrInsertNamedMetadata("noise");
+  for (Module::const_iterator F=mod->begin(), FE=mod->end(); F!=FE; ++F)
+  {
+    if (hasNoiseFunctionAttribute(*F, *MD)) return true;
+
+    for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
+    {
+      if (getCompoundStmtNoiseMD(*BB)) return true;
+    }
+  }
+
+  // Remove noise metadata from TheModule.
+  // TODO: Only if we know that there is only noise metadata inside.
+  // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
+  MD->eraseFromParent();
+
+  return false;
+}
+}
+
+void EmitAssemblyHelper::NoiseEmitAssembly(BackendAction Action, raw_ostream *OS) {
   TimeRegion Region(llvm::TimePassesIsEnabled ? &CodeGenerationTime : 0);
   llvm::formatted_raw_ostream FormattedOS;
 
@@ -537,17 +584,18 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
   if (UsesCodeGen && !TM) return;
   CreatePasses(TM);
 
+  PassManager NoisePassManager;
   switch (Action) {
   case Backend_EmitNothing:
     break;
 
   case Backend_EmitBC:
-    getPerModulePasses(TM)->add(createBitcodeWriterPass(*OS));
+    NoisePassManager.add(createBitcodeWriterPass(*OS));
     break;
 
   case Backend_EmitLL:
     FormattedOS.setStream(*OS, formatted_raw_ostream::PRESERVE_STREAM);
-    getPerModulePasses(TM)->add(createPrintModulePass(&FormattedOS));
+    NoisePassManager.add(createPrintModulePass(&FormattedOS));
     break;
 
   default:
@@ -588,6 +636,74 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
   // Handle noise optimizations
   Noiser.Reassemble();
   Noiser.Finalize();
+
+  // Finally, emit the code if desired.
+  if (Action == Backend_EmitBC || Action == Backend_EmitLL) {
+    NoisePassManager.run(*TheModule);
+  }
+
+  if (CodeGenPasses) {
+    PrettyStackTraceString CrashInfo("Code generation");
+    CodeGenPasses->run(*TheModule);
+  }
+}
+
+void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
+  if (hasNoiseAttribute(TheModule)) {
+    NoiseEmitAssembly(Action, OS);
+    return;
+  }
+
+  TimeRegion Region(llvm::TimePassesIsEnabled ? &CodeGenerationTime : 0);
+  llvm::formatted_raw_ostream FormattedOS;
+
+  bool UsesCodeGen = (Action != Backend_EmitNothing &&
+                      Action != Backend_EmitBC &&
+                      Action != Backend_EmitLL);
+  TargetMachine *TM = CreateTargetMachine(UsesCodeGen);
+  if (UsesCodeGen && !TM) return;
+  CreatePasses(TM);
+
+  switch (Action) {
+  case Backend_EmitNothing:
+    break;
+
+  case Backend_EmitBC:
+    getPerModulePasses(TM)->add(createBitcodeWriterPass(*OS));
+    break;
+
+  case Backend_EmitLL:
+    FormattedOS.setStream(*OS, formatted_raw_ostream::PRESERVE_STREAM);
+    getPerModulePasses(TM)->add(createPrintModulePass(&FormattedOS));
+    break;
+
+  default:
+    FormattedOS.setStream(*OS, formatted_raw_ostream::PRESERVE_STREAM);
+    if (!AddEmitPasses(Action, FormattedOS, TM))
+      return;
+  }
+
+  // Before executing passes, print the final values of the LLVM options.
+  cl::PrintOptionValues();
+
+  // Run passes. For now we do all passes at once, but eventually we
+  // would like to have the option of streaming code generation.
+
+  if (PerFunctionPasses) {
+    PrettyStackTraceString CrashInfo("Per-function optimization");
+
+    PerFunctionPasses->doInitialization();
+    for (Module::iterator I = TheModule->begin(),
+           E = TheModule->end(); I != E; ++I)
+      if (!I->isDeclaration())
+        PerFunctionPasses->run(*I);
+    PerFunctionPasses->doFinalization();
+  }
+
+  if (PerModulePasses) {
+    PrettyStackTraceString CrashInfo("Per-module optimization passes");
+    PerModulePasses->run(*TheModule);
+  }
 
   if (CodeGenPasses) {
     PrettyStackTraceString CrashInfo("Code generation");

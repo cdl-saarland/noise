@@ -99,21 +99,6 @@ bool hasNoiseFunctionAttribute(const Function&    function,
   return false;
 }
 
-bool hasNoiseAttribute(const Module&      mod,
-                       const NamedMDNode& MD)
-{
-  for (Module::const_iterator F=mod.begin(), FE=mod.end(); F!=FE; ++F)
-  {
-    if (hasNoiseFunctionAttribute(*F, MD)) return true;
-
-    for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
-    {
-      if (getCompoundStmtNoiseMD(*BB)) return true;
-    }
-  }
-  return false;
-}
-
 } // unnamed namespace
 
 namespace llvm {
@@ -1262,9 +1247,6 @@ void NoiseOptimizer::PerformOptimization()
   return;
 #endif
 
-  // If there is no noise attribute, return immediately.
-  if (!hasNoiseAttribute(*Mod, *MD)) return;
-
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
   {
@@ -1500,8 +1482,7 @@ void NoiseOptimizer::PerformOptimization()
 
 void NoiseOptimizer::Reassemble()
 {
-  // If there is no noise attribute, return immediately.
-  if (MD->getNumOperands() == 0) return;
+  assert (MD->getNumOperands() != 0);
 
   PrettyStackTraceString CrashInfo("NOISE: reassemble module after optimizations");
 
@@ -1618,8 +1599,7 @@ void NoiseOptimizer::Finalize()
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
   MD->eraseFromParent();
-
-  if (!noiseFnInfoVec.empty()) outs() << "\nmodule after noise: " << *Mod;
+  outs() << "\nmodule after noise: " << *Mod;
 }
 
 }
