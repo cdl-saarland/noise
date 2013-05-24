@@ -1508,18 +1508,16 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
     // Get start/end for scalar start loop:
     // - start = startVal (no change to cloned loop required)
-    // - end   = startVal % W
+    // - end   = startVal + startVal % W
     Value* firstEndVal = BinaryOperator::Create(Instruction::URem,
                                                 startVal,
                                                 constW,
                                                 "",
                                                 preheaderBB->getTerminator());
-    // Since "end" is the last value for which we still iterate, add 1 to get
-    // the value that we compare to.
     firstEndVal = BinaryOperator::Create(Instruction::Add,
+                                         startVal,
                                          firstEndVal,
-                                         ConstantInt::get(firstEndVal->getType(), 1, false),
-                                         "",
+                                         "scalarEndIdx",
                                          preheaderBB->getTerminator());
 
     // Tie loose ends of cloning.
@@ -1568,16 +1566,16 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                            "",
                                            preheaderBB->getTerminator());
   }
-  Value* tmpRem      = BinaryOperator::Create(Instruction::URem,
+  Value* tmpRem    = BinaryOperator::Create(Instruction::URem,
                                               endVal,
                                               constW,
                                               "",
                                               preheaderBB->getTerminator());
-  Value* wfvEndVal   = BinaryOperator::Create(Instruction::Sub,
-                                              endVal,
-                                              tmpRem,
-                                              "",
-                                              preheaderBB->getTerminator());
+  Value* wfvEndVal = BinaryOperator::Create(Instruction::Sub,
+                                            endVal,
+                                            tmpRem,
+                                            "wfvEndIdx",
+                                            preheaderBB->getTerminator());
   Value* wfvLoopIndVar = indVarPhi;
 
   // Adjust incoming value of induction variable phi (if start loop exists, otherwise no effect).
@@ -1614,7 +1612,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     DEBUG_NOISE_WFV( outs() << "scalarEndLoop: " << *scalarEndLoop << "\n"; );
 
     // Get start/end for scalar end loop:
-    // - start = vectorized loop induction phi - W
+    // - start = vectorized loop induction phi
     // - end   = endVal (no change to cloned loop required)
     Value* thirdStartVal = wfvLoopIndVar;
 
