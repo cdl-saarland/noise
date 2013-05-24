@@ -1131,20 +1131,27 @@ Function* createDummyFunction(Function* noiseFn)
     {
       for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
       {
-        // Handle global variables etc.
+        // Handle global values.
         for (Instruction::op_iterator O=I->op_begin(), OE=I->op_end(); O!=OE; ++O)
         {
           Value* opVal = cast<Value>(*O);
           if (isa<Function>(opVal)) continue;
           if (isa<BasicBlock>(opVal)) continue;
 
-          if (!isa<GlobalValue>(opVal) &&
-              !isa<GlobalVariable>(opVal) &&
-              !isa<ConstantExpr>(opVal))
+          if (isa<GlobalValue>(opVal))
           {
-            continue;
+            values.push_back(opVal);
           }
-          values.push_back(new LoadInst(opVal, "", entryBB));
+
+          if (!isa<ConstantExpr>(opVal)) continue;
+          ConstantExpr* ce = cast<ConstantExpr>(opVal);
+
+          for (ConstantExpr::op_iterator O2=ce->op_begin(), OE2=ce->op_end(); O2!=OE2; ++O2)
+          {
+            Value* opVal2 = cast<Value>(*O2);
+            if (!isa<GlobalValue>(opVal2)) continue;
+            values.push_back(opVal2);
+          }
         }
 
         // Handle calls to other functions.
@@ -1344,8 +1351,8 @@ void NoiseOptimizer::PerformOptimization()
   //       with the parents.
   for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
   {
-    NoiseFnInfo*   nfi    = noiseFnInfoVec[i];
-    Function*     noiseFn = nfi->mReinline ? nfi->mOrigFn : nfi->mMovedFn;
+    NoiseFnInfo* nfi     = noiseFnInfoVec[i];
+    Function*    noiseFn = nfi->mReinline ? nfi->mOrigFn : nfi->mMovedFn;
 
     assert (!nfi->mReinline || !nfi->mMovedFn);
 
