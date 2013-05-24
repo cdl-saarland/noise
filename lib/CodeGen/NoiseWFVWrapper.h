@@ -14,7 +14,7 @@
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 
 namespace llvm {
@@ -32,6 +32,7 @@ class AllocaInst;
 class CallInst;
 class StoreInst;
 class Argument;
+class ScalarEvolution;
 }
 
 // Forward decl.
@@ -48,12 +49,13 @@ struct NoiseWFVWrapper : public FunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
 
-  bool           mFinished;
+  bool             mFinished;
 
-  Module*        mModule;
-  LLVMContext*   mContext;
-  DominatorTree* mDomTree;
-  LoopInfo*      mLoopInfo;
+  Module*          mModule;
+  LLVMContext*     mContext;
+  DominatorTree*   mDomTree;
+  LoopInfo*        mLoopInfo;
+  ScalarEvolution* mSCEV;
 
   unsigned mVectorizationFactor;
   bool mUseAVX;
@@ -77,7 +79,7 @@ public:
     Instruction*      mIntermediateResultPtr;
   };
 
-  typedef DenseMap<Instruction*, ReductionUpdate*> RedUpMapType;
+  typedef MapVector<Instruction*, ReductionUpdate*> RedUpMapType;
 
   struct ReductionVariable
   {

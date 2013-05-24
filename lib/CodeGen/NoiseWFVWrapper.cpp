@@ -51,6 +51,8 @@
 #include "llvm/IR/Constants.h" // UndefValue
 #include "llvm/IR/Instructions.h" // CallInst
 #include "llvm/Analysis/Verifier.h" // VerifyFunction
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpander.h"
 
 #include <sstream>
 
@@ -119,6 +121,7 @@ NoiseWFVWrapper::runOnFunction(Function &F)
   mContext  = &F.getContext();
   mLoopInfo = &getAnalysis<LoopInfo>();
   mDomTree  = &getAnalysis<DominatorTree>();
+  mSCEV     = &getAnalysis<ScalarEvolution>();
 
   const bool success = runWFV(&F);
 
@@ -138,11 +141,152 @@ NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
 {
   AU.addRequired<DominatorTree>();
   AU.addRequired<LoopInfo>();
+  AU.addRequired<ScalarEvolution>();
 }
 
 
 // Helper functions for runWFV().
 namespace {
+
+Loop*
+createNewLoop(Loop* loop, Loop* parentLoop, ValueToValueMapTy& valueMap, LoopInfo* loopInfo)
+{
+  Loop* newLoop = new Loop();
+
+  // Add all of the blocks in loop to the new loop.
+  for (Loop::block_iterator BB=loop->block_begin(), BBE=loop->block_end(); BB!=BBE; ++BB)
+  {
+    if (loopInfo->getLoopFor(*BB) != loop) continue;
+    newLoop->addBasicBlockToLoop(cast<BasicBlock>(valueMap[*BB]), loopInfo->getBase());
+  }
+
+  // Add all of the subloops to the new loop.
+  for (Loop::iterator SL=loop->begin(), SLE=loop->end(); SL!=SLE; ++SL)
+  {
+    createNewLoop(*SL, newLoop, valueMap, loopInfo);
+  }
+
+  return newLoop;
+}
+
+Loop*
+cloneLoop(Loop*              loop,
+          ValueToValueMapTy& valueMap,
+          LoopInfo*          loopInfo)
+{
+  assert (loop && loopInfo);
+  Function* f = loop->getHeader()->getParent();
+  assert (f);
+
+  // Get all info we need about the loop before we start cloning.
+  BasicBlock* preheaderBB = loop->getLoopPreheader();
+  SmallVector<Loop::Edge, 2> exitEdges;
+  loop->getExitEdges(exitEdges);
+
+  // Clone blocks and store mappings of blocks and instructions.
+  SmallVector<BasicBlock*, 4> loopBlocks;
+  SmallVector<BasicBlock*, 4> newBlocks;
+  loopBlocks.insert(loopBlocks.end(), loop->block_begin(), loop->block_end());
+  newBlocks.reserve(loopBlocks.size()+2);
+
+  for (unsigned i=0, e=loopBlocks.size(); i!=e; ++i)
+  {
+    BasicBlock* newBB = CloneBasicBlock(loopBlocks[i], valueMap, ".", f);
+    newBlocks.push_back(newBB);
+    valueMap[loopBlocks[i]] = newBB;
+  }
+
+  // Create new preheader block.
+  BasicBlock* headerBB = loop->getHeader();
+  BasicBlock* newHeaderBB = cast<BasicBlock>(valueMap[headerBB]);
+  BasicBlock* newPreheaderBB = BasicBlock::Create(preheaderBB->getContext(),
+                                                  preheaderBB->getName()+".",
+                                                  f,
+                                                  newHeaderBB);
+  BranchInst::Create(headerBB, newPreheaderBB); // This is just for consistency, all edges are updated below.
+  newPreheaderBB->moveBefore(newHeaderBB);
+  newBlocks.push_back(newPreheaderBB);
+  valueMap[preheaderBB] = newPreheaderBB;
+
+  // Create new exit blocks with exit value phis and store mappings of blocks and phis.
+  for (unsigned i=0, e=exitEdges.size(); i!=e; ++i)
+  {
+    const BasicBlock* exitingBB = exitEdges[i].first;
+    const BasicBlock* exitBB    = exitEdges[i].second;
+    BasicBlock* newExitingBB = cast<BasicBlock>(valueMap[exitingBB]);
+
+    BasicBlock* newExitBB = BasicBlock::Create(exitBB->getContext(),
+                                               exitBB->getName()+".",
+                                               f,
+                                               newExitingBB);
+    newExitingBB->moveBefore(newExitBB);
+    // Add a dummy terminator (no branch, since below we update all branches).
+    Type* fnRetTy = f->getFunctionType()->getReturnType();
+    ReturnInst* dummyRet = fnRetTy->isVoidTy() ?
+        ReturnInst::Create(f->getContext(), newExitBB) :
+        ReturnInst::Create(f->getContext(), UndefValue::get(fnRetTy), newExitBB);
+
+    newBlocks.push_back(newExitBB);
+    valueMap[exitBB] = newExitBB;
+
+    // Clone exit block phis (LCSSA).
+    for (BasicBlock::const_iterator I=exitBB->begin(), IE=exitBB->end(); I!=IE; ++I)
+    {
+      if (!isa<PHINode>(I)) break;
+      const PHINode* phi = cast<PHINode>(I);
+      PHINode* newPhi = cast<PHINode>(phi->clone());
+      newPhi->insertBefore(dummyRet);
+    }
+  }
+
+  // Rewire blocks to their cloned successors.
+  for (unsigned i=0, e=newBlocks.size(); i!=e; ++i)
+  {
+    BasicBlock* block = newBlocks[i];
+    TerminatorInst* terminator = block->getTerminator();
+    if (!terminator) continue; // This is an exit block.
+    for (unsigned s=0, se=terminator->getNumSuccessors(); s<se; ++s)
+    {
+      BasicBlock* succBB = terminator->getSuccessor(s);
+      assert (valueMap[succBB]);
+      terminator->setSuccessor(s, cast<BasicBlock>(valueMap[succBB]));
+    }
+  }
+
+  // Update operands coming from other blocks.
+  for (unsigned i=0, e=newBlocks.size(); i!=e; ++i)
+  {
+    BasicBlock* block = newBlocks[i];
+    for (BasicBlock::iterator I=block->begin(), IE=block->end(); I!=IE; ++I)
+    {
+      // Update incoming blocks of phi nodes.
+      if (PHINode* phi = dyn_cast<PHINode>(I))
+      {
+        for (unsigned j=0, je=phi->getNumIncomingValues(); j<je; ++j)
+        {
+          BasicBlock* incBB = phi->getIncomingBlock(j);
+          BasicBlock* newIncBB = cast<BasicBlock>(valueMap[incBB]);
+          phi->setIncomingBlock(j, newIncBB);
+        }
+      }
+
+      // Update operands.
+      for (unsigned j=0, je=I->getNumOperands(); j<je; ++j)
+      {
+        Value* mappedOp = valueMap[I->getOperand(j)];
+        if (!mappedOp) continue;
+        I->setOperand(j, mappedOp);
+      }
+    }
+  }
+
+  // The only remaining "loose ends" now are the following:
+  // - New preheader has no entry edge (incoming values do not dominate their uses)
+  // - New exit blocks have no successors.
+
+  // Create new loop, update loop info.
+  return createNewLoop(loop, 0, valueMap, loopInfo);
+}
 
 template<unsigned S>
 Function*
@@ -495,8 +639,7 @@ getCallArgs(ReductionVariable&      redVar,
 Type*
 vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
 {
-  if (oldType->isFloatTy() ||
-      (oldType->isIntegerTy() && oldType->getPrimitiveSizeInBits() <= 32U))
+  if (oldType->isFloatingPointTy() || oldType->isIntegerTy())
   {
     return VectorType::get(oldType, vectorizationFactor);
   }
@@ -537,7 +680,7 @@ vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
 }
 
 void
-deleteTree(Instruction* inst, std::vector<Instruction*>& deleteVec)
+deleteTree(Instruction* inst, SetVector<Instruction*>& deleteVec)
 {
   assert (inst);
 
@@ -554,7 +697,7 @@ deleteTree(Instruction* inst, std::vector<Instruction*>& deleteVec)
     assert (false && "deleteTree for branch/switch/return not implemented!");
   }
 
-  deleteVec.push_back(inst);
+  deleteVec.insert(inst);
 }
 
 bool
@@ -634,10 +777,10 @@ replaceUpdateOpUses(Value*              mappedOp,
 //   - One output parameter per "update operation" that has at least one "result user".
 // TODO: It would be beneficial to have WFV vectorization analysis info here.
 void
-generateSIMDReductionFunction(ReductionVariable& redVar,
-                              const unsigned     vectorizationFactor,
-                              Function*          loopBodyFn,
-                              DominatorTree&     domTree)
+generateSIMDReductionFunction(ReductionVariable&   redVar,
+                              const unsigned       vectorizationFactor,
+                              Function*            loopBodyFn,
+                              const RedVarVecType& redVars)
 {
   Type* type = redVar.mPhi->getType();
   LLVMContext& context = type->getContext();
@@ -804,7 +947,7 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
       const ReductionUpdate& redUp = *it->second;
       Instruction* mappedUp = cast<Instruction>(valueMap[redUp.mOperation]);
       DEBUG_NOISE_WFV( outs() << "mappedUp: " << *mappedUp << "\n"; );
-      OtherOperandsVec& otherOperands = *redUp.mOtherOperands;
+      const OtherOperandsVec& otherOperands = *redUp.mOtherOperands;
       for (OtherOperandsVec::const_iterator it2=otherOperands.begin(),
            E2=otherOperands.end(); it2!=E2; ++it2)
       {
@@ -877,31 +1020,6 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
     }
 
     //------------------------------------------------------------------------//
-    // Delete all result users and their uses from the reduction function.
-    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
-    {
-      const ReductionUpdate& redUp = *it->second;
-      if (redUp.mResultUsers->empty()) continue;
-      ResultUsersVec& resultUsers = *redUp.mResultUsers;
-      for (unsigned j=0, ej=resultUsers.size(); j<ej; ++j)
-      {
-        Instruction* resultUser = resultUsers[j];
-        Instruction* mappedUser = cast<Instruction>(valueMap[resultUser]);
-
-        // For now, we don't touch anything that could alter the control flow behavior.
-        if (isInfluencingControlFlow(mappedUser)) continue;
-
-        std::vector<Instruction*> deleteVec;
-        deleteTree(mappedUser, deleteVec);
-        for (unsigned i=0, e=deleteVec.size(); i<e; ++i)
-        {
-          assert (deleteVec[i]->use_empty());
-          deleteVec[i]->eraseFromParent();
-        }
-      }
-    }
-
-    //------------------------------------------------------------------------//
     // Replace return by a branch to the latest entry block.
     // First iteration: do nothing :p.
     if (i != 0)
@@ -926,6 +1044,125 @@ generateSIMDReductionFunction(ReductionVariable& redVar,
       storeBack->eraseFromParent();
     }
 
+    //------------------------------------------------------------------------//
+    // Delete all result users and their uses from the reduction function.
+    DEBUG_NOISE_WFV( outs() << "\nErasing unnecessary code from SIMD reduction function...\n"; );
+#if 0
+    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+    {
+      const ReductionUpdate& redUp = *it->second;
+      if (redUp.mResultUsers->empty()) continue;
+      ResultUsersVec& resultUsers = *redUp.mResultUsers;
+      for (unsigned j=0, ej=resultUsers.size(); j<ej; ++j)
+      {
+        Instruction* resultUser = resultUsers[j];
+        Instruction* mappedUser = cast<Instruction>(valueMap[resultUser]);
+
+        // For now, we don't touch anything that could alter the control flow behavior.
+        if (isInfluencingControlFlow(mappedUser)) continue;
+
+        DEBUG_NOISE_WFV( outs() << "  deleting tree below user: " << *mappedUser << "\n"; );
+        SetVector<Instruction*> deleteVec;
+        deleteTree(mappedUser, deleteVec);
+        for (unsigned i=0, e=deleteVec.size(); i<e; ++i)
+        {
+          DEBUG_NOISE_WFV( outs() << "    deleting instruction: " << *deleteVec[i] << "\n"; );
+          assert (deleteVec[i]->use_empty());
+          deleteVec[i]->eraseFromParent();
+        }
+      }
+    }
+
+    // Delete all code that is related to other reduction variables.
+    SetVector<Instruction*> deleteVec;
+    for (RedVarVecType::const_iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+    {
+      const ReductionVariable& otherRedVar = **it;
+      if (&otherRedVar == &redVar) continue;
+
+      // Delete trees below uses of the phi that have a mapping.
+      for (PHINode::use_iterator U=otherRedVar.mPhi->use_begin(),
+           UE=otherRedVar.mPhi->use_end(); U!=UE; ++U)
+      {
+        Value* useVal = *U;
+        Value* mappedUseVal = valueMap[useVal];
+        if (!mappedUseVal) continue;
+        if (!isa<Instruction>(mappedUseVal)) continue;
+        //DEBUG_NOISE_WFV( outs() << "    deleting use of phi: " << *mappedUseVal << "\n"; );
+        deleteTree(cast<Instruction>(mappedUseVal), deleteVec);
+      }
+
+      // Delete trees below update operations.
+      const RedUpMapType& otherUpdates = *otherRedVar.mUpdates;
+      for (RedUpMapType::const_iterator it2=otherUpdates.begin(), E2=otherUpdates.end(); it2!=E2; ++it2)
+      {
+        const ReductionUpdate& redUp = *it2->second;
+        Instruction* mappedUp = cast<Instruction>(valueMap[redUp.mOperation]);
+        //DEBUG_NOISE_WFV( outs() << "    deleting update op: " << *mappedUp << "\n"; );
+        deleteTree(mappedUp, deleteVec);
+      }
+    }
+
+    DEBUG_NOISE_WFV( outs() << "  deleting trees below other red vars...\n"; );
+    for (unsigned j=0, je=deleteVec.size(); j<je; ++j)
+    {
+      // Don't delete instructions that also belong to the current SCC.
+      bool isSCCUse = false;
+      for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+      {
+        const ReductionUpdate& redUp = *it->second;
+        if (deleteVec[j] != redUp.mOperation) continue;
+        isSCCUse = true;
+      }
+      if (isSCCUse) continue;
+
+      if (!deleteVec[j]->use_empty()) continue;
+
+      DEBUG_NOISE_WFV( outs() << "    deleting instruction: " << *deleteVec[j] << "\n"; );
+      deleteVec[j]->eraseFromParent();
+    }
+#endif
+
+    // Delete all call and store operations that are not part of this reduction.
+    // This should kill all code that is not required.
+    SetVector<Instruction*> deleteVec2;
+    for (Function::iterator BB=simdRedFn->begin(), BBE=simdRedFn->end(); BB!=BBE; ++BB)
+    {
+      for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
+      {
+        if (!isa<StoreInst>(I) && !isa<CallInst>(I)) continue;
+        deleteTree(I, deleteVec2);
+      }
+    }
+    DEBUG_NOISE_WFV( outs() << "  deleting unrelated calls/stores...\n"; );
+    for (unsigned j=0, je=deleteVec2.size(); j<je; ++j)
+    {
+      // Don't delete instructions that also belong to the current SCC.
+      bool isSCCUse = false;
+      for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
+      {
+        const ReductionUpdate& redUp = *it->second;
+        if (deleteVec2[j] != redUp.mOperation) continue;
+        isSCCUse = true;
+      }
+      if (isSCCUse) continue;
+
+      // Don't delete the storeback operation.
+      if (StoreInst* store = dyn_cast<StoreInst>(deleteVec2[j]))
+      {
+        if (store->getPointerOperand() == valueMap[redVar.mOutArg]) continue;
+      }
+
+      // Don't delete instructions whose parent was not deleted (due to the continues above).
+      if (!deleteVec2[j]->use_empty()) continue;
+
+      DEBUG_NOISE_WFV( outs() << "    deleting instruction: " << *deleteVec2[j] << "\n"; );
+      deleteVec2[j]->eraseFromParent();
+    }
+
+    DEBUG_NOISE_WFV( outs() << "Erasing of unnecessary code done.\n\n"; );
+
+    //------------------------------------------------------------------------//
     //------------------------------------------------------------------------//
     // Finally, we need to update the vectors of all intermediate results that are used
     // outside of the SCC.
@@ -1035,6 +1272,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   BasicBlock* headerBB    = loop->getHeader();
   BasicBlock* latchBB     = loop->getLoopLatch();
   BasicBlock* exitBB      = loop->getUniqueExitBlock();
+  BasicBlock* exitingBB   = loop->getExitingBlock();
   assert (preheaderBB && headerBB && latchBB &&
           "vectorization of non-simplified loop not supported!");
   assert (loop->isLoopSimplifyForm() &&
@@ -1044,12 +1282,59 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   assert (loop->getNumBackEdges() == 1 &&
           "vectorization of loops with multiple back edges not supported!");
-  assert (exitBB &&
+  assert (exitBB && exitingBB &&
           "vectorization of loops with multiple exits not supported!");
 
+  //-------------------------------------------------------------------------//
+
   // Get loop induction variable phi.
-  // TODO: Use Scalar Evolution for that.
   PHINode* indVarPhi = loop->getCanonicalInductionVariable();
+  if (!indVarPhi)
+  {
+    for (BasicBlock::iterator I=headerBB->begin(), IE=headerBB->end(); I!=IE; ++I)
+    {
+      if (!isa<PHINode>(I)) continue;
+      PHINode* phi = cast<PHINode>(I);
+      Type* type = phi->getType();
+
+      if (!type->isIntegerTy() &&
+          //!type->isFloatingPointTy() && // can't use getSCEV.
+          !type->isPointerTy())
+      {
+        continue;
+      }
+
+      const SCEV* scevPhi = mSCEV->getSCEV(phi);
+      if (!isa<SCEVAddRecExpr>(scevPhi)) continue;
+
+      const SCEVAddRecExpr* addExpr = cast<SCEVAddRecExpr>(scevPhi);
+      const SCEV* stepRec = addExpr->getStepRecurrence(*mSCEV);
+
+      if (type->isIntegerTy() && stepRec->isAllOnesValue())
+      {
+        errs() << "WARNING: vectorization of loop with reverse induction not implemented!\n";
+        continue;
+      }
+
+      if (!stepRec->isOne()) continue;
+
+      if (type->isPointerTy())
+      {
+        errs() << "WARNING: vectorization of loop with pointer induction not implemented!\n";
+        continue;
+      }
+
+      if (indVarPhi)
+      {
+        errs() << "WARNING: vectorization of loop with multiple "
+            << "induction variables not implemented!\n";
+        continue;
+      }
+
+      indVarPhi = phi;
+    }
+  }
+
   assert (indVarPhi &&
           "vectorization of loops without canonical induction variable not supported!");
   assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
@@ -1119,6 +1404,245 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   }
 
   // TODO: Make sure we stop here already if there are reductions we can't handle.
+
+  //-------------------------------------------------------------------------//
+
+  assert (mSCEV->hasLoopInvariantBackedgeTakenCount(loop) &&
+          "vectorization of loops without loop-invariant backedge count not supported!");
+
+  const SCEV* scevLoopCountMinus1 = mSCEV->getExitCount(loop, exitingBB);
+  assert (scevLoopCountMinus1 != mSCEV->getCouldNotCompute() && "invalid loop count found!");
+#if 0
+  const SCEV* scevConst1 = mSCEV->getConstant(scevLoopCountMinus1->getType(), 1);
+  const SCEV* scevLoopCount = mSCEV->getAddExpr(scevLoopCountMinus1, scevConst1);
+#else
+  const SCEV* scevLoopCount = scevLoopCountMinus1;
+#endif
+  DEBUG_NOISE_WFV( outs() << "loop count expr: " << *scevLoopCount << "\n"; );
+  SCEVExpander expander(*mSCEV, "");
+  Value* loopCount = expander.expandCodeFor(scevLoopCount,
+                                            scevLoopCount->getType(),
+                                            preheaderBB->getTerminator());
+  DEBUG_NOISE_WFV( outs() << "loop count     : " << *loopCount << "\n"; );
+
+  loopCount = ZExtInst::CreateZExtOrBitCast(loopCount,
+                                            indVarPhi->getType(),
+                                            "",
+                                            preheaderBB->getTerminator());
+
+  Value* startVal = indVarPhi->getIncomingValueForBlock(preheaderBB);
+  DEBUG_NOISE_WFV( outs() << "start val      : " << *startVal << "\n"; );
+
+  // Get the end value.
+  // Optimize for the case where the end value is a constant.
+  assert (isa<BranchInst>(exitingBB->getTerminator()));
+  BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
+  assert (exitBr->isConditional());
+  assert (isa<CmpInst>(exitBr->getCondition()) &&
+          "vectorization of loop with non-compare-inst exit condition not supported!");
+  CmpInst* exitCond = cast<CmpInst>(exitBr->getCondition());
+  Value* endVal = exitCond->getOperand(1);
+  if (!isa<Constant>(endVal))
+  {
+    const SCEV* scevLoopCountZExt = mSCEV->getSCEV(loopCount);
+    const SCEV* scevLoopStartVal = mSCEV->getSCEV(startVal);
+    const SCEV* scevLoopEndVal = mSCEV->getAddExpr(scevLoopStartVal, scevLoopCountZExt);
+    endVal = expander.expandCodeFor(scevLoopEndVal,
+                                    scevLoopEndVal->getType(),
+                                    preheaderBB->getTerminator());
+  }
+  DEBUG_NOISE_WFV( outs() << "end val        : " << *endVal << "\n"; );
+
+  Constant* constW = ConstantInt::get(indVarPhi->getType(), mVectorizationFactor, false);
+
+  //-------------------------------------------------------------------------//
+
+  // If the loop induction variable does not start at a constant that is
+  // a multiple of W, we have to create a first loop that iterates until
+  // the induction variable is aligned.
+  // NOTE: This is only required if we have loads/stores that are consecutive
+  //       and aligned. We only know this after vectorization analysis, though.
+  bool needScalarStartLoop = true;
+  if (ConstantInt* c = dyn_cast<ConstantInt>(startVal))
+  {
+    uint64_t val = c->getLimitedValue();
+    if (val % mVectorizationFactor == 0) needScalarStartLoop = false;
+  }
+  else if (ConstantFP* c = dyn_cast<ConstantFP>(startVal))
+  {
+    double val = c->getValueAPF().convertToDouble();
+    if (fmod(val, (double)mVectorizationFactor) == 0.0) needScalarStartLoop = false;
+  }
+
+  // If the loop end value is not a multiple of W, we have to create an end
+  // loop that iterates until the end value is hit.
+  bool needScalarEndLoop = true;
+  if (ConstantInt* c = dyn_cast<ConstantInt>(endVal))
+  {
+    uint64_t val = c->getLimitedValue();
+    if (val % mVectorizationFactor == 0) needScalarEndLoop = false;
+  }
+  else if (ConstantFP* c = dyn_cast<ConstantFP>(endVal))
+  {
+    double val = c->getValueAPF().convertToDouble();
+    if (fmod(val, (double)mVectorizationFactor) == 0.0) needScalarEndLoop = false;
+  }
+
+  //-------------------------------------------------------------------------//
+
+  // Clone the loop to create start/end loops if necessary.
+  // We have to clone before we start adjusting values etc. for the SIMD loop.
+  ValueToValueMapTy startLoopValueMap;
+  ValueToValueMapTy endLoopValueMap;
+  Loop* scalarStartLoop = needScalarStartLoop ?
+      cloneLoop(loop, startLoopValueMap, mLoopInfo) : 0;
+  Loop* scalarEndLoop = needScalarEndLoop ?
+      cloneLoop(loop, endLoopValueMap, mLoopInfo) : 0;
+
+  //-------------------------------------------------------------------------//
+
+  Value* startLoopIndVar = startVal;
+  if (needScalarStartLoop)
+  {
+    DEBUG_NOISE_WFV( outs() << "scalarStartLoop: " << *scalarStartLoop << "\n"; );
+
+    // Get start/end for scalar start loop:
+    // - start = startVal (no change to cloned loop required)
+    // - end   = startVal % W
+    Value* firstEndVal = BinaryOperator::Create(Instruction::URem,
+                                                startVal,
+                                                constW,
+                                                "",
+                                                preheaderBB->getTerminator());
+    // Since "end" is the last value for which we still iterate, add 1 to get
+    // the value that we compare to.
+    firstEndVal = BinaryOperator::Create(Instruction::Add,
+                                         firstEndVal,
+                                         ConstantInt::get(firstEndVal->getType(), 1, false),
+                                         "",
+                                         preheaderBB->getTerminator());
+
+    // Tie loose ends of cloning.
+    BasicBlock* startPreheaderBB = cast<BasicBlock>(startLoopValueMap[preheaderBB]);
+    BasicBlock* startExitBB = scalarStartLoop->getUniqueExitBlock();
+    TerminatorInst* preheaderTerm = preheaderBB->getTerminator();
+    TerminatorInst* startLoopExitTerm = startExitBB->getTerminator();
+    // 1. Branch from preheader to start loop preheader.
+    BranchInst::Create(startPreheaderBB, preheaderBB);
+    // 2. Move terminator of preheader to start loop exit.
+    preheaderTerm->moveBefore(startLoopExitTerm);
+    // 3. Erase dummy terminator.
+    startLoopExitTerm->eraseFromParent();
+
+    // Incoming value of induction phi does not have to be changed.
+    // However, we have to store the phi since it will be the input value of the
+    // SIMD loop induction variable.
+    startLoopIndVar = cast<PHINode>(startLoopValueMap[indVarPhi]);
+
+    // Adjust exit condition.
+    BasicBlock* startExitingBB = cast<BasicBlock>(startLoopValueMap[exitingBB]);
+    assert (isa<BranchInst>(startExitingBB->getTerminator()));
+    BranchInst* exitBr = cast<BranchInst>(startExitingBB->getTerminator());
+    assert (exitBr->isConditional());
+    assert (isa<CmpInst>(exitBr->getCondition()) &&
+            "vectorization of loop with non-compare-inst exit condition not supported!");
+    CmpInst* exitCond = cast<CmpInst>(exitBr->getCondition());
+
+    CmpInst* newExitCond = indVarPhi->getType()->isIntegerTy() ?
+        ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_SLT, startLoopIndVar, firstEndVal, "", exitCond) :
+        FCmpInst::Create(Instruction::FCmp, FCmpInst::FCMP_OLT, startLoopIndVar, firstEndVal, "", exitCond);
+
+    exitCond->replaceAllUsesWith(newExitCond);
+  }
+
+  //-------------------------------------------------------------------------//
+
+  // Get start/end for vectorized loop:
+  // - start = start loop induction phi
+  // - end   = endVal - (endVal % W)
+  Value* wfvStartVal = startLoopIndVar;
+  if (endVal->getType() != indVarPhi->getType())
+  {
+    endVal = ZExtInst::CreateZExtOrBitCast(endVal,
+                                           indVarPhi->getType(),
+                                           "",
+                                           preheaderBB->getTerminator());
+  }
+  Value* tmpRem      = BinaryOperator::Create(Instruction::URem,
+                                              endVal,
+                                              constW,
+                                              "",
+                                              preheaderBB->getTerminator());
+  Value* wfvEndVal   = BinaryOperator::Create(Instruction::Sub,
+                                              endVal,
+                                              tmpRem,
+                                              "",
+                                              preheaderBB->getTerminator());
+  Value* wfvLoopIndVar = indVarPhi;
+
+  // Adjust incoming value of induction variable phi (if start loop exists, otherwise no effect).
+  const unsigned preIdx = indVarPhi->getBasicBlockIndex(preheaderBB);
+  indVarPhi->setIncomingValue(preIdx, wfvStartVal);
+
+  // Adjust incoming blocks of phis in header if there is a scalar start loop.
+  if (needScalarStartLoop)
+  {
+    BasicBlock* mappedExitBB = cast<BasicBlock>(startLoopValueMap[exitBB]);
+    for (BasicBlock::iterator I=headerBB->begin(), IE=headerBB->end(); I!=IE; ++I)
+    {
+      if (!isa<PHINode>(I)) break;
+      PHINode* phi = cast<PHINode>(I);
+      const unsigned preIdx = phi->getBasicBlockIndex(preheaderBB);
+      phi->setIncomingBlock(preIdx, mappedExitBB);
+    }
+  }
+
+  // Adjust exit condition.
+  // TODO: We may have to replace *all* possible uses of the end value!
+  CmpInst* newExitCond = indVarPhi->getType()->isIntegerTy() ?
+      ICmpInst::Create(Instruction::ICmp, ICmpInst::ICMP_SLT, indVarPhi, wfvEndVal, "", exitCond) :
+      FCmpInst::Create(Instruction::FCmp, FCmpInst::FCMP_OLT, indVarPhi, wfvEndVal, "", exitCond);
+
+  exitCond->replaceAllUsesWith(newExitCond);
+
+  // TODO: Rewire inputs of SIMD loop from outputs of scalar start loop (if any)?
+
+  //-------------------------------------------------------------------------//
+
+  if (needScalarEndLoop)
+  {
+    DEBUG_NOISE_WFV( outs() << "scalarEndLoop: " << *scalarEndLoop << "\n"; );
+
+    // Get start/end for scalar end loop:
+    // - start = vectorized loop induction phi - W
+    // - end   = endVal (no change to cloned loop required)
+    Value* thirdStartVal = wfvLoopIndVar;
+
+    // Tie loose ends of cloning.
+    BasicBlock* endPreheaderBB = cast<BasicBlock>(endLoopValueMap[preheaderBB]);
+    BasicBlock* endExitBB = scalarEndLoop->getUniqueExitBlock();
+    TerminatorInst* simdTerm = exitBB->getTerminator();
+    TerminatorInst* endLoopExitTerm = endExitBB->getTerminator();
+    // 1. Branch from SIMD loop exit to end loop preheader.
+    BranchInst::Create(endPreheaderBB, exitBB);
+    // 2. Move terminator of SIMD loop exit to end loop exit.
+    simdTerm->moveBefore(endLoopExitTerm);
+    // 3. Erase dummy terminator.
+    endLoopExitTerm->eraseFromParent();
+
+    // Set incoming value of induction phi to the correct start value.
+    PHINode* endIndVarPhi = cast<PHINode>(endLoopValueMap[indVarPhi]);
+    const unsigned preIdx = endIndVarPhi->getBasicBlockIndex(endPreheaderBB);
+    endIndVarPhi->setIncomingValue(preIdx, thirdStartVal);
+
+    // Exit condition does not have to be changed.
+
+    // TODO: Rewire inputs of scalar end loop from outputs of SIMD loop?
+
+    // TODO: Rewire outputs of this function to the code behind the loop.
+  }
+
+  assert (!verifyFunction(*noiseFn) && "verification failed!");
 
   //-------------------------------------------------------------------------//
 
@@ -1296,7 +1820,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
-    generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn, *mDomTree);
+    generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn, redVars);
     DEBUG_NOISE_WFV( outs() << "reduction var phi: " << *redVar.mPhi << "\n"; );
     DEBUG_NOISE_WFV( outs() << "  SIMD reduction function: " << *redVar.mReductionFnSIMD << "\n"; );
     assert (!verifyFunction(*redVar.mReductionFnSIMD));
@@ -1467,12 +1991,54 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   // Add semantics to final result alloca to prevent vectorization (otherwise it is
   // marked as OP_VARYING because the reduction call is OP_VARYING).
-  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  // Also mark its reload uses and their store uses.
+  for (RedVarVecType::const_iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
-    ReductionVariable& redVar = **it;
-    wfvInterface.addSIMDSemantics(*redVar.mResultPtr, true, false, false, false,
+    const ReductionVariable& redVar = **it;
+    const Instruction& resPtr = *redVar.mResultPtr;
+    wfvInterface.addSIMDSemantics(resPtr, true, false, false, false,
                                   true, false, false,
                                   true, true, false);
+    for (Instruction::const_use_iterator U=resPtr.use_begin(),
+         UE=resPtr.use_end(); U!=UE; ++U)
+    {
+      const Instruction& useI = *cast<Instruction>(*U);
+      if (isa<CallInst>(useI)) continue;
+      wfvInterface.addSIMDSemantics(useI, true, false, false, false,
+                                    true, false, false,
+                                    true, true, false);
+      for (Instruction::const_use_iterator U2=useI.use_begin(),
+           UE2=useI.use_end(); U2!=UE2; ++U2)
+      {
+        const Instruction& useI2 = *cast<Instruction>(*U2);
+        assert (isa<StoreInst>(useI2));
+        wfvInterface.addSIMDSemantics(useI2, true, false, false, false,
+                                      true, false, false,
+                                      true, true, false);
+      }
+    }
+  }
+
+  // Add semantics to "other operand" allocas to enforce vectorization.
+  // However, also make sure that their uses are never marked as OP_SEQUENTIAL.
+  const BasicBlock* entryBB = &loopBodyFn->getEntryBlock();
+  for (BasicBlock::const_iterator I=entryBB->begin(), IE=entryBB->end(); I!=IE; ++I)
+  {
+    if (!isa<AllocaInst>(I)) continue;
+    if (!I->getName().startswith("red.otherop")) continue;
+    wfvInterface.addSIMDSemantics(*I, false, true, false, false,
+                                  false, true, false,
+                                  true, false, true);
+
+    for (Instruction::const_use_iterator U=I->use_begin(),
+         UE=I->use_end(); U!=UE; ++U)
+    {
+      const Instruction& useI = *cast<Instruction>(*U);
+      assert (isa<StoreInst>(useI) || isa<LoadInst>(useI));
+      wfvInterface.addSIMDSemantics(useI, false, true, false, false,
+                                    false, !useI.getType()->isVoidTy(), false,
+                                    false, false, false);
+    }
   }
 
   // Run WFV.
@@ -1835,6 +2401,7 @@ INITIALIZE_PASS_BEGIN(NoiseWFVWrapper, "wfv-wrapper",
                       "wrapper pass around WFV library", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
 INITIALIZE_PASS_END(NoiseWFVWrapper, "wfv-wrapper",
                     "wrapper pass around WFV library", false, false)
 
