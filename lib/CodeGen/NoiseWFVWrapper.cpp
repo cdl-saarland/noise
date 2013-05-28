@@ -236,6 +236,7 @@ cloneLoop(Loop*              loop,
       const PHINode* phi = cast<PHINode>(I);
       PHINode* newPhi = cast<PHINode>(phi->clone());
       newPhi->insertBefore(dummyRet);
+      valueMap[phi] = newPhi;
     }
   }
 
@@ -1045,86 +1046,9 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
     }
 
     //------------------------------------------------------------------------//
-    // Delete all result users and their uses from the reduction function.
-    DEBUG_NOISE_WFV( outs() << "\nErasing unnecessary code from SIMD reduction function...\n"; );
-#if 0
-    for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
-    {
-      const ReductionUpdate& redUp = *it->second;
-      if (redUp.mResultUsers->empty()) continue;
-      ResultUsersVec& resultUsers = *redUp.mResultUsers;
-      for (unsigned j=0, ej=resultUsers.size(); j<ej; ++j)
-      {
-        Instruction* resultUser = resultUsers[j];
-        Instruction* mappedUser = cast<Instruction>(valueMap[resultUser]);
-
-        // For now, we don't touch anything that could alter the control flow behavior.
-        if (isInfluencingControlFlow(mappedUser)) continue;
-
-        DEBUG_NOISE_WFV( outs() << "  deleting tree below user: " << *mappedUser << "\n"; );
-        SetVector<Instruction*> deleteVec;
-        deleteTree(mappedUser, deleteVec);
-        for (unsigned i=0, e=deleteVec.size(); i<e; ++i)
-        {
-          DEBUG_NOISE_WFV( outs() << "    deleting instruction: " << *deleteVec[i] << "\n"; );
-          assert (deleteVec[i]->use_empty());
-          deleteVec[i]->eraseFromParent();
-        }
-      }
-    }
-
-    // Delete all code that is related to other reduction variables.
-    SetVector<Instruction*> deleteVec;
-    for (RedVarVecType::const_iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
-    {
-      const ReductionVariable& otherRedVar = **it;
-      if (&otherRedVar == &redVar) continue;
-
-      // Delete trees below uses of the phi that have a mapping.
-      for (PHINode::use_iterator U=otherRedVar.mPhi->use_begin(),
-           UE=otherRedVar.mPhi->use_end(); U!=UE; ++U)
-      {
-        Value* useVal = *U;
-        Value* mappedUseVal = valueMap[useVal];
-        if (!mappedUseVal) continue;
-        if (!isa<Instruction>(mappedUseVal)) continue;
-        //DEBUG_NOISE_WFV( outs() << "    deleting use of phi: " << *mappedUseVal << "\n"; );
-        deleteTree(cast<Instruction>(mappedUseVal), deleteVec);
-      }
-
-      // Delete trees below update operations.
-      const RedUpMapType& otherUpdates = *otherRedVar.mUpdates;
-      for (RedUpMapType::const_iterator it2=otherUpdates.begin(), E2=otherUpdates.end(); it2!=E2; ++it2)
-      {
-        const ReductionUpdate& redUp = *it2->second;
-        Instruction* mappedUp = cast<Instruction>(valueMap[redUp.mOperation]);
-        //DEBUG_NOISE_WFV( outs() << "    deleting update op: " << *mappedUp << "\n"; );
-        deleteTree(mappedUp, deleteVec);
-      }
-    }
-
-    DEBUG_NOISE_WFV( outs() << "  deleting trees below other red vars...\n"; );
-    for (unsigned j=0, je=deleteVec.size(); j<je; ++j)
-    {
-      // Don't delete instructions that also belong to the current SCC.
-      bool isSCCUse = false;
-      for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
-      {
-        const ReductionUpdate& redUp = *it->second;
-        if (deleteVec[j] != redUp.mOperation) continue;
-        isSCCUse = true;
-      }
-      if (isSCCUse) continue;
-
-      if (!deleteVec[j]->use_empty()) continue;
-
-      DEBUG_NOISE_WFV( outs() << "    deleting instruction: " << *deleteVec[j] << "\n"; );
-      deleteVec[j]->eraseFromParent();
-    }
-#endif
-
     // Delete all call and store operations that are not part of this reduction.
     // This should kill all code that is not required.
+    DEBUG_NOISE_WFV( outs() << "\nErasing unnecessary code from SIMD reduction function...\n"; );
     SetVector<Instruction*> deleteVec2;
     for (Function::iterator BB=simdRedFn->begin(), BBE=simdRedFn->end(); BB!=BBE; ++BB)
     {
@@ -1134,6 +1058,7 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
         deleteTree(I, deleteVec2);
       }
     }
+
     DEBUG_NOISE_WFV( outs() << "  deleting unrelated calls/stores...\n"; );
     for (unsigned j=0, je=deleteVec2.size(); j<je; ++j)
     {
@@ -1609,7 +1534,28 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   exitCond->replaceAllUsesWith(newExitCond);
 
-  // TODO: Rewire inputs of SIMD loop from outputs of scalar start loop (if any)?
+  // Rewire inputs of SIMD loop from outputs of scalar start loop (if any).
+  // These can only be reductions.
+  if (needScalarStartLoop)
+  {
+    // The loop has a new preheader.
+    BasicBlock* newPreheaderBB = loop->getLoopPreheader();
+    for (BasicBlock::iterator I=exitBB->begin(), IE=exitBB->end(); I!=IE; ++I)
+    {
+      if (!isa<PHINode>(I)) break;
+      PHINode* simdLoopRedRes = cast<PHINode>(I);
+      assert (simdLoopRedRes->getNumIncomingValues() == 1 && "not in LCSSA?!");
+      // Get the reduction phi (the only operand due to LCSSA).
+      assert (isa<PHINode>(simdLoopRedRes->getIncomingValue(0)));
+      PHINode* simdLoopRedPhi = cast<PHINode>(simdLoopRedRes->getIncomingValue(0));
+      // Get the result of the start loop.
+      PHINode* startLoopRedRes = cast<PHINode>(startLoopValueMap[simdLoopRedRes]);
+      // Now, modify the phi in the header of the SIMD loop.
+      // Replace the incoming value from the preheader of the SIMD loop by the result.
+      Value* phIncVal = simdLoopRedPhi->getIncomingValueForBlock(newPreheaderBB);
+      simdLoopRedPhi->replaceUsesOfWith(phIncVal, startLoopRedRes);
+    }
+  }
 
   //-------------------------------------------------------------------------//
 
@@ -1641,9 +1587,44 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
     // Exit condition does not have to be changed.
 
-    // TODO: Rewire inputs of scalar end loop from outputs of SIMD loop?
+    // Rewire inputs of scalar end loop from outputs of SIMD loop (if any).
+    // These can only be reductions.
+    for (BasicBlock::iterator I=exitBB->begin(), IE=exitBB->end(); I!=IE; ++I)
+    {
+      if (!isa<PHINode>(I)) break;
+      PHINode* simdLoopRedRes = cast<PHINode>(I);
+      assert (simdLoopRedRes->getNumIncomingValues() == 1 && "not in LCSSA?!");
+      // Get the result of the start loop.
+      PHINode* endLoopRedRes = cast<PHINode>(endLoopValueMap[simdLoopRedRes]);
+      // Get the reduction phi (the only operand due to LCSSA).
+      assert (isa<PHINode>(endLoopRedRes->getIncomingValue(0)));
+      PHINode* endLoopRedPhi = cast<PHINode>(endLoopRedRes->getIncomingValue(0));
+      // Now, modify the phi in the header of the SIMD loop.
+      // Replace the incoming value from the preheader of the SIMD loop by the result.
+      Value* phIncVal = endLoopRedPhi->getIncomingValueForBlock(endPreheaderBB);
+      endLoopRedPhi->replaceUsesOfWith(phIncVal, simdLoopRedRes);
+    }
 
-    // TODO: Rewire outputs of this function to the code behind the loop.
+    // Rewire outputs of this function to the code behind the loop.
+    // Outputs are all those values that have a phi in the exit block (LCSSA).
+    // This also requires to move all store operations in the exit block.
+    SmallVector<StoreInst*, 2> moveInsts;
+    for (BasicBlock::iterator I=exitBB->begin(), IE=exitBB->end(); I!=IE; ++I)
+    {
+      if (!isa<StoreInst>(I)) continue;
+      StoreInst* storeI = cast<StoreInst>(I);
+      Value* storedVal = storeI->getValueOperand();
+      Value* mappedStoreVal = endLoopValueMap[storedVal];
+      storeI->replaceUsesOfWith(storedVal, mappedStoreVal);
+      moveInsts.push_back(storeI);
+    }
+
+    TerminatorInst* terminator = endExitBB->getTerminator();
+    for (SmallVector<StoreInst*, 2>::iterator it=moveInsts.begin(),
+         E=moveInsts.end(); it!=E; ++it)
+    {
+        (*it)->moveBefore(terminator);
+    }
   }
 
   assert (!verifyFunction(*noiseFn) && "verification failed!");
