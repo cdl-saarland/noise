@@ -1078,6 +1078,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     }
     Passes.add(info->createPass());
   }
+  outs() << "Running pass: " << GetPassName(Opt) << "\n";
 }
 
 // Noise Optimizer
@@ -1374,7 +1375,6 @@ void NoiseOptimizer::PerformOptimization()
 
     for(size_t i = 0, e = nfi->GetNumOptimizations(); i < e; ++i) {
       NoiseOptimization* noiseOpt = nfi->GetOptimization(i);
-      outs() << "Running pass: " << NoiseOptimizations::GetPassName(noiseOpt) << "\n";
       NoiseOptimizations::Instantiate(noiseOpt, Registry, NoisePasses);
     }
 
