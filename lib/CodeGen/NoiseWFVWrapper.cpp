@@ -1067,7 +1067,7 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
       for (RedUpMapType::const_iterator it=updates.begin(), E=updates.end(); it!=E; ++it)
       {
         const ReductionUpdate& redUp = *it->second;
-        if (deleteVec2[j] != redUp.mOperation) continue;
+        if (deleteVec2[j] != valueMap[redUp.mOperation]) continue;
         isSCCUse = true;
       }
       if (isSCCUse) continue;
@@ -2258,6 +2258,9 @@ gatherReductionUpdateInfo(RedUpMapType&        reductionSCC,
     for (Instruction::op_iterator O=updateOp->op_begin(),
          OE=updateOp->op_end(); O!=OE; ++O)
     {
+      if (isa<BasicBlock>(*O)) continue;
+      if (isa<Function>(*O)) continue;
+
       if (Instruction* opInst = dyn_cast<Instruction>(*O))
       {
         if (reductionPhi == opInst) continue;
