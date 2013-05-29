@@ -1956,6 +1956,10 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                           mUseDivergenceAnalysis,
                                           mVerbose);
 
+  // Add semantics for SSE/AVX builtins.
+  if (mUseAVX) wfvInterface.addCommonMappings(false, false, false, true, false);
+  else wfvInterface.addCommonMappings(true, true, true, false, false);
+
   // Add semantics to the induction variable vector.
   wfvInterface.addSIMDSemantics(*indVarArg, false, true, false, true, false, true);
 
