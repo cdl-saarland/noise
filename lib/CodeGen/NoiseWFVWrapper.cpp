@@ -1306,6 +1306,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
             redVar.mPhi == redVar.mResultUser->getIncomingValueForBlock(loop->getExitingBlock()));
 
     DEBUG_NOISE_WFV( outs() << "reduction var phi  P: " << *redVar.mPhi << "\n"; );
+    DEBUG_NOISE_WFV( if (redVar.mCanOptimizeWithVector) outs() << "  can be vectorized!\n";);
     DEBUG_NOISE_WFV( outs() << "  start value      S: " << *redVar.mStartVal << "\n"; );
     DEBUG_NOISE_WFV(
       if (redVar.mResultUser) outs() << "  reduction result R: " << *redVar.mResultUser << "\n";
@@ -1647,6 +1648,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // - Rewire SCC to scalar reduction function.
   // - Remove reduction operations
   // - run WFV
+  // - Vectorize "simple" reductions.
 
   //-------------------------------------------------------------------------//
 
@@ -1666,6 +1668,10 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     errs() << "ERROR: Loop body extraction failed!\n";
     return false;
   }
+
+  // Update preheaderBB and latchBB.
+  preheaderBB = loop->getLoopPreheader();
+  latchBB = loop->getLoopLatch();
 
   assert (loopBodyFn->getNumUses() == 1);
   CallInst* loopBodyCall = cast<CallInst>(*loopBodyFn->use_begin());
@@ -1772,6 +1778,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
     Instruction* latestPos = redVar.mStoreBack;
     redVar.mReductionPos = getCallInsertPosition(redVar, earliestPos, latestPos);
     if (!redVar.mReductionPos)
@@ -1792,6 +1799,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
     generateScalarReductionFunction(redVar);
     DEBUG_NOISE_WFV( outs() << "reduction var phi: " << *redVar.mPhi << "\n"; );
     DEBUG_NOISE_WFV( outs() << "  scalar reduction function: " << *redVar.mReductionFn << "\n"; );
@@ -1805,6 +1813,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
+
     generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn, redVars);
     DEBUG_NOISE_WFV( outs() << "reduction var phi: " << *redVar.mPhi << "\n"; );
     DEBUG_NOISE_WFV( outs() << "  SIMD reduction function: " << *redVar.mReductionFnSIMD << "\n"; );
@@ -1819,6 +1829,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
     assert (redVar.mPhi && redVar.mStartVal && redVar.mUpdates);
     assert (redVar.mReductionFn && redVar.mReductionPos);
     SmallVector<Value*, 4> args;
@@ -1839,6 +1850,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
 
     // Replace value that is stored back by the final result of the reduction call.
     LoadInst* reload = new LoadInst(redVar.mResultPtr, "red.result.reload", redVar.mStoreBack);
@@ -1872,6 +1884,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
     DEBUG_NOISE_WFV( outs() << "erasing SCC: " << *redVar.mPhi << "\n"; );
 
     const RedUpMapType& updates = *redVar.mUpdates;
@@ -1908,28 +1921,52 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   //-------------------------------------------------------------------------//
 
   // Create new function type.
-  // The only varying parameter is the one of the loop induction variable.
+  // Varying parameters are the one of the loop induction variable and all that
+  // are related to reductions that can be vectorized. However, the loop
+  // induction variable is no vector value since it also is consecutive.
   // All other incoming values are uniform.
   FunctionType* loopBodyFnType = loopBodyFn->getFunctionType();
   Type*         newReturnType  = loopBodyFnType->getReturnType();
   std::vector<Type*>  newParamTypes;
-  std::vector<Value*> newCallArgs;
   Argument*           indVarArg = 0;
   assert (loopBodyFnType->getNumParams() == loopBodyCall->getNumArgOperands());
-  for (unsigned i=0, e=loopBodyCall->getNumArgOperands(); i<e; ++i)
+  Function::arg_iterator A = loopBodyFn->arg_begin();
+  for (unsigned i=0, e=loopBodyCall->getNumArgOperands(); i<e; ++i, ++A)
   {
-    Value* argOp   = loopBodyCall->getArgOperand(i);
-    Type*  type    = loopBodyFnType->getParamType(i);
+    Value* argOp = loopBodyCall->getArgOperand(i);
+    Type*  type  = loopBodyFnType->getParamType(i);
     assert (type == argOp->getType());
 
-    newParamTypes.push_back(type);
-    newCallArgs.push_back(argOp);
     if (argOp == indVarPhi)
     {
-      Function::arg_iterator A = loopBodyFn->arg_begin();
-      std::advance(A, i);
+      newParamTypes.push_back(type);
+      // Map the induction variable to its new argument.
       indVarArg = A;
+      continue;
     }
+
+    // Reduction variables that can be vectorized have to have a vector input and a
+    // vector-pointer output argument.
+    bool requiresVectorType = false;
+    for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+    {
+      ReductionVariable& redVar = **it;
+      if (!redVar.mCanOptimizeWithVector) continue;
+      if (redVar.mPhiArg != A && redVar.mOutArg != A) continue;
+      requiresVectorType = true;
+      break;
+    }
+
+    if (requiresVectorType)
+    {
+      assert (argOp != indVarPhi);
+      newParamTypes.push_back(vectorizeSIMDType(type, mVectorizationFactor));
+      continue;
+    }
+
+    // Otherwise, the type is the same (either uniform or varying/consecutive).
+    newParamTypes.push_back(type);
+
   }
   assert (indVarArg && "loop body independent of induction variable!?");
   FunctionType* simdFnType = FunctionType::get(newReturnType, newParamTypes, false);
@@ -1967,6 +2004,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
 
     // The mask is always the last parameter (by construction in generateSIMDReductionFns()).
     const unsigned numParams          = redVar.mReductionFnSIMD->getFunctionType()->getNumParams();
@@ -1984,6 +2022,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::const_iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     const ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
+
     const Instruction& resPtr = *redVar.mResultPtr;
     wfvInterface.addSIMDSemantics(resPtr, true, false, false, false,
                                   true, false, false,
@@ -2047,6 +2087,160 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   DEBUG_NOISE_WFV( outs() << "\nfunction after WFV: " << *simdFn << "\n"; );
 
   //-------------------------------------------------------------------------//
+  // Vectorize "simple" reductions.
+  // If the reduction only consists of one type of update operations, and that
+  // operation is associative and commutative, we can do a "classic" reduction
+  // optimization:
+  // - Replace the scalar reduction variable R by a vector variable VR.
+  // - Initialize VR with <R, S, S, S>, where S is the neutral element of the
+  //   operation (0 for add/sub, 1 for mul).
+  // - Vectorize VR as part of normal WFV (no reduction function etc.)
+  //   - Mark VR as "varying".
+  // - Behind the loop, create a horizontal reduction operation that performs
+  //   the reduction operation on each element of VR and produces a scalar
+  //   result again.
+  // - Replace all uses of the original reduction result by this.
+  for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
+  {
+    ReductionVariable& redVar = **it;
+    if (!redVar.mCanOptimizeWithVector) continue;
+
+    assert (redVar.mPhi->getIncomingValueForBlock(latchBB) == redVar.mBackEdgeVal);
+
+    LLVMContext& context = redVar.mPhi->getContext();
+
+    Type* oldType = redVar.mPhi->getType();
+    Type* newType = vectorizeSIMDType(oldType, mVectorizationFactor);
+
+    // Mutate type of phi
+    redVar.mPhi->mutateType(newType);
+
+    // Vectorize start value.
+    Value* oldStartVal = redVar.mPhi->getIncomingValueForBlock(preheaderBB);
+    assert (oldStartVal->getType() == oldType);
+    Value* newStartVal = UndefValue::get(newType);
+
+    // Get the neutral value of the common update operation as start values
+    // for lanes 1 to W-1. The start value of lane 0 is the old start value.
+    Value* neutralVal = NULL;
+    assert (redVar.mCommonOpcode != 0);
+    switch (redVar.mCommonOpcode)
+    {
+      case Instruction::Add:
+      case Instruction::Sub:
+      case Instruction::FAdd:
+      case Instruction::FSub:
+      {
+        neutralVal = Constant::getNullValue(oldType);
+        break;
+      }
+      case Instruction::Mul:
+      {
+        neutralVal = ConstantInt::get(oldType, 1, false);
+        break;
+      }
+      case Instruction::FMul:
+      {
+        neutralVal = ConstantFP::get(oldType, 1.0);
+        break;
+      }
+      default:
+      {
+        errs() << "ERROR: Bad common operation for 'simple' reduction found!\n";
+        assert (false && "should never happen!");
+        return false;
+      }
+    }
+
+    Instruction* insertBefore = preheaderBB->getTerminator();
+    for (unsigned i=0; i<mVectorizationFactor; ++i)
+    {
+      ConstantInt* idxVal = ConstantInt::get(context, APInt(32, i));
+      Value* elem = i == 0 ? oldStartVal : neutralVal;
+      newStartVal = InsertElementInst::Create(newStartVal,
+                                              elem,
+                                              idxVal,
+                                              "",
+                                              insertBefore);
+    }
+
+    // Replace start val.
+    const unsigned preheaderIdx = redVar.mPhi->getBasicBlockIndex(preheaderBB);
+    redVar.mPhi->setIncomingValue(preheaderIdx, newStartVal);
+
+    // The value from the latch is already a vector due to WFV.
+    // However, the reload doesn't know anything about this yet,
+    // so we simply mutate its type.
+    assert (isa<LoadInst>(redVar.mBackEdgeVal));
+    LoadInst* latchVal = cast<LoadInst>(redVar.mBackEdgeVal);
+    assert (latchVal->getType() == oldType);
+    latchVal->mutateType(newType);
+
+    // Accordingly, we have to mutate the type of the corresponding alloca.
+    Value* ptrVal = latchVal->getPointerOperand();
+    assert (isa<AllocaInst>(ptrVal));
+    ptrVal->mutateType(PointerType::get(newType, ptrVal->getType()->getPointerAddressSpace()));
+
+    // Replace all uses of the result user phi by a dummy.
+    assert (redVar.mResultUser->getNumIncomingValues() == 1);
+    insertBefore = redVar.mResultUser->getParent()->getFirstNonPHI();
+    Instruction* dummy = SelectInst::Create(Constant::getAllOnesValue(Type::getInt1Ty(context)),
+                                            UndefValue::get(oldType),
+                                            UndefValue::get(oldType),
+                                            "dummy",
+                                            insertBefore);
+    redVar.mResultUser->replaceAllUsesWith(dummy);
+
+    // Mutate the type of the only out-of-loop use of the reduction result
+    // (not before replacing the uses).
+    redVar.mResultUser->mutateType(newType);
+
+    // Insert horizontal reduction operations.
+    // Use log(W) shuffles and operations. LLVM is clever enough to create
+    // hadd_ps etc. intrinsics from this.
+    // Adapted from LLVM LoopVectorize.cpp.
+    Value* result = redVar.mResultUser;
+    SmallVector<Constant*, 8> shuffleMask(mVectorizationFactor, 0);
+    for (unsigned i=mVectorizationFactor; i!=1; i >>= 1)
+    {
+      // Move the upper half of the vector to the lower half.
+      for (unsigned j=0; j!=i/2; ++j)
+      {
+        shuffleMask[j] = ConstantInt::get(Type::getInt32Ty(context),
+                                          i/2 + j,
+                                          false);
+      }
+
+      // Fill the rest of the mask with undef.
+      std::fill(&shuffleMask[i/2],
+                shuffleMask.end(),
+                UndefValue::get(Type::getInt32Ty(context)));
+
+      Value* shuf = new ShuffleVectorInst(result,
+                                          UndefValue::get(result->getType()),
+                                          ConstantVector::get(shuffleMask),
+                                          "",
+                                          insertBefore);
+
+      result = BinaryOperator::Create((Instruction::BinaryOps)redVar.mCommonOpcode,
+                                      result,
+                                      shuf,
+                                      "",
+                                      insertBefore);
+    }
+
+    Constant* idx0 = ConstantInt::get(Type::getInt32Ty(context), 0, false);
+    result = ExtractElementInst::Create(result,
+                                        idx0,
+                                        "",
+                                        insertBefore);
+
+    // Replace the dummy with the final result.
+    dummy->replaceAllUsesWith(result);
+    dummy->eraseFromParent();
+  }
+
+  //-------------------------------------------------------------------------//
 
   // Inline reduction functions into the vectorized code.
   // The "scalar" dummy reduction function can't be erased until the temporary
@@ -2054,6 +2248,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
+    if (redVar.mCanOptimizeWithVector) continue;
+
     Function* fn = redVar.mReductionFnSIMD;
     for (Function::use_iterator U=fn->use_begin(), UE=fn->use_end(); U!=UE; ++U)
     {
@@ -2077,16 +2273,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   //-------------------------------------------------------------------------//
 
-  // Upon successful vectorization, we have to modify the loop in the original function.
-  // Adjust the increment of the induction variable (increment by SIMD width).
-  // Adjust the exit condition (divide by SIMD width).
-  // -> Already done in extractLoopBody.
-
-  // Generate code that packs all input values into vectors to match the signature.
-  // -> Should only be the induction variable itself.
-  // -> Already done in extractLoopBody.
-
   // To execute the vectorized code, we have to replace the body of the original function.
+#if 0
   loopBodyFn->deleteBody();
 
   ValueToValueMapTy valueMap;
@@ -2126,6 +2314,41 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // Remove the now inlined loop body function again.
   assert (loopBodyFn->use_empty());
   loopBodyFn->eraseFromParent();
+#else
+  // To execute the vectorized code, we have to replace the call to loopBodyFn
+  // by a call to simdFn.
+  assert (loopBodyFn->getNumUses() == 1 &&
+          "There should be only one call to the extracted loop body function");
+  assert (isa<CallInst>(*loopBodyFn->use_begin()));
+  CallInst* loopBodyFnCall = cast<CallInst>(*loopBodyFn->use_begin());
+  assert (loopBodyFnCall->getParent()->getParent() == noiseFn);
+  assert (loopBodyFnCall->use_empty());
+
+  SmallVector<Value*, 8> args;
+  CallInst::op_iterator O = loopBodyCall->op_begin();
+  for (Function::arg_iterator A=simdFn->arg_begin(),
+       AE=simdFn->arg_end(); A!=AE; ++A, ++O)
+  {
+    assert ((*O)->getType() == A->getType());
+    args.push_back(*O);
+  }
+
+  CallInst* newCall = CallInst::Create(simdFn,
+                                       args,
+                                       loopBodyFnCall->getName(),
+                                       loopBodyFnCall);
+  loopBodyFnCall->eraseFromParent();
+
+  // Immediately inline the call.
+  InlineFunctionInfo IFI;
+  InlineFunction(newCall, IFI);
+
+  // Remove the now unused functions again.
+  assert (loopBodyFn->use_empty());
+  loopBodyFn->eraseFromParent();
+  assert (simdFn->use_empty());
+  simdFn->eraseFromParent();
+#endif
 
   // Delete reduction variable data structure.
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
@@ -2360,6 +2583,44 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
               "must not have more than one reduction user outside the loop!");
       redVar->mResultUser = exitPhi;
     }
+
+    // Check if this reduction can be optimized, i.e. performed using vector
+    // instructions and a post-loop horizontal vector update operation.
+    bool hasCommonOpcode = true;
+    unsigned commonOpcode = reductionSCC->empty() ?
+        0 : reductionSCC->begin()->second->mOperation->getOpcode();
+    bool hasIntermediateUses = false;
+    for (RedUpMapType::const_iterator it=reductionSCC->begin(),
+         E=reductionSCC->end(); it!=E; ++it)
+    {
+      const ReductionUpdate& redUp = *it->second;
+
+      if (commonOpcode != redUp.mOperation->getOpcode())
+      {
+        hasCommonOpcode = false;
+        break;
+      }
+
+      if (!redUp.mResultUsers->empty())
+      {
+        hasIntermediateUses = true;
+        break;
+      }
+    }
+
+    if (!hasIntermediateUses &&
+        hasCommonOpcode &&
+        (commonOpcode == Instruction::Add ||
+         commonOpcode == Instruction::Sub ||
+         commonOpcode == Instruction::Mul ||
+         commonOpcode == Instruction::FAdd ||
+         commonOpcode == Instruction::FSub ||
+         commonOpcode == Instruction::FMul))
+    {
+      redVar->mCanOptimizeWithVector = true;
+    }
+
+    redVar->mCommonOpcode = hasCommonOpcode ? commonOpcode : 0;
 
     // Sanity check.
     for (Instruction::use_iterator U=reductionPhi->use_begin(),

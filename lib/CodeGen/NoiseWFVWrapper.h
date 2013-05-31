@@ -114,6 +114,10 @@ public:
     StoreInst*    mStoreBack;
     // The value that goes back to the reduction phi from the latch in the original function.
     Instruction*  mBackEdgeVal;
+
+    // Store information whether this reduction can be optimized in the classic way.
+    bool          mCanOptimizeWithVector;
+    unsigned      mCommonOpcode;
   };
 
   typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
