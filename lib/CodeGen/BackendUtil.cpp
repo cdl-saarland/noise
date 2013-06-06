@@ -41,6 +41,11 @@
 #include "NoiseOptimizer.h"
 #include "llvm/IR/Instructions.h"
 
+//#define ANALYZE_LOOPS
+#ifdef ANALYZE_LOOPS
+#   include "LoopAnalysis.h"
+#endif
+
 using namespace clang;
 using namespace llvm;
 
@@ -649,6 +654,11 @@ void EmitAssemblyHelper::NoiseEmitAssembly(BackendAction Action, raw_ostream *OS
 }
 
 void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
+#ifdef ANALYZE_LOOPS
+  loopanalysis::LoopAnalysis LA(TheModule);
+  LA.Analyze();
+#endif
+
   if (hasNoiseAttribute(TheModule)) {
     NoiseEmitAssembly(Action, OS);
     return;

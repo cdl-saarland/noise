@@ -2127,9 +2127,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     switch (redVar.mCommonOpcode)
     {
       case Instruction::Add:
-      case Instruction::Sub:
       case Instruction::FAdd:
-      case Instruction::FSub:
       {
         neutralVal = Constant::getNullValue(oldType);
         break;
@@ -2521,6 +2519,31 @@ gatherReductionUpdateInfo(RedUpMapType&        reductionSCC,
   }
 }
 
+bool
+isCAUpdateOp(const unsigned opcode)
+{
+  switch (opcode)
+  {
+    case Instruction::Add:
+    case Instruction::FAdd:
+    case Instruction::Mul:
+    case Instruction::FMul:
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+    case Instruction::Shl:
+    case Instruction::LShr:
+    case Instruction::AShr:
+    case Instruction::PHI:
+    case Instruction::Select:
+    case Instruction::GetElementPtr:
+      return true;
+    default:
+      return false;
+  }
+}
+
+
 } // unnamed namespace
 
 // TODO: Make sure there is no interference between reduction variables.
@@ -2561,6 +2584,11 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
     SmallPtrSet<Instruction*, 8> visitedInsts;
     findReductionSCC(backEdgeVal, reductionPhi, loop, *reductionSCC, visitedInsts);
 
+    // Weirdly, it can happen that there are two phis for the same loop-carried variable,
+    // where the one update operation references the other phi.
+    // This results in an empty reductionSCC, which is actually correct since this is
+    // no real reduction.
+    //if (reductionSCC->empty()) continue;
     assert (!reductionSCC->empty());
     gatherReductionUpdateInfo(*reductionSCC, reductionPhi, latchBB, domTree);
 
@@ -2610,12 +2638,7 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
 
     if (!hasIntermediateUses &&
         hasCommonOpcode &&
-        (commonOpcode == Instruction::Add ||
-         commonOpcode == Instruction::Sub ||
-         commonOpcode == Instruction::Mul ||
-         commonOpcode == Instruction::FAdd ||
-         commonOpcode == Instruction::FSub ||
-         commonOpcode == Instruction::FMul))
+        isCAUpdateOp(commonOpcode))
     {
       redVar->mCanOptimizeWithVector = true;
     }
