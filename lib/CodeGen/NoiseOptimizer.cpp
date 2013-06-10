@@ -252,9 +252,13 @@ struct NoiseInliner : public FunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
 
-  explicit NoiseInliner()
+  SmallVector<std::string, 2> functionNames;
+  SmallPtrSet<Function*, 2>   functions;
+
+  explicit NoiseInliner(SmallVector<std::string, 2>* fnNames=0)
   : FunctionPass(ID) {
     initializeNoiseInlinerPass(*PassRegistry::getPassRegistry());
+    if (fnNames) functionNames.insert(functionNames.begin(), fnNames->begin(), fnNames->end());
   }
 
   virtual ~NoiseInliner()
@@ -262,22 +266,45 @@ public:
 
   virtual bool runOnFunction(Function &F)
   {
-    // Collect all blocks which belong to the function.
+    const bool inlineAll = functionNames.empty();
+
+    // Get Functions from input strings (if any).
+    Module* mod = F.getParent();
+    for (SmallVector<std::string, 2>::iterator it=functionNames.begin(),
+         E=functionNames.end(); it!=E; ++it)
+    {
+      Function* fn = mod->getFunction(*it);
+      if (!fn)
+      {
+        errs() << "ERROR: Function requested for inlining does not exist in module: '"
+          << *it << "'!\n";
+        assert (false && "function to be inlined not found");
+        continue;
+      }
+
+      functions.insert(fn);
+    }
+
+    // Collect blocks that belong to the marked region.
     SmallPtrSet<BasicBlock*, 32> functionRegion;
     collectBlocks<32>(&F.front(), &F.back(), functionRegion);
-    // Loop over the collected blocks and find all interesting call instructions
+
+    // For all specified functions, collect all calls within the marked code segment.
+    // If no function names were given, collect all calls to any function.
     SmallVector<CallInst*, 32> calls;
     for (SmallPtrSet<BasicBlock*, 32>::iterator it = functionRegion.begin(),
          e = functionRegion.end(); it != e; ++it)
     {
-      for(BasicBlock::iterator bit = (*it)->begin(), e = (*it)->end(); bit != e; ++bit)
+      for(BasicBlock::iterator I=(*it)->begin(), IE=(*it)->end(); I!=IE; ++I)
       {
-        if(!isa<CallInst>(*bit))
-          continue;
-        calls.push_back(&cast<CallInst>(*bit));
+        if (!isa<CallInst>(I)) continue;
+        CallInst* call = cast<CallInst>(I);
+        if (!inlineAll && !functions.count(call->getCalledFunction())) continue;
+        calls.push_back(call);
       }
     }
-    // inline each call
+
+    // Inline each of the collected calls.
     for(SmallVector<CallInst*, 32>::iterator it = calls.begin(),
         e = calls.end(); it != e; ++it)
     {
@@ -376,9 +403,14 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
                                      FunctionPassManager& Passes)
 {
   const StringRef pass = GetPassName(Opt);
-  if(pass == "inline")
-    Passes.add(new NoiseInliner());
-  else if(pass == "unroll") {
+  if(pass == "inline") {
+    SmallVector<std::string, 2> fnNames;
+    for (unsigned i=0, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
+      std::string fnName = NoiseOptimizations::GetPassArgAsString(Opt, i);
+      fnNames.push_back(fnName);
+    }
+    Passes.add(new NoiseInliner(&fnNames));
+  } else if(pass == "unroll") {
     const int count = NoiseOptimizations::HasPassArg(Opt, 0U) ?
       NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : -1;
 
@@ -402,8 +434,9 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     // pass = "specialize(x,1,2,3)"
     StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
     SmallVector<int, 4> values;
-    for(size_t i = 0, e = values.size(); i < e; ++i)
+    for (unsigned i=0, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
       values.push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
+    }
     Passes.add(new NoiseSpecializer(variable, values));
   } else if(pass == "wfv" || pass == "wfv-vectorize") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
