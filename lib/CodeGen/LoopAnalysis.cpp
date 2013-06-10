@@ -1026,6 +1026,8 @@ LoopAnalyzer::analyzeLoop(Loop*        loop,
         << (rMultiOpNonSame ? " MULTI_OP_NON_SAME" : "")
         << (rNonCAUpdateOp ? " NON_CA_UPDATE" : "")
         << (rDependsOnControlFlow ? " CF_DEP" : "")
+        << " IDENTIFIER=" << preheaderBB->getParent()->getParent()->getModuleIdentifier()
+        << "#" << preheaderBB->getParent()->getName()
         << "\n";
 
     return loopType;
