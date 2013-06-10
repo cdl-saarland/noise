@@ -2637,16 +2637,16 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
         if (commonOpcode == 0)
         {
           commonOpcode = redUpOpcode;
-          continue;
         }
-        hasCommonOpcode = false;
-        break;
+        else
+        {
+          hasCommonOpcode = false;
+        }
       }
 
       if (!redUp.mResultUsers->empty())
       {
         hasIntermediateUses = true;
-        break;
       }
     }
 
