@@ -160,11 +160,12 @@ struct LoopAnalyzer : public FunctionPass {
                         RedUpMapType&                 reductionSCC,
                         SmallPtrSet<Instruction*, 8>& visitedInsts);
 
-  void gatherConditions(BasicBlock*                           block,
-                        BasicBlock*                           succBB,
-                        const BasicBlock*                     latchBB,
-                        const DominatorTree&                  domTree,
-                        ReductionUpdate::OtherOperandsVec&    otherOperands);
+  void gatherConditions(BasicBlock*                        block,
+                        BasicBlock*                        succBB,
+                        const BasicBlock*                  latchBB,
+                        const DominatorTree&               domTree,
+                        ReductionUpdate::OtherOperandsVec& otherOperands,
+                        SmallPtrSet<BasicBlock*, 8>&       visitedBlocks);
 
   void gatherReductionUpdateInfo(RedUpMapType&        reductionSCC,
                                  const PHINode*       reductionPhi,
@@ -421,13 +422,17 @@ LoopAnalyzer::findReductionSCC(Instruction*                  curInst,
 }
 
 void
-LoopAnalyzer::gatherConditions(BasicBlock*          block,
-                               BasicBlock*          succBB,
-                               const BasicBlock*    latchBB,
-                               const DominatorTree& domTree,
-                               OtherOperandsVec&    otherOperands)
+LoopAnalyzer::gatherConditions(BasicBlock*                  block,
+                               BasicBlock*                  succBB,
+                               const BasicBlock*            latchBB,
+                               const DominatorTree&         domTree,
+                               OtherOperandsVec&            otherOperands,
+                               SmallPtrSet<BasicBlock*, 8>& visitedBlocks)
 {
     assert (block && latchBB);
+
+    if (visitedBlocks.count(block)) return;
+    visitedBlocks.insert(block);
 
     // If succBB is not set this is the first block of this path,
     // so we don't want to add any condition.
@@ -458,7 +463,7 @@ LoopAnalyzer::gatherConditions(BasicBlock*          block,
     for (pred_iterator P=pred_begin(block), PE=pred_end(block); P!=PE; ++P)
     {
         BasicBlock* predBB = *P;
-        gatherConditions(predBB, block, latchBB, domTree, otherOperands);
+        gatherConditions(predBB, block, latchBB, domTree, otherOperands, visitedBlocks);
     }
 }
 
@@ -508,7 +513,8 @@ LoopAnalyzer::gatherReductionUpdateInfo(RedUpMapType&        reductionSCC,
         // More concretely, we collect all conditions that this update depends upon.
         // NOTE: It would be beneficial to have WFV divergence information here.
         BasicBlock* block = updateOp->getParent();
-        gatherConditions(block, NULL, latchBB, domTree, *otherOperands);
+        SmallPtrSet<BasicBlock*, 8> visitedBlocks;
+        gatherConditions(block, NULL, latchBB, domTree, *otherOperands, visitedBlocks);
 
         // The other information is only inserted later.
         redUp.mIntermediateResultPtr = NULL;
