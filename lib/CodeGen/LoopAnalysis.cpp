@@ -614,17 +614,26 @@ LoopAnalyzer::collectReductionVariables(RedVarVecType&       redVars,
 
         // Check if this reduction can be optimized, i.e. performed using vector
         // instructions and a post-loop horizontal vector update operation.
+        // Do not consider phis when testing for a common opcode.
         bool hasCommonOpcode = true;
-        unsigned commonOpcode = reductionSCC->empty() ?
-          0 : reductionSCC->begin()->second->mOperation->getOpcode();
+        unsigned commonOpcode = 0;
         bool hasIntermediateUses = false;
         for (RedUpMapType::const_iterator it=reductionSCC->begin(),
             E=reductionSCC->end(); it!=E; ++it)
         {
             const ReductionUpdate& redUp = *it->second;
 
-            if (commonOpcode != redUp.mOperation->getOpcode())
+            const unsigned redUpOpcode = redUp.mOperation->getOpcode();
+            assert (redUpOpcode != 0 && "expected opcode 0 not to exist!");
+
+            if (!isa<PHINode>(redUp.mOperation) &&
+                commonOpcode != redUpOpcode)
             {
+                if (commonOpcode == 0)
+                {
+                    commonOpcode = redUpOpcode;
+                    continue;
+                }
                 hasCommonOpcode = false;
                 break;
             }
@@ -634,6 +643,13 @@ LoopAnalyzer::collectReductionVariables(RedVarVecType&       redVars,
                 hasIntermediateUses = true;
                 break;
             }
+        }
+
+        // If all updates are phis, set the opcode accordingly.
+        if (hasCommonOpcode && commonOpcode == 0 && !reductionSCC->empty())
+        {
+            assert (isa<PHINode>(reductionSCC->begin()->second->mOperation));
+            commonOpcode = reductionSCC->begin()->second->mOperation->getOpcode();
         }
 
         if (!hasIntermediateUses &&
