@@ -1,4 +1,4 @@
-//===--- NoiseOptimizer.cpp - Noise Optimizations --------------------------===//
+//===--- NoiseWFVWrapper.h - Noise Optimizations --------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,9 +7,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The optimizer for noise functions
+// Noise vectorizer interface
 //
 //===----------------------------------------------------------------------===//
+
+#ifndef CLANG_CODEGEN_NOISEWFVWRAPPER_H
+#define CLANG_CODEGEN_NOISEWFVWRAPPER_H
 
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
@@ -142,3 +145,4 @@ public:
 
 }
 
+#endif /* CLANG_CODEGEN_NOISEWFVWRAPPER_H */

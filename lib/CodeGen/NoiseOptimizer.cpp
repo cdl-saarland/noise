@@ -18,6 +18,7 @@
 #ifdef COMPILE_NOISE_WFV_WRAPPER
 #include "NoiseWFVWrapper.h"
 #endif
+#include "NoiseSpecializer.h"
 
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
@@ -117,7 +118,6 @@ void collectBlocks(BasicBlock* block,
 
 void initializeNoiseExtractorPass(PassRegistry&);
 void initializeNoiseInlinerPass(PassRegistry&);
-void initializeNoiseSpecializerPass(PassRegistry&);
 
 struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
@@ -331,42 +331,8 @@ public:
   }
 };
 
-struct NoiseSpecializer : public FunctionPass {
-public:
-  static char ID; // Pass identification, replacement for typeid
-
-  const StringRef            mVariable;
-  const SmallVector<int, 4>* mValues;
-
-  explicit NoiseSpecializer() : FunctionPass(ID), mVariable(""), mValues(0)
-  {
-    assert (false && "empty constructor must never be called!");
-    initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
-  }
-
-  NoiseSpecializer(StringRef&                 variable,
-                   const SmallVector<int, 4>& values)
-  : FunctionPass(ID), mVariable(variable), mValues(&values)
-  {
-    initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
-  }
-
-  virtual ~NoiseSpecializer()
-  { }
-
-  virtual bool runOnFunction(Function &F)
-  {
-    return false;
-  }
-
-  virtual void getAnalysisUsage(AnalysisUsage &AU) const {
-  }
-};
-
-
 char NoiseExtractor::ID = 0;
 char NoiseInliner::ID = 0;
-char NoiseSpecializer::ID = 0;
 }
 
 // Pass declarations
@@ -380,11 +346,6 @@ INITIALIZE_PASS_BEGIN(NoiseInliner, "noise-inline",
                       "Forces inlining of calls", false, false)
 INITIALIZE_PASS_END(NoiseInliner, "noise-inline",
                     "Forces inlining of calls", false, false)
-
-INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialize",
-                      "Specializes code for specific values of a variable", false, false)
-INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialize",
-                    "Specializes code for specific values of a variable", false, false)
 
 
 namespace llvm {
@@ -443,7 +404,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     builder.populateFunctionPassManager(Passes);
     builder.populateModulePassManager(Passes);
   } else if(pass == "specialize") {
-    // pass = "specialize(x,1,2,3)"
+    // pass = "specialize(x=0,1,13)"
     StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
     SmallVector<int, 4> values;
     for (unsigned i=0, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
