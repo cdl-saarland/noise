@@ -301,11 +301,10 @@ extractLoopBody(Loop*                        loop,
   assert (loop && indVarPhi);
   assert (loopBody.empty());
 
-  BasicBlock* preheaderBB = loop->getLoopPreheader();
   BasicBlock* headerBB    = loop->getHeader();
   BasicBlock* latchBB     = loop->getLoopLatch();
   BasicBlock* exitingBB   = loop->getExitingBlock();
-  assert (preheaderBB && headerBB && latchBB &&
+  assert (loop->getLoopPreheader() && headerBB && latchBB &&
           "vectorization of non-simplified loop not supported!");
   assert (exitingBB &&
           "vectorization of loop with multiple exits not supported!");
@@ -328,10 +327,9 @@ extractLoopBody(Loop*                        loop,
   BranchInst* exitBr = cast<BranchInst>(exitingBB->getTerminator());
 
   assert (isa<ICmpInst>(exitBr->getCondition()));
-  ICmpInst* exitCond = cast<ICmpInst>(exitBr->getCondition());
-  assert (exitCond->getParent() == exitingBB &&
+  assert (cast<Instruction>(exitBr->getCondition())->getParent() == exitingBB &&
           "expected exit condition to be in exiting block!");
-  assert (exitCond->getNumUses() == 1 &&
+  assert (exitBr->getCondition()->getNumUses() == 1 &&
           "expected exit condition to have only one use in the exit branch!");
 
   // Split latch directly before induction variable increment.
@@ -435,9 +433,8 @@ getCallInsertPosition(const ReductionVariable& redVar,
                       Instruction*             earliestPos,
                       Instruction*             latestPos)
 {
-  Function* f = redVar.mPhiArg->getParent();
-  assert (earliestPos->getParent()->getParent() == f);
-  assert (latestPos->getParent()->getParent() == f);
+  assert (earliestPos->getParent()->getParent() == redVar.mPhiArg->getParent());
+  assert (latestPos->getParent()->getParent() == redVar.mPhiArg->getParent());
 
   const RedUpMapType& updates = *redVar.mUpdates;
 #if 0
@@ -464,7 +461,7 @@ getCallInsertPosition(const ReductionVariable& redVar,
     {
       if (!isa<Instruction>(*it2)) continue;
       Instruction* otherOperand = cast<Instruction>(*it2);
-      assert (otherOperand->getParent()->getParent() == f);
+      assert (otherOperand->getParent()->getParent() == redVar.mPhiArg->getParent());
       if (isPredecessor(otherOperand, earliestPos)) continue;
       earliestPos = otherOperand;
     }
@@ -480,7 +477,7 @@ getCallInsertPosition(const ReductionVariable& redVar,
          E2=resultUsers.end(); it2!=E2; ++it2)
     {
       Instruction* resultUser = *it2;
-      assert (resultUser->getParent()->getParent() == f);
+      assert (resultUser->getParent()->getParent() == redVar.mPhiArg->getParent());
       if (isPredecessor(latestPos, resultUser)) continue;
       latestPos = resultUser;
     }
@@ -1313,10 +1310,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
       else outs() << "  reduction result R: not available\n";
     );
 
-    Type* type = redVar.mPhi->getType();
-
-    assert (type == redVar.mStartVal->getType());
-    assert (!redVar.mResultUser || type == redVar.mResultUser->getType());
+    assert (redVar.mPhi->getType() == redVar.mStartVal->getType());
+    assert (!redVar.mResultUser || redVar.mPhi->getType() == redVar.mResultUser->getType());
 
     DEBUG_NOISE_WFV(
       const RedUpMapType& updates = *redVar.mUpdates;
