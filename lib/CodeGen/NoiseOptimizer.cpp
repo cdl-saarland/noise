@@ -404,12 +404,16 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     builder.populateFunctionPassManager(Passes);
     builder.populateModulePassManager(Passes);
   } else if(pass == "specialize") {
-    // pass = "specialize(x=0,1,13)"
+    // pass = "specialize(x,0,1,13)"
+
+    assert (NoiseOptimizations::GetNumPassArgs(Opt) > 1 &&
+            "expected at least two arguments for specialized loop dispatching!");
     StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
     SmallVector<int, 4> values;
-    for (unsigned i=0, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
+    for (unsigned i=1, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
       values.push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
     }
+
     Passes.add(new NoiseSpecializer(variable, values));
   } else if(pass == "wfv" || pass == "wfv-vectorize") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
