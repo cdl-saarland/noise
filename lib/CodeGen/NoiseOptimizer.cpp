@@ -178,6 +178,18 @@ struct NoiseExtractor : public FunctionPass {
         }
     }
 
+    // Things currently break if there is a return statement inside the region,
+    // so we forbid this.
+    for (typename SmallPtrSet<BasicBlock*, SetSize>::iterator it=region.begin(),
+         E=region.end(); it!=E; ++it)
+    {
+      if (!isa<ReturnInst>((*it)->getTerminator())) continue;
+
+      errs() << "ERROR: Marked region must not contain a 'return' statement!\n";
+      assert (false && "marked region must not contain a 'return' statement");
+      return false;
+    }
+
     // Create new function from the marked range.
     SmallVector<BasicBlock*, SetSize> regionVec(region.begin(), region.end());
     CodeExtractor extractor(regionVec);
