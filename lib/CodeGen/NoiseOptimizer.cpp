@@ -18,6 +18,7 @@
 #ifdef COMPILE_NOISE_WFV_WRAPPER
 #include "NoiseWFVWrapper.h"
 #endif
+#include "NoiseFusion.h"
 #include "NoiseSpecializer.h"
 
 #include "llvm/Pass.h"
@@ -454,6 +455,9 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
                                    useDivergenceAnalysis,
                                    verbose));
 #endif
+  } else if(pass == "loop-fusion") {
+    //Passes.add(createLoopSimplifyPass());
+    Passes.add(new NoiseFusion());
   } else {
     const PassInfo* info = Registry->getPassInfo(pass);
     if(!info) {
