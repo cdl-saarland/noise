@@ -72,11 +72,6 @@ NoiseFusion::runOnFunction(Function &F)
   Value *Induction1 = Phi1->getIncomingValueForBlock(Latch1);
   Value *Induction2 = Phi2->getIncomingValueForBlock(Latch2);
 
-  Phi1->dump();
-  Induction1->dump();
-  Phi2->dump();
-  Induction2->dump();
-
   assert(Induction1->getNumUses() == 1);
   assert(Induction2->getNumUses() == 1);
 
