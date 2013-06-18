@@ -407,7 +407,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     // pass = "specialize(x,0,1,13)"
 
     assert (NoiseOptimizations::GetNumPassArgs(Opt) > 1 &&
-            "expected at least two arguments for specialized loop dispatching!");
+            "expected at least two arguments for specialized dispatching!");
     StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
     SmallVector<int, 4> values;
     for (unsigned i=1, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {

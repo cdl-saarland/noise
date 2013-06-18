@@ -1,4 +1,4 @@
-//===--- NoiseSpecializer.cpp - Noise Specialized Loop Dispatch -----------===//
+//===--- NoiseSpecializer.cpp - Noise Specialized Dispatch -----------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The specialized loop dispatch transformation for noise functions
+// The specialized dispatch transformation for noise functions
 //
 //===----------------------------------------------------------------------===//
 
@@ -17,12 +17,9 @@
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/PassManagers.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/Verifier.h"
-#include "llvm/Analysis/LoopPass.h"
-#include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Transforms/Utils/CodeExtractor.h"   // extractCodeRegion()
-#include "llvm/Transforms/Utils/BasicBlockUtils.h" // SplitBlock()
 #include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
 #include "llvm/IR/Module.h"
 #include "llvm/IR/DataLayout.h"
@@ -52,7 +49,7 @@ NoiseSpecializer::NoiseSpecializer()
     initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
 }
 
-NoiseSpecializer::NoiseSpecializer(StringRef&                 variable,
+NoiseSpecializer::NoiseSpecializer(const std::string&         variable,
                                    const SmallVector<int, 4>& values)
 : FunctionPass(ID), mVariable(variable), mValues(&values)
 {
@@ -68,54 +65,156 @@ NoiseSpecializer::runOnFunction(Function &F)
 {
   mModule   = F.getParent();
   mContext  = &F.getContext();
-  mLoopInfo = &getAnalysis<LoopInfo>();
 
   const bool success = runSLD(&F);
 
   if (!success)
   {
-    errs() << "ERROR: Specialized loop dispatching failed!\n";
+    errs() << "ERROR: Specialized dispatching failed!\n";
   }
 
   // If not successful, nothing changed.
-  // TODO: Make sure this is correct, e.g. by re-inlining the extracted
-  //       loop body.
   return success;
 }
 
 void
 NoiseSpecializer::getAnalysisUsage(AnalysisUsage &AU) const
 {
-  AU.addRequired<LoopInfo>();
 }
 
 
-// TODO: Implement generation of fixup code for cases where we either
-//       don't know the exact iteration count or where it is not an exact
-//       multiple of the vectorization width.
-// TODO: Make assertions return gracefully instead.
 bool
 NoiseSpecializer::runSLD(Function* noiseFn)
 {
   assert (noiseFn);
 
-  // Get the only outermost loop of this function.
-  assert (std::distance(mLoopInfo->begin(), mLoopInfo->end()) == 1 &&
-          "expected exactly one top level loop in noise function!");
-  Loop* loop = *mLoopInfo->begin();
-  assert (loop);
-
-  BasicBlock* preheaderBB = loop->getLoopPreheader();
-  BasicBlock* headerBB    = loop->getHeader();
-  BasicBlock* latchBB     = loop->getLoopLatch();
-  BasicBlock* exitBB      = loop->getUniqueExitBlock();
-  BasicBlock* exitingBB   = loop->getExitingBlock();
-  assert (preheaderBB && headerBB && latchBB &&
-          "specialized loop dispatching of non-simplified loop not supported!");
-  assert (loop->isLoopSimplifyForm() &&
-          "specialized loop dispatching of non-simplified loop not supported!");
+  //-------------------------------------------------------------------------//
+  // Get the expected name of the specialize function.
+  std::stringstream sstr;
+  sstr << "__noise_specialize_" << mVariable;
+  const std::string& specializeFnName = sstr.str();
 
   //-------------------------------------------------------------------------//
+  // Find the Noise specialize call for this variable.
+  CallInst* specializeCall = 0;
+  for (Function::iterator BB=noiseFn->begin(), BBE=noiseFn->end(); BB!=BBE; ++BB)
+  {
+      for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
+      {
+          if (!isa<CallInst>(I)) continue;
+          CallInst* call = cast<CallInst>(I);
+          Function* callee = call->getCalledFunction();
+          if (!callee) continue;
+          if (callee->getName() != specializeFnName) continue;
+          if (specializeCall)
+          {
+              errs() << "ERROR: Found multiple calls to function '"
+                  << specializeFnName << "'!\n";
+              assert (false &&
+                      "must not have multiple calls to same noise specialize function");
+              continue;
+          }
+          specializeCall = call;
+          //break;
+      }
+      //if (specializeCall) break;
+  }
+  assert (specializeCall && "specialize call not found!");
+
+  assert (specializeCall->getType()->isIntegerTy() &&
+          "specialized dispatch currently only implemented for integer values");
+  IntegerType* variableType = cast<IntegerType>(specializeCall->getType());
+
+  //-------------------------------------------------------------------------//
+  // Create new function for switch statement.
+  const unsigned numVariants = mValues->size();
+
+  Function* switchFn = Function::Create(noiseFn->getFunctionType(),
+                                        Function::ExternalLinkage,
+                                        "switch_fn",
+                                        noiseFn->getParent());
+
+  BasicBlock* entryBB = BasicBlock::Create(*mContext, "noiseSpecializeBegin", noiseFn);
+
+  //-------------------------------------------------------------------------//
+  // Duplicate code once for each specialization variant.
+  SmallVector<BasicBlock*, 4> entryBlocks;
+  SmallVector<BasicBlock*, 4> exitBlocks;
+  SmallVector<CallInst*, 4>   mappedCalls;
+  for (unsigned i=0; i<=numVariants; ++i)
+  {
+      ValueToValueMapTy valueMap;
+      Function::arg_iterator destI = switchFn->arg_begin();
+      for (Function::const_arg_iterator I = noiseFn->arg_begin(),
+          E = noiseFn->arg_end(); I != E; ++I)
+      {
+          if (valueMap.count(I) == 0)          // Is this argument preserved?
+          {
+              destI->setName(I->getName()); // Copy the name over...
+              valueMap[I] = destI++;           // Add mapping to ValueMap
+          }
+      }
+      SmallVector<ReturnInst*, 2>  returns;
+      ClonedCodeInfo               clonedFInfo;
+      const char*                  nameSuffix = ".";
+      CloneFunctionInto(switchFn,
+                        noiseFn,
+                        valueMap,
+                        false,
+                        returns,
+                        nameSuffix,
+                        &clonedFInfo);
+
+      // Store the mapped entry block.
+      entryBlocks.push_back(cast<BasicBlock>(valueMap[&noiseFn->getEntryBlock()]));
+
+      // Store the mapped exit block.
+      assert (returns.size() == 1);
+      exitBlocks.push_back(returns[0]->getParent());
+
+      // Store the mapped noise specialize calls.
+      mappedCalls.push_back(cast<CallInst>(valueMap[specializeCall]));
+  }
+
+  BasicBlock* exitBB = BasicBlock::Create(*mContext, "noiseSpecializeEnd", noiseFn);
+
+  //-------------------------------------------------------------------------//
+  // Create switch statement.
+  SwitchInst* switchInst = SwitchInst::Create(specializeCall,
+                                              entryBlocks[numVariants],
+                                              numVariants+1,
+                                              entryBB);
+
+  for (unsigned i=0; i<numVariants; ++i)
+  {
+      ConstantInt* onVal = ConstantInt::get(variableType,
+                                            (*mValues)[i],
+                                            true);
+      BasicBlock* destBB = entryBlocks[i];
+      switchInst->addCase(onVal, destBB);
+  }
+
+  //-------------------------------------------------------------------------//
+  // Create branches from return blocks to exitBB.
+  for (unsigned i=0; i<numVariants; ++i)
+  {
+      BasicBlock* srcBB = exitBlocks[i];
+      assert (isa<ReturnInst>(srcBB->getTerminator()));
+      assert (!(cast<ReturnInst>(srcBB->getTerminator()))->getReturnValue());
+      srcBB->getTerminator()->eraseFromParent();
+      BranchInst::Create(exitBB, srcBB);
+  }
+
+  //-------------------------------------------------------------------------//
+  // Replace uses of specializeCall in each variant by the corresponding value.
+  for (unsigned i=0; i<numVariants; ++i)
+  {
+      ConstantInt* onVal = ConstantInt::get(variableType,
+                                            (*mValues)[i],
+                                            true);
+      CallInst* call = mappedCalls[i];
+      call->replaceAllUsesWith(onVal);
+  }
 
   return true;
 }
@@ -125,10 +224,7 @@ NoiseSpecializer::runSLD(Function* noiseFn)
 char NoiseSpecializer::ID = 0;
 } // namespace llvm
 
-INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialized-loop-dispatch",
-                      "Specialized loop dispatching for noise functions", false, false)
-INITIALIZE_PASS_DEPENDENCY(DominatorTree)
-INITIALIZE_PASS_DEPENDENCY(LoopInfo)
-INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
-INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialized-loop-dispatch",
-                    "Specialized loop dispatching for noise functions", false, false)
+INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialized-dispatch",
+                      "Specialized dispatching for noise functions", false, false)
+INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialized-dispatch",
+                    "Specialized dispatching for noise functions", false, false)

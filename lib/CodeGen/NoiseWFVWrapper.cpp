@@ -1163,9 +1163,6 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
 
 } // unnamed namespace
 
-// TODO: Implement generation of fixup code for cases where we either
-//       don't know the exact iteration count or where it is not an exact
-//       multiple of the vectorization width.
 // TODO: Make assertions return gracefully instead.
 bool
 NoiseWFVWrapper::runWFV(Function* noiseFn)

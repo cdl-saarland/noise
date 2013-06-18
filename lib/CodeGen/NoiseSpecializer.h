@@ -1,4 +1,4 @@
-//===--- NoiseSpecializer.h - Noise Specialized Loop Dispatch -------------===//
+//===--- NoiseSpecializer.h - Noise Specialized Dispatch -------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The specialized loop dispatch transformation for noise functions
+// The specialized dispatch transformation for noise functions
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,10 +21,6 @@
 namespace llvm {
 class Module;
 class LLVMContext;
-class LoopInfo;
-class Loop;
-class Type;
-class PHINode;
 class Function;
 }
 
@@ -41,12 +37,11 @@ public:
 
   Module*                    mModule;
   LLVMContext*               mContext;
-  LoopInfo*                  mLoopInfo;
-  const StringRef            mVariable;
+  const std::string          mVariable;
   const SmallVector<int, 4>* mValues;
 
   NoiseSpecializer();
-  NoiseSpecializer(StringRef&                 variable,
+  NoiseSpecializer(const std::string&         variable,
                    const SmallVector<int, 4>& values);
 
   virtual ~NoiseSpecializer();
