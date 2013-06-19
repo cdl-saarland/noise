@@ -46,20 +46,48 @@ createNoiseFusionPass()
 
 
 NoiseFusion::NoiseFusion()
-: FunctionPass(ID), mVariable(""), mValues(0)
+: FunctionPass(ID)
 {
     initializeNoiseFusionPass(*PassRegistry::getPassRegistry());
 }
 
+class Sorter {
+public:
+
+  Sorter(DominatorTree* DomTree) : mDomTree(DomTree) {}
+
+  bool operator () (const Loop *Loop1, const Loop *Loop2) { 
+    return mDomTree->dominates(Loop1->getHeader(), Loop2->getHeader());
+  }
+
+  DominatorTree *mDomTree;
+};
+
 bool
-NoiseFusion::runOnFunction(Function &F)
-{
+NoiseFusion::runOnFunction(Function &F) {
   mModule   = F.getParent();
   mContext  = &F.getContext();
   mLoopInfo = &getAnalysis<LoopInfo>();
+  mDomTree  = &getAnalysis<DominatorTree>();
 
   typedef LoopInfoBase<BasicBlock, Loop> LIB;
   LIB& Base = mLoopInfo->getBase();
+
+  size_t NumLoops = std::distance(Base.begin(), Base.end());
+  if (NumLoops <= 1)
+    return true;
+
+  std::vector<const Loop*> Loops(NumLoops);
+  std::copy(Base.begin(), Base.end(), Loops.begin());
+  std::sort(Loops.begin(), Loops.end(), Sorter(mDomTree));
+
+  outs() << "---\n";
+  for (size_t i = 0, e = Loops.size(); i != e; ++i) {
+    Loops[i]->dump();
+  }
+  outs() << "---\n";
+
+
   const Loop *Loop2 = *Base.begin();
   const Loop *Loop1 = *(Base.begin() + 1);
   fuse(Loop1, Loop2);
@@ -88,11 +116,13 @@ void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
                          ? HeaderBranch2->getSuccessor(0) 
                          : HeaderBranch2->getSuccessor(1);
 
+  // jump: Latch1 -> BodyStart2
   BranchInst *LatchBranch1 = cast<BranchInst>(Latch1->getTerminator());
   assert(LatchBranch1->isUnconditional() && LatchBranch1->getNumSuccessors() == 1);
   LatchBranch1->eraseFromParent();
   BranchInst::Create(BodyStart2, Latch1);
 
+  // jump: Latch2 -> Header1
   BranchInst *LatchBranch2 = cast<BranchInst>(Latch2->getTerminator());
   assert(LatchBranch2->isUnconditional() && LatchBranch2->getNumSuccessors() == 1);
   LatchBranch2->eraseFromParent();
@@ -103,6 +133,7 @@ void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
   else
     Phi1->setIncomingBlock(1, Latch2);
 
+  // jump: Header1 -> Cond, Exit, Header1
   BranchInst *HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
   assert(HeaderBranch1->isConditional() && HeaderBranch1->getNumSuccessors() == 2);
   Value *Cond = HeaderBranch1->getCondition();
@@ -124,6 +155,7 @@ void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
 void
 NoiseFusion::getAnalysisUsage(AnalysisUsage &AU) const
 {
+  AU.addRequired<DominatorTree>();
   AU.addRequired<LoopInfo>();
 }
 

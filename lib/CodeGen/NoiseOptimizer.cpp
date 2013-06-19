@@ -456,7 +456,6 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
                                    verbose));
 #endif
   } else if(pass == "loop-fusion") {
-    //Passes.add(createLoopSimplifyPass());
     Passes.add(new NoiseFusion());
   } else {
     const PassInfo* info = Registry->getPassInfo(pass);

@@ -19,16 +19,14 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace llvm {
-class Module;
-class LLVMContext;
-class LoopInfo;
-class Loop;
-class Type;
-class PHINode;
+class DominatorTree;
 class Function;
+class LLVMContext;
+class Loop;
+class LoopInfo;
+class Module;
+class Type;
 }
-
-using namespace llvm;
 
 namespace llvm {
 
@@ -38,11 +36,10 @@ struct NoiseFusion : public FunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
 
-  Module*                    mModule;
-  LLVMContext*               mContext;
-  LoopInfo*                  mLoopInfo;
-  const StringRef            mVariable;
-  const SmallVector<int, 4>* mValues;
+  Module        *mModule;
+  LLVMContext   *mContext;
+  LoopInfo      *mLoopInfo;
+  DominatorTree *mDomTree;
 
   NoiseFusion();
   virtual ~NoiseFusion() {}
