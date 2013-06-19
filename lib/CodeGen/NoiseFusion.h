@@ -19,13 +19,17 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace llvm {
+class BasicBlock;
+class BranchInst;
 class DominatorTree;
 class Function;
 class LLVMContext;
 class Loop;
 class LoopInfo;
 class Module;
+class PHINode;
 class Type;
+class Value;
 }
 
 namespace llvm {
@@ -41,12 +45,18 @@ public:
   LoopInfo      *mLoopInfo;
   DominatorTree *mDomTree;
 
+  PHINode       *Phi1;
+  Value         *Induction1;
+  BasicBlock    *Header1;
+  BranchInst    *HeaderBranch1;
+  BasicBlock    *Latch1;
+
   NoiseFusion();
   virtual ~NoiseFusion() {}
 
   virtual bool runOnFunction(Function &F);
   virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-  void fuse(const Loop *Loop1, const Loop *Loop2);
+  void fuse(int ExitIndex, const Loop *Loop2);
 };
 
 }

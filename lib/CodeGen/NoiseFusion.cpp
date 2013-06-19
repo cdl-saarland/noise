@@ -81,32 +81,28 @@ NoiseFusion::runOnFunction(Function &F) {
   std::copy(Base.begin(), Base.end(), Loops.begin());
   std::sort(Loops.begin(), Loops.end(), Sorter(mDomTree));
 
-  outs() << "---\n";
-  for (size_t i = 0, e = Loops.size(); i != e; ++i) {
-    Loops[i]->dump();
+  const Loop *Loop1 = Loops.front();
+  Header1 = Loop1->getHeader(); 
+  Latch1 = Loop1->getLoopLatch(); 
+  Phi1 = Loop1->getCanonicalInductionVariable();
+  Induction1 = Phi1->getIncomingValueForBlock(Latch1);
+  assert(Induction1->getNumUses() == 1);
+  HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
+  int ExitIndex = Loop1->contains(HeaderBranch1->getSuccessor(0)) ? 1 : 0;
+
+  for (std::vector<const Loop*>::const_iterator Loop2 = Loops.begin() + 1, e = Loops.end(); Loop2 != e; ++Loop2) {
+    fuse(ExitIndex, *Loop2);
   }
-  outs() << "---\n";
-
-
-  const Loop *Loop2 = *Base.begin();
-  const Loop *Loop1 = *(Base.begin() + 1);
-  fuse(Loop1, Loop2);
 
   return true;
 }
 
-void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
-  PHINode *Phi1 = Loop1->getCanonicalInductionVariable();
-  PHINode *Phi2 = Loop2->getCanonicalInductionVariable();
-  BasicBlock *Header1 = Loop1->getHeader(); 
+void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   BasicBlock *Header2 = Loop2->getHeader(); 
-  BasicBlock *Latch1 = Loop1->getLoopLatch(); 
   BasicBlock *Latch2 = Loop2->getLoopLatch();
 
-  Value *Induction1 = Phi1->getIncomingValueForBlock(Latch1);
+  PHINode *Phi2 = Loop2->getCanonicalInductionVariable();
   Value *Induction2 = Phi2->getIncomingValueForBlock(Latch2);
-
-  assert(Induction1->getNumUses() == 1);
   assert(Induction2->getNumUses() == 1);
 
   BranchInst *HeaderBranch2 = cast<BranchInst>(Header2->getTerminator());
@@ -128,6 +124,7 @@ void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
   LatchBranch2->eraseFromParent();
   BranchInst::Create(Header1, Latch2);
 
+  // fix Phi1's predecessor to Latch2
   if (Phi1->getIncomingBlock(0) == Latch1)
     Phi1->setIncomingBlock(0, Latch2);
   else
@@ -141,15 +138,14 @@ void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
   BasicBlock* Exit = Loop2->contains(HeaderBranch2->getSuccessor(0)) 
                    ? HeaderBranch2->getSuccessor(1) 
                    : HeaderBranch2->getSuccessor(0);
-  if (Loop1->contains(Targets[0]))
-    Targets[1] = Exit;
-  else
-    Targets[0] = Exit;
+  Targets[ExitIndex] = Exit;
   HeaderBranch1->eraseFromParent();
-  BranchInst::Create(Targets[0], Targets[1], Cond, Header1);
+  HeaderBranch1 = BranchInst::Create(Targets[0], Targets[1], Cond, Header1);
 
   Phi2->replaceAllUsesWith(Phi1);
   Header2->eraseFromParent();
+
+  Latch1 = Latch2;
 }
 
 void
