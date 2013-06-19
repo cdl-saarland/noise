@@ -90,9 +90,8 @@ NoiseFusion::runOnFunction(Function &F) {
   HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
   int ExitIndex = Loop1->contains(HeaderBranch1->getSuccessor(0)) ? 1 : 0;
 
-  for (std::vector<const Loop*>::const_iterator Loop2 = Loops.begin() + 1, e = Loops.end(); Loop2 != e; ++Loop2) {
+  for (std::vector<const Loop*>::const_iterator Loop2 = Loops.begin() + 1, e = Loops.end(); Loop2 != e; ++Loop2)
     fuse(ExitIndex, *Loop2);
-  }
 
   return true;
 }
@@ -112,6 +111,10 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
                          ? HeaderBranch2->getSuccessor(0) 
                          : HeaderBranch2->getSuccessor(1);
 
+  // fix phi functions first
+  Latch1->replaceSuccessorsPhiUsesWith(Latch2);
+  Header2->replaceSuccessorsPhiUsesWith(Header1);
+
   // jump: Latch1 -> BodyStart2
   BranchInst *LatchBranch1 = cast<BranchInst>(Latch1->getTerminator());
   assert(LatchBranch1->isUnconditional() && LatchBranch1->getNumSuccessors() == 1);
@@ -124,13 +127,6 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   LatchBranch2->eraseFromParent();
   BranchInst::Create(Header1, Latch2);
 
-  // fix Phi1's predecessor to Latch2
-  if (Phi1->getIncomingBlock(0) == Latch1)
-    Phi1->setIncomingBlock(0, Latch2);
-  else
-    Phi1->setIncomingBlock(1, Latch2);
-
-  // jump: Header1 -> Cond, Exit, Header1
   BranchInst *HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
   assert(HeaderBranch1->isConditional() && HeaderBranch1->getNumSuccessors() == 2);
   Value *Cond = HeaderBranch1->getCondition();
