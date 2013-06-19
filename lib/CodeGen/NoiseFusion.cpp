@@ -62,6 +62,12 @@ NoiseFusion::runOnFunction(Function &F)
   LIB& Base = mLoopInfo->getBase();
   const Loop *Loop2 = *Base.begin();
   const Loop *Loop1 = *(Base.begin() + 1);
+  fuse(Loop1, Loop2);
+
+  return true;
+}
+
+void NoiseFusion::fuse(const Loop *Loop1, const Loop *Loop2) {
   PHINode *Phi1 = Loop1->getCanonicalInductionVariable();
   PHINode *Phi2 = Loop2->getCanonicalInductionVariable();
   BasicBlock *Header1 = Loop1->getHeader(); 
@@ -113,8 +119,6 @@ NoiseFusion::runOnFunction(Function &F)
 
   Phi2->replaceAllUsesWith(Phi1);
   Header2->eraseFromParent();
-
-  return true;
 }
 
 void

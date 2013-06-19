@@ -45,12 +45,11 @@ public:
   const SmallVector<int, 4>* mValues;
 
   NoiseFusion();
-
   virtual ~NoiseFusion() {}
 
   virtual bool runOnFunction(Function &F);
-
   virtual void getAnalysisUsage(AnalysisUsage &AU) const;
+  void fuse(const Loop *Loop1, const Loop *Loop2);
 };
 
 }
