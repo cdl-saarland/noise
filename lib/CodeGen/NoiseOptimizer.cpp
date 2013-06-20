@@ -409,10 +409,10 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
 
     assert (NoiseOptimizations::GetNumPassArgs(Opt) > 1 &&
             "expected at least two arguments for specialized dispatching!");
-    StringRef variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
-    SmallVector<int, 4> values;
+    const std::string variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
+    SmallVector<int, 4>* values = new SmallVector<int, 4>();
     for (unsigned i=1, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
-      values.push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
+      values->push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
     }
 
     Passes.add(new NoiseSpecializer(variable, values));

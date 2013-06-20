@@ -42,7 +42,7 @@ public:
 
   NoiseSpecializer();
   NoiseSpecializer(const std::string&         variable,
-                   const SmallVector<int, 4>& values);
+                   const SmallVector<int, 4>* values);
 
   virtual ~NoiseSpecializer();
 
@@ -50,7 +50,7 @@ public:
 
   virtual void getAnalysisUsage(AnalysisUsage &AU) const;
 
-  bool runSLD(Function* noiseFn);
+  bool runSpecializer(Function* noiseFn);
 };
 
 }

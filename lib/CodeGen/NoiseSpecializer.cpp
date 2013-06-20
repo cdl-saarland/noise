@@ -50,8 +50,8 @@ NoiseSpecializer::NoiseSpecializer()
 }
 
 NoiseSpecializer::NoiseSpecializer(const std::string&         variable,
-                                   const SmallVector<int, 4>& values)
-: FunctionPass(ID), mVariable(variable), mValues(&values)
+                                   const SmallVector<int, 4>* values)
+: FunctionPass(ID), mVariable(variable), mValues(values)
 {
     initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
 }
@@ -66,7 +66,7 @@ NoiseSpecializer::runOnFunction(Function &F)
   mModule   = F.getParent();
   mContext  = &F.getContext();
 
-  const bool success = runSLD(&F);
+  const bool success = runSpecializer(&F);
 
   if (!success)
   {
@@ -84,7 +84,7 @@ NoiseSpecializer::getAnalysisUsage(AnalysisUsage &AU) const
 
 
 bool
-NoiseSpecializer::runSLD(Function* noiseFn)
+NoiseSpecializer::runSpecializer(Function* noiseFn)
 {
   assert (noiseFn);
 
@@ -95,35 +95,30 @@ NoiseSpecializer::runSLD(Function* noiseFn)
   const std::string& specializeFnName = sstr.str();
 
   //-------------------------------------------------------------------------//
-  // Find the Noise specialize call for this variable.
-  CallInst* specializeCall = 0;
-  for (Function::iterator BB=noiseFn->begin(), BBE=noiseFn->end(); BB!=BBE; ++BB)
-  {
-      for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
-      {
-          if (!isa<CallInst>(I)) continue;
-          CallInst* call = cast<CallInst>(I);
-          Function* callee = call->getCalledFunction();
-          if (!callee) continue;
-          if (callee->getName() != specializeFnName) continue;
-          if (specializeCall)
-          {
-              errs() << "ERROR: Found multiple calls to function '"
-                  << specializeFnName << "'!\n";
-              assert (false &&
-                      "must not have multiple calls to same noise specialize function");
-              continue;
-          }
-          specializeCall = call;
-          //break;
-      }
-      //if (specializeCall) break;
-  }
-  assert (specializeCall && "specialize call not found!");
+  // Find the Noise specialize call for this variable and the corresponding
+  // argument where it is given to the noise function.
+  Module* module = noiseFn->getParent();
+  Function* specializeFn = module->getFunction(specializeFnName);
+  assert (specializeFn->getNumUses() == 1);
+  CallInst* specializeCall = cast<CallInst>(*specializeFn->use_begin());
 
   assert (specializeCall->getType()->isIntegerTy() &&
           "specialized dispatch currently only implemented for integer values");
   IntegerType* variableType = cast<IntegerType>(specializeCall->getType());
+
+  assert (specializeCall->getNumUses() == 1);
+  CallInst* noiseFnCall = cast<CallInst>(*specializeCall->use_begin());
+
+  Argument* specializeCallArg = 0;
+  Function::arg_iterator A = noiseFn->arg_begin();
+  for (CallInst::op_iterator OP=noiseFnCall->op_begin(),
+       OPE=noiseFnCall->op_end(); OP!=OPE; ++OP, ++A)
+  {
+      if (*OP != specializeCall) continue;
+      specializeCallArg = A;
+      break;
+  }
+  assert (specializeCallArg);
 
   //-------------------------------------------------------------------------//
   // Create new function for switch statement.
@@ -134,13 +129,13 @@ NoiseSpecializer::runSLD(Function* noiseFn)
                                         "switch_fn",
                                         noiseFn->getParent());
 
-  BasicBlock* entryBB = BasicBlock::Create(*mContext, "noiseSpecializeBegin", noiseFn);
+  BasicBlock* entryBB = BasicBlock::Create(*mContext, "noiseSpecializeBegin", switchFn);
 
   //-------------------------------------------------------------------------//
-  // Duplicate code once for each specialization variant.
+  // Duplicate code once for each specialization variant and specialize.
   SmallVector<BasicBlock*, 4> entryBlocks;
   SmallVector<BasicBlock*, 4> exitBlocks;
-  SmallVector<CallInst*, 4>   mappedCalls;
+  Argument* mappedCallArg = 0;
   for (unsigned i=0; i<=numVariants; ++i)
   {
       ValueToValueMapTy valueMap;
@@ -172,15 +167,25 @@ NoiseSpecializer::runSLD(Function* noiseFn)
       assert (returns.size() == 1);
       exitBlocks.push_back(returns[0]->getParent());
 
-      // Store the mapped noise specialize calls.
-      mappedCalls.push_back(cast<CallInst>(valueMap[specializeCall]));
+      // Get the mapped noise specialize calls.
+      mappedCallArg = cast<Argument>(valueMap[specializeCallArg]);
+
+      // If this is the last iteration, skip the specialization (default case).
+      // Only store the mapped call argument.
+      if (i == numVariants) continue;
+
+      // Replace uses of specializeCallArg in each variant by the corresponding value.
+      ConstantInt* onVal = ConstantInt::get(variableType,
+                                            (*mValues)[i],
+                                            true);
+      mappedCallArg->replaceAllUsesWith(onVal);
   }
 
-  BasicBlock* exitBB = BasicBlock::Create(*mContext, "noiseSpecializeEnd", noiseFn);
+  //BasicBlock* exitBB = BasicBlock::Create(*mContext, "noiseSpecializeEnd", switchFn);
 
   //-------------------------------------------------------------------------//
   // Create switch statement.
-  SwitchInst* switchInst = SwitchInst::Create(specializeCall,
+  SwitchInst* switchInst = SwitchInst::Create(mappedCallArg,
                                               entryBlocks[numVariants],
                                               numVariants+1,
                                               entryBB);
@@ -194,27 +199,50 @@ NoiseSpecializer::runSLD(Function* noiseFn)
       switchInst->addCase(onVal, destBB);
   }
 
-  //-------------------------------------------------------------------------//
-  // Create branches from return blocks to exitBB.
-  for (unsigned i=0; i<numVariants; ++i)
-  {
-      BasicBlock* srcBB = exitBlocks[i];
-      assert (isa<ReturnInst>(srcBB->getTerminator()));
-      assert (!(cast<ReturnInst>(srcBB->getTerminator()))->getReturnValue());
-      srcBB->getTerminator()->eraseFromParent();
-      BranchInst::Create(exitBB, srcBB);
-  }
+//  //-------------------------------------------------------------------------//
+//  // Create branches from return blocks to exitBB.
+//  for (unsigned i=0; i<numVariants; ++i)
+//  {
+//      BasicBlock* srcBB = exitBlocks[i];
+//      assert (isa<ReturnInst>(srcBB->getTerminator()));
+//      assert (!(cast<ReturnInst>(srcBB->getTerminator()))->getReturnValue());
+//      srcBB->getTerminator()->eraseFromParent();
+//      BranchInst::Create(exitBB, srcBB);
+//  }
 
   //-------------------------------------------------------------------------//
-  // Replace uses of specializeCall in each variant by the corresponding value.
-  for (unsigned i=0; i<numVariants; ++i)
+  // Replace body of old function with new function.
+  noiseFn->deleteBody();
+  ValueToValueMapTy valueMap;
+  Function::arg_iterator destI = noiseFn->arg_begin();
+  for (Function::const_arg_iterator I = switchFn->arg_begin(),
+       E = switchFn->arg_end(); I != E; ++I)
   {
-      ConstantInt* onVal = ConstantInt::get(variableType,
-                                            (*mValues)[i],
-                                            true);
-      CallInst* call = mappedCalls[i];
-      call->replaceAllUsesWith(onVal);
+      if (valueMap.count(I) == 0)          // Is this argument preserved?
+      {
+          destI->setName(I->getName()); // Copy the name over...
+          valueMap[I] = destI++;           // Add mapping to ValueMap
+      }
   }
+
+  SmallVector<ReturnInst*, 2>  returns;
+  ClonedCodeInfo               clonedFInfo;
+  const char*                  nameSuffix = ".";
+  CloneFunctionInto(noiseFn,
+                    switchFn,
+                    valueMap,
+                    false,
+                    returns,
+                    nameSuffix,
+                    &clonedFInfo);
+
+  switchFn->eraseFromParent();
+
+  //-------------------------------------------------------------------------//
+  // Replace dummy call by the original value again.
+  Value* specializedVal = specializeCall->getOperand(0);
+  specializeCall->replaceAllUsesWith(specializedVal);
+  specializeCall->eraseFromParent();
 
   return true;
 }
