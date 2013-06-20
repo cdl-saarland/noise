@@ -99,6 +99,11 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   // argument where it is given to the noise function.
   Module* module = noiseFn->getParent();
   Function* specializeFn = module->getFunction(specializeFnName);
+  assert (specializeFn && "could not find specialize function");
+  assert (std::distance(specializeFn->arg_begin(), specializeFn->arg_end()) == 1 &&
+          "expected specialize function with exactly one argument");
+  assert (!specializeFn->arg_begin()->getType()->isPointerTy() &&
+          "expected specialize function with non-pointer argument");
   assert (specializeFn->getNumUses() == 1);
   CallInst* specializeCall = cast<CallInst>(*specializeFn->use_begin());
 
