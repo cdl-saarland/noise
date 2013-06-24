@@ -1190,7 +1190,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   BasicBlock* preheaderBB = loop->getLoopPreheader();
   BasicBlock* headerBB    = loop->getHeader();
   BasicBlock* latchBB     = loop->getLoopLatch();
-  BasicBlock* exitBB      = loop->getUniqueExitBlock();
+  BasicBlock* exitBB      = loop->getExitBlock();
   BasicBlock* exitingBB   = loop->getExitingBlock();
   assert (preheaderBB && headerBB && latchBB &&
           "vectorization of non-simplified loop not supported!");
@@ -1446,7 +1446,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
     // Tie loose ends of cloning.
     BasicBlock* startPreheaderBB = cast<BasicBlock>(startLoopValueMap[preheaderBB]);
-    BasicBlock* startExitBB = scalarStartLoop->getUniqueExitBlock();
+    BasicBlock* startExitBB = scalarStartLoop->getExitBlock();
     TerminatorInst* preheaderTerm = preheaderBB->getTerminator();
     TerminatorInst* startLoopExitTerm = startExitBB->getTerminator();
     // 1. Branch from preheader to start loop preheader.
@@ -1563,7 +1563,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
     // Tie loose ends of cloning.
     BasicBlock* endPreheaderBB = cast<BasicBlock>(endLoopValueMap[preheaderBB]);
-    BasicBlock* endExitBB = scalarEndLoop->getUniqueExitBlock();
+    BasicBlock* endExitBB = scalarEndLoop->getExitBlock();
     TerminatorInst* simdTerm = exitBB->getTerminator();
     TerminatorInst* endLoopExitTerm = endExitBB->getTerminator();
     // 1. Branch from SIMD loop exit to end loop preheader.
@@ -2555,7 +2555,7 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
   BasicBlock* preheaderBB = loop.getLoopPreheader();
   BasicBlock* headerBB    = loop.getHeader();
   BasicBlock* latchBB     = loop.getLoopLatch();
-  BasicBlock* exitBB      = loop.getUniqueExitBlock();
+  BasicBlock* exitBB      = loop.getExitBlock();
 
   for (BasicBlock::iterator I=headerBB->begin(),
        IE=headerBB->end(); I!=IE; ++I)

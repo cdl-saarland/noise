@@ -657,12 +657,12 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action, raw_ostream *OS) {
 #ifdef ANALYZE_LOOPS
   loopanalysis::LoopAnalysis LA(TheModule);
   LA.Analyze();
-#endif
-
+#else
   if (hasNoiseAttribute(TheModule)) {
     NoiseEmitAssembly(Action, OS);
     return;
   }
+#endif
 
   TimeRegion Region(llvm::TimePassesIsEnabled ? &CodeGenerationTime : 0);
   llvm::formatted_raw_ostream FormattedOS;

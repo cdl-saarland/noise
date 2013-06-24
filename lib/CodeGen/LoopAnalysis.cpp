@@ -209,8 +209,8 @@ INITIALIZE_PASS_END(LoopAnalyzer, "analyze-loops",
 namespace llvm {
 namespace loopanalysis {
 
-LoopAnalysis::LoopAnalysis(Module* M) : Mod(M) {}
-LoopAnalysis::~LoopAnalysis() {}
+LoopAnalysis::LoopAnalysis(Module* M) : Mod(CloneModule(M)) {}
+LoopAnalysis::~LoopAnalysis() { delete Mod; }
 
 void LoopAnalysis::Analyze()
 {
@@ -536,7 +536,7 @@ LoopAnalyzer::collectReductionVariables(RedVarVecType&       redVars,
     BasicBlock* preheaderBB = loop.getLoopPreheader();
     BasicBlock* headerBB    = loop.getHeader();
     BasicBlock* latchBB     = loop.getLoopLatch();
-    BasicBlock* exitBB      = loop.getUniqueExitBlock();
+    BasicBlock* exitBB      = loop.getExitBlock();
 
     for (BasicBlock::iterator I=headerBB->begin(),
         IE=headerBB->end(); I!=IE; ++I)
@@ -740,7 +740,7 @@ LoopAnalyzer::analyzeLoop(Loop*        loop,
     BasicBlock* preheaderBB = loop->getLoopPreheader();
     BasicBlock* headerBB    = loop->getHeader();
     BasicBlock* latchBB     = loop->getLoopLatch();
-    BasicBlock* exitBB      = loop->getUniqueExitBlock();
+    BasicBlock* exitBB      = loop->getExitBlock();
     BasicBlock* exitingBB   = loop->getExitingBlock();
 
     out << "\nanalyzing loop with header: '" << headerBB->getName() << "'\n";
