@@ -152,8 +152,8 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   moveTo<false>(PreHeader2, PreHeader1);
 
   // erase now unreachable (pre-)headers
-  //PreHeader2->eraseFromParent();
-  //Header2->eraseFromParent();
+  PreHeader2->eraseFromParent();
+  Header2->eraseFromParent();
 
   // make new big loop's latch current latch
   Latch1 = Latch2;
