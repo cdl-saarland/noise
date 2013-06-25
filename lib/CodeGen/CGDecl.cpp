@@ -899,6 +899,10 @@ CodeGenFunction::EmitAutoVarAlloca(const VarDecl &D) {
 
       llvm::AllocaInst *Alloc = CreateTempAlloca(LTy);
       Alloc->setName(D.getName());
+      llvm::MDString* MDS = llvm::MDString::get(getLLVMContext(), D.getName());
+      Alloc->setMetadata("noise_varname",
+                         llvm::MDNode::get(getLLVMContext(),
+                                           llvm::ArrayRef<llvm::Value*>(MDS)));
 
       CharUnits allocaAlignment = alignment;
       if (isByRef)
@@ -1590,6 +1594,10 @@ void CodeGenFunction::EmitParmDecl(const VarDecl &D, llvm::Value *Arg,
         llvm::AllocaInst *Alloc = CreateTempAlloca(ConvertTypeForMem(Ty),
                                                    D.getName() + ".addr");
         Alloc->setAlignment(getContext().getDeclAlign(&D).getQuantity());
+        llvm::MDString* MDS = llvm::MDString::get(getLLVMContext(), D.getName());
+        Alloc->setMetadata("noise_varname",
+                           llvm::MDNode::get(getLLVMContext(),
+                                             llvm::ArrayRef<llvm::Value*>(MDS)));
         LValue lv = MakeAddrLValue(Alloc, Ty, getContext().getDeclAlign(&D));
         EmitStoreOfScalar(Arg, lv, /* isInitialization */ true);
         LocalAddr = Builder.CreateLoad(Alloc);
@@ -1618,6 +1626,10 @@ void CodeGenFunction::EmitParmDecl(const VarDecl &D, llvm::Value *Arg,
                                                D.getName() + ".addr");
     CharUnits Align = getContext().getDeclAlign(&D);
     Alloc->setAlignment(Align.getQuantity());
+    llvm::MDString* MDS = llvm::MDString::get(getLLVMContext(), D.getName());
+    Alloc->setMetadata("noise_varname",
+                       llvm::MDNode::get(getLLVMContext(),
+                                         llvm::ArrayRef<llvm::Value*>(MDS)));
     DeclPtr = Alloc;
 
     bool doStore = true;

@@ -112,18 +112,31 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   IntegerType* variableType = cast<IntegerType>(specializeCall->getType());
 
   assert (specializeCall->getNumUses() == 1);
-  CallInst* noiseFnCall = cast<CallInst>(*specializeCall->use_begin());
 
-  Argument* specializeCallArg = 0;
-  Function::arg_iterator A = noiseFn->arg_begin();
-  for (CallInst::op_iterator OP=noiseFnCall->op_begin(),
-       OPE=noiseFnCall->op_end(); OP!=OPE; ++OP, ++A)
+  // If this is a compound statement, there is one more indirection
+  // because of the extracted function.
+  const bool isFnAttr = cast<Instruction>(*specializeCall->use_begin())->getParent()->getParent() == noiseFn;
+  Value* specializeCallVal = 0;
+  if (isFnAttr)
   {
-      if (*OP != specializeCall) continue;
-      specializeCallArg = A;
-      break;
+    specializeCallVal = specializeCall->getOperand(0);
   }
-  assert (specializeCallArg);
+  else
+  {
+    CallInst* noiseFnCall = cast<CallInst>(*specializeCall->use_begin());
+
+    Argument* specializeCallArg = 0;
+    Function::arg_iterator A = noiseFn->arg_begin();
+    for (CallInst::op_iterator OP=noiseFnCall->op_begin(),
+         OPE=noiseFnCall->op_end(); OP!=OPE; ++OP, ++A)
+    {
+        if (*OP != specializeCall) continue;
+        specializeCallArg = A;
+        break;
+    }
+    assert (specializeCallArg);
+    specializeCallVal = specializeCallArg;
+  }
 
   //-------------------------------------------------------------------------//
   // Create new function for switch statement.
@@ -140,7 +153,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   // Duplicate code once for each specialization variant and specialize.
   SmallVector<BasicBlock*, 4> entryBlocks;
   SmallVector<BasicBlock*, 4> exitBlocks;
-  Argument* mappedCallArg = 0;
+  Value* mappedVal = 0;
   for (unsigned i=0; i<=numVariants; ++i)
   {
       ValueToValueMapTy valueMap;
@@ -173,24 +186,32 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
       exitBlocks.push_back(returns[0]->getParent());
 
       // Get the mapped noise specialize calls.
-      mappedCallArg = cast<Argument>(valueMap[specializeCallArg]);
+      mappedVal = valueMap[specializeCallVal];
 
       // If this is the last iteration, skip the specialization (default case).
       // Only store the mapped call argument.
       if (i == numVariants) continue;
 
-      // Replace uses of specializeCallArg in each variant by the corresponding value.
+      // Replace uses of specializeCallVal in each variant by the corresponding value.
       ConstantInt* onVal = ConstantInt::get(variableType,
                                             (*mValues)[i],
                                             true);
-      mappedCallArg->replaceAllUsesWith(onVal);
+      if (Argument* arg = dyn_cast<Argument>(mappedVal))
+      {
+        arg->replaceAllUsesWith(onVal);
+      }
+      else
+      {
+        assert (isa<Instruction>(mappedVal));
+        cast<Instruction>(mappedVal)->replaceAllUsesWith(onVal);
+      }
   }
 
   //BasicBlock* exitBB = BasicBlock::Create(*mContext, "noiseSpecializeEnd", switchFn);
 
   //-------------------------------------------------------------------------//
   // Create switch statement.
-  SwitchInst* switchInst = SwitchInst::Create(mappedCallArg,
+  SwitchInst* switchInst = SwitchInst::Create(mappedVal,
                                               entryBlocks[numVariants],
                                               numVariants+1,
                                               entryBB);
@@ -244,10 +265,26 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   switchFn->eraseFromParent();
 
   //-------------------------------------------------------------------------//
-  // Replace dummy call by the original value again.
-  Value* specializedVal = specializeCall->getOperand(0);
-  specializeCall->replaceAllUsesWith(specializedVal);
-  specializeCall->eraseFromParent();
+  if (isFnAttr)
+  {
+    // Replace each dummy call by its single operand.
+    for (Function::use_iterator U=specializeFn->use_begin(),
+         UE=specializeFn->use_end(); U!=UE; )
+    {
+      CallInst* useI = cast<CallInst>(*U++);
+      if (useI->getParent()->getParent() != noiseFn) continue;
+      Value* value = useI->getOperand(0);
+      useI->replaceAllUsesWith(value);
+      useI->eraseFromParent();
+    }
+  }
+  else
+  {
+    // Replace dummy call by the original value again.
+    Value* specializedVal = specializeCall->getOperand(0);
+    specializeCall->replaceAllUsesWith(specializedVal);
+    specializeCall->eraseFromParent();
+  }
 
   return true;
 }

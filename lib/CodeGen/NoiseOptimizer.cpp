@@ -56,11 +56,7 @@
 #include "llvm/IR/Instructions.h" // CallInst
 
 #include <iostream>
-
-//#define NOISE_DEBUG_SPECIALIZE
-#ifdef NOISE_DEBUG_SPECIALIZE
 #include <sstream>
-#endif
 
 using namespace llvm;
 
@@ -87,16 +83,16 @@ MDNode* getCompoundStmtNoiseMD(const BasicBlock& block)
   return block.getTerminator()->getMetadata("noise_compound_stmt");
 }
 
-bool hasNoiseFunctionAttribute(const Function&    function,
-                               const NamedMDNode& MD)
+const MDNode* getNoiseFunctionAttributeMDN(const Function&    function,
+                                           const NamedMDNode& MD)
 {
   for (unsigned i=0, e=MD.getNumOperands(); i<e; ++i) {
     const MDNode* functionMDN = MD.getOperand(i);
     const Function* noiseFn = GetNoiseFunction(functionMDN);
-    if (noiseFn == &function) return true;
+    if (noiseFn == &function) return functionMDN;
   }
 
-  return false;
+  return 0;
 }
 
 } // unnamed namespace
@@ -245,7 +241,7 @@ struct NoiseExtractor : public FunctionPass {
     while (iterate)
     {
       iterate = false;
-      const bool isTopLevel = !hasNoiseFunctionAttribute(F, *MD);
+      const bool isTopLevel = !getNoiseFunctionAttributeMDN(F, *MD);
       for (Function::iterator BB = F.begin(), BBE=F.end(); BB!=BBE; ++BB)
       {
         if (resolveMarkers(BB, visitedBlocks, isTopLevel))
@@ -603,102 +599,52 @@ Function* createDummyFunction(Function* noiseFn)
     return dummyFn;
 }
 
-#ifdef NOISE_DEBUG_SPECIALIZE
-Function* GetNoiseFunction(const MDNode* mdNode)
+
+void createDummyVarNameCalls(Module*            module,
+                             const NamedMDNode& MD)
 {
-    assert (mdNode->getNumOperands() == 2);
-    // First operand is the function.
-    assert (isa<Function>(mdNode->getOperand(0)));
-    return cast<Function>(mdNode->getOperand(0));
-}
-
-MDNode* getCompoundStmtNoiseMD(const BasicBlock& block) {
-  return block.getTerminator()->getMetadata("noise_compound_stmt");
-}
-
-bool hasNoiseFunctionAttribute(const Function&    function,
-                               const NamedMDNode& MD) {
-  for (unsigned i=0, e=MD.getNumOperands(); i<e; ++i) {
-    const MDNode* functionMDN = MD.getOperand(i);
-    const Function* noiseFn = GetNoiseFunction(functionMDN);
-    if (noiseFn == &function) return true;
-  }
-
-  return false;
-}
-#endif
-
-} // unnamed namespace
-
-// TODO: Support "negative" noise attributes (e.g. "subtraction" of specified
-//       passes from O3).
-void NoiseOptimizer::PerformOptimization()
-{
-  // Initialize all passes linked into all libraries (see InitializePasses.h).
-  // This way, they are registered so we can add them via getPassInfo().
-  initializeCore(*PassRegistry::getPassRegistry());
-  initializeTransformUtils(*PassRegistry::getPassRegistry());
-  initializeScalarOpts(*PassRegistry::getPassRegistry());
-  initializeVectorization(*PassRegistry::getPassRegistry());
-  initializeInstCombine(*PassRegistry::getPassRegistry());
-  initializeIPO(*PassRegistry::getPassRegistry());
-  initializeInstrumentation(*PassRegistry::getPassRegistry());
-  initializeAnalysis(*PassRegistry::getPassRegistry());
-  initializeIPA(*PassRegistry::getPassRegistry());
-  initializeCodeGen(*PassRegistry::getPassRegistry());
-  initializeTarget(*PassRegistry::getPassRegistry());
-
-  PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
-
-#ifdef NOISE_DEBUG_SPECIALIZE
-  // For debug purposes
-  NamedMDNode *MD = Mod->getOrInsertNamedMetadata("noise");
-  for (Module::iterator F=Mod->begin(), FE=Mod->end(); F!=FE; ++F)
-  {
-      const bool xx1 = hasNoiseFunctionAttribute(*F, *MD);
-      bool xx2 = false;
-
-      for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
-      {
-          if (!getCompoundStmtNoiseMD(*BB)) continue;
-          xx2 = true;
-      }
-
-      if (!xx1 && !xx2) continue;
-
-      for (Function::iterator BB=F->begin(), BBE=F->end(); BB!=BBE; ++BB)
-      {
-          for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
-          {
-              if (!isa<AllocaInst>(I)) continue;
-
-              MDString* MDS = MDString::get(Mod->getContext(), "x");
-              I->setMetadata("noise_specialize",
-                             MDNode::get(Mod->getContext(),
-                                         ArrayRef<Value*>(MDS)));
-              break;
-          }
-      }
-
-      break;
-  }
-#endif
-
   // Handle noise specialize attributes.
-  for (Module::iterator F=Mod->begin(), FE=Mod->end(); F!=FE; ++F) {
-    const bool hasNoiseFn = hasNoiseFunctionAttribute(*F, *MD);
-    bool hasNoiseCmp = false;
+  for (Module::iterator F=module->begin(), FE=module->end(); F!=FE; ++F)
+  {
+    // First, find out for which variables per function we have to generate
+    // dummy function calls.
+    SmallSet<std::string, 2> specializeVarNames;
 
-    for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
+    // Check noise strings from function metadata for passes that need a variable name.
+    const MDNode* noiseFnAttrMDN = getNoiseFunctionAttributeMDN(*F, MD);
+    if (noiseFnAttrMDN)
     {
-      if (!getCompoundStmtNoiseMD(*BB)) continue;
-      hasNoiseCmp = true;
+      MDNode* noiseDescStrs = cast<MDNode>(noiseFnAttrMDN->getOperand(1)); // 0 = function, 1 = desc strings
+      for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
+      {
+        NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
+        if (NoiseOptimizations::GetPassName(noiseOpt) != "specialize") continue;
+        StringRef passArg = NoiseOptimizations::GetPassArgAsString(noiseOpt, 0);
+        specializeVarNames.insert(passArg.str());
+      }
     }
 
-    if (!hasNoiseFn && !hasNoiseCmp) continue;
+    // Check noise strings from compound metadata for passes that need a variable name.
+    bool hasNoiseCmp = false;
+    for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
+    {
+      MDNode* noiseMD = getCompoundStmtNoiseMD(*BB);
+      if (!noiseMD) continue;
+      hasNoiseCmp = true;
+      MDNode* noiseDescStrs = cast<MDNode>(noiseMD->getOperand(2)); // 0 = entry, 1 = exit, 2 = desc strings
+      for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
+      {
+        NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
+        if (NoiseOptimizations::GetPassName(noiseOpt) != "specialize") continue;
+        StringRef passArg = NoiseOptimizations::GetPassArgAsString(noiseOpt, 0);
+        specializeVarNames.insert(passArg.str());
+      }
+    }
 
-    outs() << "noise fn: " << *F << "\n";
+    // If there was no noise metadata, skip this function.
+    if (!noiseFnAttrMDN && !hasNoiseCmp) continue;
 
+    // Generate dummy calls to retain variable name mapping after SROA.
     for (Function::iterator BB=F->begin(), BBE=F->end(); BB!=BBE; ++BB)
     {
       for (BasicBlock::iterator I=BB->begin(), IE=BB->end(); I!=IE; ++I)
@@ -706,18 +652,21 @@ void NoiseOptimizer::PerformOptimization()
         if (!isa<AllocaInst>(I)) continue;
         if (!I->hasMetadata()) continue;
 
-        MDNode* noiseSpecializeMD = I->getMetadata("noise_specialize");
-        if (!noiseSpecializeMD) continue;
+        MDNode* noiseVarNameMD = I->getMetadata("noise_varname");
+        if (!noiseVarNameMD) continue;
 
-        assert (noiseSpecializeMD->getNumOperands() == 1);
-        assert (isa<MDString>(noiseSpecializeMD->getOperand(0)));
-        MDString* varNameMD = cast<MDString>(noiseSpecializeMD->getOperand(0));
+        assert (noiseVarNameMD->getNumOperands() == 1);
+        assert (isa<MDString>(noiseVarNameMD->getOperand(0)));
+        MDString* varNameMDS = cast<MDString>(noiseVarNameMD->getOperand(0));
+        std::string varName = varNameMDS->getString().str();
+
+        if (!specializeVarNames.count(varName)) continue;
 
         std::stringstream sstr;
-        sstr << "__noise_specialize_" << varNameMD->getString().str();
+        sstr << "__noise_specialize_" << varName;
         const std::string& specializeFnName = sstr.str();
 
-        assert (!Mod->getFunction(specializeFnName) &&
+        assert (!module->getFunction(specializeFnName) &&
                 "specialization of multiple variables of same name not implemented!");
 
         Type* type = I->getType();
@@ -728,7 +677,7 @@ void NoiseOptimizer::PerformOptimization()
         Function* dummyFn = Function::Create(fType,
                                              Function::ExternalLinkage,
                                              specializeFnName,
-                                             Mod);
+                                             module);
         dummyFn->setDoesNotAccessMemory();
         dummyFn->setDoesNotThrow();
 
@@ -759,10 +708,35 @@ void NoiseOptimizer::PerformOptimization()
         firstStore->setOperand(0, call);
       }
     }
-
-    outs() << "noise fn (after): " << *F << "\n";
   }
+}
 
+} // unnamed namespace
+
+// TODO: Support "negative" noise attributes (e.g. "subtraction" of specified
+//       passes from O3).
+void NoiseOptimizer::PerformOptimization()
+{
+  // Initialize all passes linked into all libraries (see InitializePasses.h).
+  // This way, they are registered so we can add them via getPassInfo().
+  initializeCore(*PassRegistry::getPassRegistry());
+  initializeTransformUtils(*PassRegistry::getPassRegistry());
+  initializeScalarOpts(*PassRegistry::getPassRegistry());
+  initializeVectorization(*PassRegistry::getPassRegistry());
+  initializeInstCombine(*PassRegistry::getPassRegistry());
+  initializeIPO(*PassRegistry::getPassRegistry());
+  initializeInstrumentation(*PassRegistry::getPassRegistry());
+  initializeAnalysis(*PassRegistry::getPassRegistry());
+  initializeIPA(*PassRegistry::getPassRegistry());
+  initializeCodeGen(*PassRegistry::getPassRegistry());
+  initializeTarget(*PassRegistry::getPassRegistry());
+
+  PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
+
+  // Before transforming to SROA, create dummy calls for phases like
+  // specialize that need to have a mapping of variable names to SSA
+  // values.
+  createDummyVarNameCalls(Mod, *MD);
 
   {
     // Perform some standard optimizations upfront.
@@ -778,24 +752,6 @@ void NoiseOptimizer::PerformOptimization()
     PM.add(createScalarReplAggregatesPass());
     PM.run(*Mod);
   }
-
-#ifdef NOISE_DEBUG_SPECIALIZE
-  for (Module::iterator F=Mod->begin(), FE=Mod->end(); F!=FE; ++F)
-  {
-      const bool xx1 = hasNoiseFunctionAttribute(*F, *MD);
-      bool xx2 = false;
-
-      for (Function::const_iterator BB = F->begin(), BBE=F->end(); BB!=BBE; ++BB)
-      {
-          if (!getCompoundStmtNoiseMD(*BB)) continue;
-          xx2 = true;
-      }
-
-      if (!xx1 && !xx2) continue;
-
-      outs() << "noise fn (after SROA): " << *F << "\n";
-  }
-#endif
 
   // Extract noise code regions from compound statements into separate functions.
   // These functions look exactly like functions with noise function attribute.
