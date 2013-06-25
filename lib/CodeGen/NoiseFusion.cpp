@@ -36,15 +36,6 @@ using namespace llvm;
 
 namespace llvm {
 
-#if 0
-Pass*
-createNoiseFusionPass()
-{
-    return new NoiseFusion();
-}
-#endif
-
-
 NoiseFusion::NoiseFusion()
 : FunctionPass(ID)
 {
@@ -82,11 +73,9 @@ NoiseFusion::runOnFunction(Function &F) {
   std::sort(Loops.begin(), Loops.end(), Sorter(mDomTree));
 
   const Loop *Loop1 = Loops.front();
+  PreHeader1 = Loop1->getLoopPreheader();
   Header1 = Loop1->getHeader(); 
   Latch1 = Loop1->getLoopLatch(); 
-  Phi1 = Loop1->getCanonicalInductionVariable();
-  Induction1 = Phi1->getIncomingValueForBlock(Latch1);
-  assert(Induction1->getNumUses() == 1);
   HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
   int ExitIndex = Loop1->contains(HeaderBranch1->getSuccessor(0)) ? 1 : 0;
 
@@ -96,13 +85,23 @@ NoiseFusion::runOnFunction(Function &F) {
   return true;
 }
 
+template<bool early>
+static void moveTo(BasicBlock *From, BasicBlock *To) {
+  // move everything except terminator from Header2 to BodyStart2
+  std::vector<Instruction*> Is;
+  for (BasicBlock::iterator i = From->begin(); dyn_cast<TerminatorInst>(i) == 0; ++i) {
+    assert(dyn_cast<PHINode>(i) == 0);
+    Is.push_back(i);
+  }
+
+  for (size_t i = 0, e = Is.size(); i != e; ++i)
+    Is[i]->moveBefore(early ? To->getFirstNonPHI() : To->getTerminator());
+}
+
 void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
+  BasicBlock *PreHeader2 = Loop2->getLoopPreheader();
   BasicBlock *Header2 = Loop2->getHeader(); 
   BasicBlock *Latch2 = Loop2->getLoopLatch();
-
-  PHINode *Phi2 = Loop2->getCanonicalInductionVariable();
-  Value *Induction2 = Phi2->getIncomingValueForBlock(Latch2);
-  assert(Induction2->getNumUses() == 1);
 
   BranchInst *HeaderBranch2 = cast<BranchInst>(Header2->getTerminator());
   assert(HeaderBranch2->isConditional() && HeaderBranch2->getNumSuccessors() == 2);
@@ -114,6 +113,7 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   // fix phi functions first
   Latch1->replaceSuccessorsPhiUsesWith(Latch2);
   Header2->replaceSuccessorsPhiUsesWith(Header1);
+  PreHeader2->replaceSuccessorsPhiUsesWith(PreHeader1);
 
   // jump: Latch1 -> BodyStart2
   BranchInst *LatchBranch1 = cast<BranchInst>(Latch1->getTerminator());
@@ -138,9 +138,24 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   HeaderBranch1->eraseFromParent();
   HeaderBranch1 = BranchInst::Create(Targets[0], Targets[1], Cond, Header1);
 
-  Phi2->replaceAllUsesWith(Phi1);
-  Header2->eraseFromParent();
+  // move all phis in Header2 to Header1
+  PHINode *Phi;
+  std::vector<PHINode*> Phis;
+  for (BasicBlock::iterator i = Header2->begin(); (Phi = dyn_cast<PHINode>(i)); ++i)
+    Phis.push_back(Phi);
 
+  for (size_t i = 0, e = Phis.size(); i != e; ++i)
+    Phis[i]->moveBefore(&Header1->front());
+
+  // move everything except terminator from Header2 and PreHeader2 to BodyStart2
+  moveTo<true>(Header2, BodyStart2);
+  moveTo<false>(PreHeader2, PreHeader1);
+
+  // erase now unreachable (pre-)headers
+  //PreHeader2->eraseFromParent();
+  //Header2->eraseFromParent();
+
+  // make new big loop's latch current latch
   Latch1 = Latch2;
 }
 
@@ -159,5 +174,6 @@ INITIALIZE_PASS_BEGIN(NoiseFusion, "noise-loop-fusion",
                       "Loop fusion for noise attributed loops", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
+INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
 INITIALIZE_PASS_END(NoiseFusion, "noise-loop-fusion",
                       "Loop fusion for noise attributed loops", false, false)

@@ -45,8 +45,7 @@ public:
   LoopInfo      *mLoopInfo;
   DominatorTree *mDomTree;
 
-  PHINode       *Phi1;
-  Value         *Induction1;
+  BasicBlock    *PreHeader1;
   BasicBlock    *Header1;
   BranchInst    *HeaderBranch1;
   BasicBlock    *Latch1;
