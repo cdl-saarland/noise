@@ -111,7 +111,9 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
           "specialized dispatch currently only implemented for integer values");
   IntegerType* variableType = cast<IntegerType>(specializeCall->getType());
 
-  assert (specializeCall->getNumUses() == 1);
+  // It can happen that our call is referenced by multiple users, and thus,
+  // we only have to ensure that at least one user exists.
+  assert (specializeCall->getNumUses() >= 1);
 
   // If this is a compound statement, there is one more indirection
   // because of the extracted function.
