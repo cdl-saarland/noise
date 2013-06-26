@@ -1021,7 +1021,7 @@ void NoiseOptimizer::Reassemble()
 
     // If mCall is not set, this was a noise function attribute.
     // Thus, we must not inline/remove anything.
-    if (!nfi->mCall) return;
+    if (!nfi->mCall) continue;
 
     // We have multiple options here.
     // 1) We mark the parent function as "noinline" after the noise function
