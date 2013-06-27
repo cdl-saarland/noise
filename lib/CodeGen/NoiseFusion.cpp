@@ -147,7 +147,7 @@ void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
   for (size_t i = 0, e = Phis.size(); i != e; ++i)
     Phis[i]->moveBefore(&Header1->front());
 
-  // move everything except terminator from Header2 and PreHeader2 to BodyStart2
+  // move everything except terminator from Header2 to BodyStart2 and from PreHeader2 to PreHeader1
   moveTo<true>(Header2, BodyStart2);
   moveTo<false>(PreHeader2, PreHeader1);
 
