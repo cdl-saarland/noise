@@ -682,19 +682,32 @@ void createDummyVarNameCalls(Module*            module,
         dummyFn->setDoesNotAccessMemory();
         dummyFn->setDoesNotThrow();
 
-        // TODO: Find the correct first reachable use that is a store.
-        //       If there are multiple "parallel" first uses, issue an error.
+        DominatorTree domTree;
+        domTree.runOnFunction(*F);
         StoreInst* firstStore = 0;
         Value* specializedVal = 0;
-        for (Instruction::use_iterator U=I->use_begin(), UE=I->use_end(); U!=UE; ++U)
+        BasicBlock* curBlock = 0;
+        for(Value::use_iterator it = I->use_begin(), e = I->use_end(); it != e; ++it)
         {
-          if (!isa<StoreInst>(*U)) continue;
-          StoreInst* storeI = cast<StoreInst>(*U);
+          if(!isa<StoreInst>(*it)) continue;
+          StoreInst* storeI = cast<StoreInst>(*it);
+          BasicBlock* instBlock = storeI->getParent();
+          if(curBlock == 0 || domTree.dominates(instBlock, curBlock))
+            curBlock = instBlock;
+          else if(domTree.dominates(curBlock, instBlock))
+            continue;
+          else
+          {
+            // reset block as this block cannot contain the first store
+            curBlock = 0;
+          }
+
+          // remember store values
           assert (storeI->getPointerOperand() == I);
           firstStore = storeI;
           specializedVal = storeI->getValueOperand();
-          break;
         }
+        assert (curBlock && "cannot find unique use of specialized variable");
         assert (specializedVal);
 
         CallInst* call = CallInst::Create(dummyFn,
@@ -707,6 +720,8 @@ void createDummyVarNameCalls(Module*            module,
         // In the first reachable use of I that is a store,
         // replace the operand by our call.
         firstStore->setOperand(0, call);
+
+        // TODO: check for related code that has to be moved out of the noise region
       }
     }
   }
