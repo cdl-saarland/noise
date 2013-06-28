@@ -87,7 +87,6 @@ bool
 NoiseSpecializer::runSpecializer(Function* noiseFn)
 {
   assert (noiseFn);
-
   //-------------------------------------------------------------------------//
   // Get the expected name of the specialize function.
   std::stringstream sstr;
@@ -104,7 +103,19 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
           "expected specialize function with exactly one argument");
   assert (!specializeFn->arg_begin()->getType()->isPointerTy() &&
           "expected specialize function with non-pointer argument");
+
+  if (specializeFn->getNumUses() == 0)
+  {
+    // The value of the specialized call is already inlined and no longer
+    // available.
+    // TODO: produce warning
+    outs() << "Variable '" << mVariable << "' no longer available. Inlined?\n";
+    return true;
+  }
+
+  // If a use exists it must be only one
   assert (specializeFn->getNumUses() == 1);
+
   CallInst* specializeCall = cast<CallInst>(*specializeFn->use_begin());
 
   assert (specializeCall->getType()->isIntegerTy() &&
