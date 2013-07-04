@@ -188,8 +188,7 @@ struct NoiseExtractor : public FunctionPass {
       if (!isa<ReturnInst>((*it)->getTerminator())) continue;
 
       errs() << "ERROR: Marked region must not contain a 'return' statement!\n";
-      assert (false && "marked region must not contain a 'return' statement");
-      return false;
+      abort();
     }
 
     // Create new function from the marked range.
@@ -292,8 +291,7 @@ public:
       {
         errs() << "ERROR: Function requested for inlining does not exist in module: '"
           << *it << "'!\n";
-        assert (false && "function to be inlined not found");
-        continue;
+        abort();
       }
 
       functions.insert(fn);
@@ -420,7 +418,7 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
   } else if(pass == "wfv" || pass == "wfv-vectorize") {
 #ifndef COMPILE_NOISE_WFV_WRAPPER
     errs() << "ERROR: No support for WFV is available!\n";
-    assert (false && "no support for WFV available\n");
+    abort();
 #else
     outs() << "Running pass: loop-simplify\n";
     outs() << "Running pass: lowerswitch\n";
@@ -463,9 +461,19 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
     const PassInfo* info = Registry->getPassInfo(pass);
     if(!info) {
       errs() << "ERROR: Pass not found: " << pass << "\n";
-      return;
+      abort();
     }
-    Passes.add(info->createPass());
+    Pass* pass = info->createPass();
+    switch(pass->getPotentialPassManagerType()) {
+      case PMT_FunctionPassManager:
+      case PMT_LoopPassManager:
+      case PMT_RegionPassManager:
+        Passes.add(pass);
+        break;
+      default:
+        errs() << "ERROR: \"" << pass->getPassName() << "\" (" << GetPassName(Opt) << ") is not a function pass\n";
+        abort();
+    }
   }
   outs() << "Running pass: " << GetPassName(Opt) << "\n";
 }
