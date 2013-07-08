@@ -464,15 +464,21 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
       abort();
     }
     Pass* pass = info->createPass();
-    switch(pass->getPotentialPassManagerType()) {
-      case PMT_FunctionPassManager:
-      case PMT_LoopPassManager:
-      case PMT_RegionPassManager:
-        Passes.add(pass);
-        break;
-      default:
-        errs() << "ERROR: \"" << pass->getPassName() << "\" (" << GetPassName(Opt) << ") is not a function pass\n";
-        abort();
+    if(info->isAnalysis())
+      Passes.add(pass);
+    else
+    {
+      switch(pass->getPassKind()) {
+        case PT_BasicBlock:
+        case PT_Function:
+        case PT_Loop:
+        case PT_Region:
+          Passes.add(pass);
+          break;
+        default:
+          errs() << "ERROR: \"" << pass->getPassName() << "\" (" << GetPassName(Opt) << ") is not a function pass\n";
+          abort();
+      }
     }
   }
   outs() << "Running pass: " << GetPassName(Opt) << "\n";
