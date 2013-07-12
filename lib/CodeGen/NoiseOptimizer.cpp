@@ -1067,10 +1067,9 @@ void NoiseOptimizer::Reassemble()
     // function, then run the standard inliner again on that one.
 
     // If mCall is set, inline the call to this function.
-    InlineFunctionInfo IFI;
-    InlineFunction(nfi->mCall, IFI);
-
-    // There may be additional calls (see comment above).
+    // Caution: as the original call might be inlined, we have to check all uses
+    // and NOT the stored one (as it might be invalid right now).
+    // Furthermore, there may be additional calls (see comment above).
     // For now, we don't care and simply attempt to inline all calls (option 2).
     SmallVector<CallInst*, 2> callVec;
     for (Function::use_iterator U=movedNoiseFn->use_begin(),
@@ -1091,8 +1090,6 @@ void NoiseOptimizer::Reassemble()
     {
       movedNoiseFn->eraseFromParent();
     }
-
-    //outs() << "module after reinlining: " << *Mod << "\n";
 
     {
       // Perform some standard optimizations after inlining.
