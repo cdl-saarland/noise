@@ -48,9 +48,14 @@ add_clang_library(clangCodeGen
   CodeGenTBAA.cpp
   CodeGenTypes.cpp
   ItaniumCXXABI.cpp
+  LoopAnalysis.cpp
   MicrosoftCXXABI.cpp
   ModuleBuilder.cpp
+  NoiseAttrParser.cpp
+  NoiseFusion.cpp
+  NoiseOptimization.cpp
   NoiseOptimizer.cpp
+  NoiseSpecializer.cpp
   NoiseWFVWrapper.cpp
   TargetInfo.cpp
   )
