@@ -128,6 +128,7 @@ NoiseWFVWrapper::runOnFunction(Function &F)
   if (!success)
   {
     errs() << "ERROR: WFV failed!\n";
+    abort();
   }
 
   // If not successful, nothing changed.
@@ -293,7 +294,7 @@ template<unsigned S>
 Function*
 extractLoopBody(Loop*                        loop,
                 PHINode*                     indVarPhi,
-                Instruction*                 indVarUpdate,
+                Instruction*&                indVarUpdate,
                 const unsigned               vectorizationFactor,
                 DominatorTree*               domTree,
                 SmallVector<BasicBlock*, S>& loopBody)
@@ -310,6 +311,8 @@ extractLoopBody(Loop*                        loop,
           "vectorization of loop with multiple exits not supported!");
   assert (exitingBB == headerBB &&
           "expected exiting block to be the loop header!");
+
+  const bool indVarUpdateInLatch = indVarUpdate->getParent() == latchBB;
 
   // Collect all blocks that are definitely part of the body.
   std::vector<BasicBlock*>& blocks = loop->getBlocksVector();
@@ -332,11 +335,22 @@ extractLoopBody(Loop*                        loop,
   assert (exitBr->getCondition()->getNumUses() == 1 &&
           "expected exit condition to have only one use in the exit branch!");
 
-  // Split latch directly before induction variable increment.
-  BasicBlock* newLatchBB = SplitBlock(latchBB, indVarUpdate, domTree);
-  newLatchBB->setName(latchBB->getName()+".wfv.latch");
+  // Split block with the induction variable increment (either the latch or the header).
+  if (indVarUpdateInLatch)
+  {
+    // Split latch directly before induction variable increment.
+    BasicBlock* newLatchBB = SplitBlock(latchBB, indVarUpdate, domTree);
+    newLatchBB->setName(latchBB->getName()+".wfv.latch");
+    // latchBB is now the part of the latch that is only the body.
+  }
+  else
+  {
+    assert (headerBB->getFirstNonPHI() == indVarUpdate &&
+            "expected induction variable update to be the first operation in the header!");
+    // Nothing to do, since the header is not included in the body anyway,
+    // and the latch does not have to be split up.
+  }
 
-  // latchBB is now the part of the latch that is only the body.
   loopBody.push_back(latchBB);
 
   CodeExtractor extractor(loopBody, domTree, false);
@@ -355,6 +369,8 @@ extractLoopBody(Loop*                        loop,
   indVarUpdate->moveBefore(newIndVarUpdate);
   indVarUpdate->replaceAllUsesWith(newIndVarUpdate);
   newIndVarUpdate->replaceUsesOfWith(newIndVarUpdate, indVarUpdate);
+
+  indVarUpdate = newIndVarUpdate;
 
   return bodyFn;
 }
@@ -1259,8 +1275,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
           "expected induction variable update value to be an instruction!");
   Instruction* indVarUpdate = cast<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB));
-  assert (indVarUpdate->getParent() == latchBB &&
-          "expected induction variable update operation in latch block!");
+  assert ((indVarUpdate->getParent() == latchBB || indVarUpdate->getParent() == headerBB) &&
+          "expected induction variable update operation in latch or header block!");
 
   // TODO: These should return gracefully.
   // TODO: These should eventually be replaced by generation of fixup code.
@@ -1660,6 +1676,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     errs() << "ERROR: Loop body extraction failed!\n";
     return false;
   }
+  assert (indVarUpdate);
 
   // Update preheaderBB and latchBB.
   preheaderBB = loop->getLoopPreheader();
@@ -1929,7 +1946,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     Type*  type  = loopBodyFnType->getParamType(i);
     assert (type == argOp->getType());
 
-    if (argOp == indVarPhi)
+    if (argOp == indVarPhi || argOp == indVarUpdate)
     {
       newParamTypes.push_back(type);
       // Map the induction variable to its new argument.
