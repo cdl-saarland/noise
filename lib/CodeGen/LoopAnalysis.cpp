@@ -447,8 +447,9 @@ LoopAnalyzer::gatherConditions(BasicBlock*                  block,
         else if (SwitchInst* swI = dyn_cast<SwitchInst>(terminator))
         {
             otherOperands.push_back(swI->getCondition());
-            assert (swI->findCaseDest(succBB));
-            otherOperands.push_back(swI->findCaseDest(succBB));
+            ConstantInt* caseDest = swI->findCaseDest(succBB);
+            // The case value can be null if the successor is the default case or not unique.
+            if (caseDest) otherOperands.push_back(caseDest);
         }
         else
         {
