@@ -23,11 +23,11 @@
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/TargetInfo.h"
-#include "clang/Basic/NoiseAttr.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Scope.h"
+#include "NoiseAttr.h"
 #include "llvm/ADT/StringExtras.h"
 using namespace clang;
 using namespace sema;
@@ -1745,7 +1745,7 @@ static void handleNoReturnAttr(Sema &S, Decl *D, const AttributeList &attr) {
 }
 
 static void handleNoiseAttr(Sema &S, Decl *D, const AttributeList &attr) {
-  if(Attr* a = noise::CreateNoiseAttr(S, attr))
+  if(Attr* a = CreateNoiseAttr(S, attr))
     D->addAttr(a);
 }
 

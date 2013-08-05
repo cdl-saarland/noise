@@ -14,7 +14,9 @@
 #ifndef CLANG_CODEGEN_NOISEATTRPARSER_H
 #define CLANG_CODEGEN_NOISEATTRPARSER_H
 
-#include "clang/Basic/NoiseAttr.h"
+namespace clang {
+    class NoiseAttr;
+}
 
 namespace llvm {
 

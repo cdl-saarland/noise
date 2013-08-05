@@ -14,7 +14,6 @@
 #ifndef CLANG_CODEGEN_CODEGENNOISE_H
 #define CLANG_CODEGEN_CODEGENNOISE_H
 
-#include "clang/Basic/NoiseAttr.h"
 #include "NoiseAttrParser.h"
 #include "CodeGenFunction.h"
 #include "CGBuilder.h"

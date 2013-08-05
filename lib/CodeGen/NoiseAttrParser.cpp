@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "NoiseAttrParser.h"
+#include "clang/AST/Attr.h" // NoiseAttr
 #include "NoiseOptimization.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Constants.h"

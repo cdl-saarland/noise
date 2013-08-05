@@ -14,6 +14,7 @@ add_clang_library(clangSema
   IdentifierResolver.cpp
   JumpDiagnostics.cpp
   MultiplexExternalSemaSource.cpp
+  NoiseAttr.cpp
   Scope.cpp
   ScopeInfo.cpp
   Sema.cpp

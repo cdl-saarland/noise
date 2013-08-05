@@ -16,10 +16,10 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/Lexer.h"
-#include "clang/Basic/NoiseAttr.h"
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/ScopeInfo.h"
+#include "NoiseAttr.h"
 #include "llvm/ADT/StringExtras.h"
 
 using namespace clang;
@@ -57,7 +57,7 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const AttributeList &A,
   case AttributeList::AT_FallThrough:
     return handleFallThroughAttr(S, St, A, Range);
   case AttributeList::AT_Noise:
-    return noise::CreateNoiseAttr(S, A);
+    return CreateNoiseAttr(S, A);
   default:
     // if we're here, then we parsed a known attribute, but didn't recognize
     // it as a statement attribute => it is declaration attribute

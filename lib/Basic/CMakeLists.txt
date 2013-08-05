@@ -13,7 +13,6 @@ add_clang_library(clangBasic
   ObjCRuntime.cpp
   OpenMPKinds.cpp
   OperatorPrecedence.cpp
-  NoiseAttr.cpp
   SourceLocation.cpp
   SourceManager.cpp
   TargetInfo.cpp
