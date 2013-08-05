@@ -69,7 +69,7 @@ MDNode* NoiseAttrParser::Parse(const clang::NoiseAttr& attr)
 
         while(str[nextIndex] != ')' && nextIndex < e)
         {
-          nextIndex = std::min(str.find(',', ++nextIndex), str.find(')', nextIndex));
+          nextIndex = std::min(str.find(',', nextIndex + 1), str.find(')', nextIndex + 1));
           if(nextIndex == StringRef::npos)
             break;
 
