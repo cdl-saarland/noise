@@ -714,6 +714,7 @@ deleteTree(Instruction* inst, SetVector<Instruction*>& deleteVec)
   deleteVec.insert(inst);
 }
 
+#if 0
 bool
 isInfluencingControlFlow(Instruction* inst)
 {
@@ -729,6 +730,7 @@ isInfluencingControlFlow(Instruction* inst)
       isa<SwitchInst>(inst) ||
       isa<ReturnInst>(inst);
 }
+#endif
 
 void
 replaceUpdateOpUses(Value*              mappedOp,
@@ -1307,7 +1309,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
   // Print info & check sanity.
   assert (redVars.empty() || noiseFn == (*redVars.begin())->mPhi->getParent()->getParent());
-  DEBUG_NOISE_WFV( DEBUG_NOISE_WFV( outs() << "\nfunction:" << *noiseFn << "\n"; ); );
+  DEBUG_NOISE_WFV( outs() << "\nfunction:" << *noiseFn << "\n"; );
   for (RedVarVecType::iterator it=redVars.begin(), E=redVars.end(); it!=E; ++it)
   {
     ReductionVariable& redVar = **it;
