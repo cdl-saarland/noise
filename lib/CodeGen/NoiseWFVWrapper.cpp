@@ -1292,7 +1292,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
           "vectorization of loop with induction variable update operation that is no simple increment not supported!");
 
   // Do some sanity checks to test assumptions about our construction.
-  assert (preheaderBB == &noiseFn->getEntryBlock());
+  assert (preheaderBB == &noiseFn->getEntryBlock() ||
+          preheaderBB == noiseFn->getEntryBlock().getTerminator()->getSuccessor(0));
   assert (preheaderBB->getTerminator()->getNumSuccessors() == 1);
   assert (headerBB == preheaderBB->getTerminator()->getSuccessor(0));
   assert (isa<PHINode>(headerBB->begin()));

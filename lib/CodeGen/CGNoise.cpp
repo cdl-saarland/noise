@@ -115,9 +115,9 @@ void NoiseCodeGenerator::EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S)
       assert( false && "trying to noise not supported stmt" );
   }
 
-  Builder.CreateBr(exit);
+  llvm::BranchInst* exitInstr = Builder.CreateBr(exit);
   Generator->EmitBlock(exit, false);
-  Builder.CreateBr(succ);
+  llvm::BranchInst* succInstr = Builder.CreateBr(succ);
   Generator->EmitBlock(succ, false);
 
   assert( &entry->back() == entryInstr );
@@ -125,6 +125,10 @@ void NoiseCodeGenerator::EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S)
   llvm::Value* params[] = { entry, exit, NoiseDesc };
   entryInstr->setMetadata("noise_compound_stmt",
                           llvm::MDNode::get(Context, llvm::ArrayRef<llvm::Value*>(params)));
+
+  // Also mark exit and succ blocks so that we can delete them again later.
+  exitInstr->setMetadata("noise_tmp_block", llvm::MDNode::get(Context, 0));
+  succInstr->setMetadata("noise_tmp_block", llvm::MDNode::get(Context, 0));
 }
 
 }

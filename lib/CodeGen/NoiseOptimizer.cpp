@@ -868,6 +868,41 @@ void NoiseOptimizer::PerformOptimization()
 
     assert (!nfi->mReinline || !nfi->mMovedFn);
 
+    // Remove exactly the blocks and instructions that we introduced in CGNoise.cpp.
+    // NOTE: Using CFG simplification instead makes problems with WFV (or any other loop optimization).
+    //       Bug #1377 shows an example where this results in an if-statement at
+    //       the end of the loop body getting converted into 2 back edges. The
+    //       following loop simplification then creates two nested loops, resulting
+    //       in WFV not being able to find a canonical induction variable anymore.
+    SmallVector<BasicBlock*, 2> eraseVec;
+    for (Function::iterator BB=noiseFn->begin(), BBE=noiseFn->end(); BB!=BBE; ++BB)
+    {
+      TerminatorInst* ti = BB->getTerminator();
+      if (!getCompoundStmtNoiseMD(*BB) && !ti->getMetadata("noise_tmp_block")) continue;
+      if (BB->getInstList().size() != 1) continue;
+      assert (ti->getNumSuccessors() == 1 && "expected noise tmp block to have exactly one successor!");
+
+      for (pred_iterator P=pred_begin(BB), PE=pred_end(BB); P!=PE; ++P)
+      {
+        BasicBlock* predBB = *P;
+        BasicBlock* succBB = ti->getSuccessor(0);
+        TerminatorInst* predTI = predBB->getTerminator();
+
+        for (unsigned i=0, e=predTI->getNumSuccessors(); i<e; ++i)
+        {
+          if (predTI->getSuccessor(i) != BB) continue;
+          predTI->setSuccessor(i, succBB);
+        }
+      }
+
+      eraseVec.push_back(BB);
+    }
+    for (SmallVector<BasicBlock*, 2>::iterator it=eraseVec.begin(),
+         E=eraseVec.end(); it!=E; ++it)
+    {
+      (*it)->eraseFromParent();
+    }
+
     // Display all available passes.
     //NoisePassListener list;
     //Registry->enumerateWith(&list);
@@ -877,12 +912,6 @@ void NoiseOptimizer::PerformOptimization()
     // Run requested noise passes.
     FunctionPassManager NoisePasses(Mod);
     NoisePasses.add(new DataLayout(Mod));
-
-    // Run CFG simplification upfront to remove the blocks we introduced
-    // ourselves.
-    // TODO: Replace this by some simple code that only removes *exactly* the
-    //       blocks and instructions we introduced so the user is not confused.
-    NoisePasses.add(createCFGSimplificationPass());
 
     for(size_t i = 0, e = nfi->GetNumOptimizations(); i < e; ++i) {
       NoiseOptimization* noiseOpt = nfi->GetOptimization(i);
