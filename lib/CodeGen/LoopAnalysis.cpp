@@ -52,11 +52,15 @@
 #include "llvm/IR/IntrinsicInst.h"
 
 #include <iostream>
+#include <sstream>
 
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 
 #include "llvm/ADT/MapVector.h"
+
+//#define DEBUG_LA_XX(x) x
+#define DEBUG_LA_XX(x) (void)0
 
 using namespace llvm;
 
@@ -117,6 +121,7 @@ struct LoopAnalyzer : public FunctionPass {
   ScalarEvolution* mSCEV;
   DataLayout*      mDataLayout;
   raw_ostream*     mOut;
+  const bool       mInstrument;
 
   TargetLibraryInfo* mTLI;
   RuntimePointerCheck mPtrRtCheck;
@@ -133,7 +138,7 @@ struct LoopAnalyzer : public FunctionPass {
   void printLoopType(const LoopType lt, const Loop& loop, raw_ostream& out) const;
   std::string loopTypeToString(const LoopType lt) const;
 
-  LoopAnalyzer(raw_ostream* out=0);
+  LoopAnalyzer(raw_ostream* out=0, const bool instrument=false);
   virtual ~LoopAnalyzer();
   virtual bool runOnFunction(Function &F);
   virtual void getAnalysisUsage(AnalysisUsage &AU) const;
@@ -234,11 +239,12 @@ struct LoopAnalyzer : public FunctionPass {
 
   bool isCAUpdateOp(const unsigned opcode);
 
-  bool canVectorizeMemory(Loop* TheLoop);
+  bool canVectorizeMemory(Loop* TheLoop, bool& hasUnknownCalls);
 
   LoopType analyzeLoop(Loop*        loop,
                        Loop*        parentLoop,
                        raw_ostream& out);
+  void instrumentLoop(Loop* loop, const std::string& infoLine);
 };
 
 char LoopAnalyzer::ID = 0;
@@ -261,8 +267,8 @@ INITIALIZE_PASS_END(LoopAnalyzer, "analyze-loops",
 namespace llvm {
 namespace loopanalysis {
 
-LoopAnalysis::LoopAnalysis(Module* M) : Mod(CloneModule(M)) {}
-LoopAnalysis::~LoopAnalysis() { delete Mod; }
+LoopAnalysis::LoopAnalysis(Module* M, const bool instrument) : Mod(instrument ? M : CloneModule(M)), Instrument(instrument) {}
+LoopAnalysis::~LoopAnalysis() { if (!Instrument) delete Mod; }
 
 void LoopAnalysis::Analyze()
 {
@@ -289,7 +295,7 @@ void LoopAnalysis::Analyze()
   PM.add(createLCSSAPass());
   PM.add(createScalarEvolutionAliasAnalysisPass());
   // Now analyze the code.
-  PM.add(new LoopAnalyzer(&out));
+  PM.add(new LoopAnalyzer(&out, Instrument));
   PM.run(*Mod);
 
   return;
@@ -351,7 +357,7 @@ LoopAnalyzer::loopTypeToString(const LoopType lt) const
   }
 }
 
-LoopAnalyzer::LoopAnalyzer(raw_ostream* out) : FunctionPass(ID), mOut(out)
+LoopAnalyzer::LoopAnalyzer(raw_ostream* out, const bool instrument) : FunctionPass(ID), mOut(out), mInstrument(instrument)
 {
   initializeLoopAnalyzerPass(*PassRegistry::getPassRegistry());
 }
@@ -919,7 +925,7 @@ bool AccessAnalysis::canCheckPtrAtRT(
 
             RtCheck.insert(SE, TheLoop, Ptr, IsWrite, DepId);
 
-            //DEBUG(dbgs() << "LV: Found a runtime check ptr:" << *Ptr <<"\n");
+            DEBUG_LA_XX(errs() << "LV: Found a runtime check ptr:" << *Ptr <<"\n");
         } else {
             CanDoRT = false;
         }
@@ -998,9 +1004,9 @@ void AccessAnalysis::processMemAccesses(bool UseDeferred) {
                     (!IsWrite && (!AreAllWritesIdentified ||
                                   !isa<Argument>(UnderlyingObj)) &&
                      !isIdentifiedObject(UnderlyingObj))) {
-                //DEBUG(dbgs() << "LV: Found an unidentified " <<
-                        //(IsWrite ?  "write" : "read" ) << " ptr:" << *UnderlyingObj <<
-                        //"\n");
+                DEBUG_LA_XX(errs() << "LV: Found an unidentified " <<
+                        (IsWrite ?  "write" : "read" ) << " ptr:" << *UnderlyingObj <<
+                        "\n");
                 IsRTCheckNeeded = (IsRTCheckNeeded ||
                         !isIdentifiedObject(UnderlyingObj) ||
                         !AreAllReadsIdentified);
@@ -1127,23 +1133,23 @@ static int isStridedPtr(ScalarEvolution *SE, DataLayout *DL, Value *Ptr,
     // Make sure that the pointer does not point to aggregate types.
     const PointerType *PtrTy = cast<PointerType>(Ty);
     if (PtrTy->getElementType()->isAggregateType()) {
-        //DEBUG(dbgs() << "LV: Bad stride - Not a pointer to a scalar type" << *Ptr <<
-                //"\n");
+        DEBUG_LA_XX(errs() << "LV: Bad stride - Not a pointer to a scalar type" << *Ptr <<
+                "\n");
         return 0;
     }
 
     const SCEV *PtrScev = SE->getSCEV(Ptr);
     const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(PtrScev);
     if (!AR) {
-        //DEBUG(dbgs() << "LV: Bad stride - Not an AddRecExpr pointer "
-                //<< *Ptr << " SCEV: " << *PtrScev << "\n");
+        DEBUG_LA_XX(errs() << "LV: Bad stride - Not an AddRecExpr pointer "
+                << *Ptr << " SCEV: " << *PtrScev << "\n");
         return 0;
     }
 
     // The accesss function must stride over the innermost loop.
     if (Lp != AR->getLoop()) {
-        //DEBUG(dbgs() << "LV: Bad stride - Not striding over innermost loop " <<
-                //*Ptr << " SCEV: " << *PtrScev << "\n");
+        DEBUG_LA_XX(errs() << "LV: Bad stride - Not striding over innermost loop " <<
+                *Ptr << " SCEV: " << *PtrScev << "\n");
     }
 
     // The address calculation must not wrap. Otherwise, a dependence could be
@@ -1157,8 +1163,8 @@ static int isStridedPtr(ScalarEvolution *SE, DataLayout *DL, Value *Ptr,
     bool IsNoWrapAddRec = AR->getNoWrapFlags(SCEV::NoWrapMask);
     bool IsInAddressSpaceZero = PtrTy->getAddressSpace() == 0;
     if (!IsNoWrapAddRec && !IsInBoundsGEP && !IsInAddressSpaceZero) {
-        //DEBUG(dbgs() << "LV: Bad stride - Pointer may wrap in the address space "
-                //<< *Ptr << " SCEV: " << *PtrScev << "\n");
+        DEBUG_LA_XX(errs() << "LV: Bad stride - Pointer may wrap in the address space "
+                << *Ptr << " SCEV: " << *PtrScev << "\n");
         return 0;
     }
 
@@ -1168,8 +1174,8 @@ static int isStridedPtr(ScalarEvolution *SE, DataLayout *DL, Value *Ptr,
     // Calculate the pointer stride and check if it is consecutive.
     const SCEVConstant *C = dyn_cast<SCEVConstant>(Step);
     if (!C) {
-        //DEBUG(dbgs() << "LV: Bad stride - Not a constant strided " << *Ptr <<
-                //" SCEV: " << *PtrScev << "\n");
+        DEBUG_LA_XX(errs() << "LV: Bad stride - Not a constant strided " << *Ptr <<
+                " SCEV: " << *PtrScev << "\n");
         return 0;
     }
 
@@ -1225,8 +1231,8 @@ bool MemoryDepChecker::couldPreventStoreLoadForward(unsigned Distance,
     }
 
     if (MaxVFWithoutSLForwardIssues< 2*TypeByteSize) {
-        //DEBUG(dbgs() << "LV: Distance " << Distance <<
-                //" that could cause a store-load forwarding conflict\n");
+        DEBUG_LA_XX(errs() << "LV: Distance " << Distance <<
+                " that could cause a store-load forwarding conflict\n");
         return true;
     }
 
@@ -1272,22 +1278,22 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
 
     const SCEV *Dist = mSCEV->getMinusSCEV(Sink, Src);
 
-    //DEBUG(dbgs() << "LV: Src Scev: " << *Src << "Sink Scev: " << *Sink
-            //<< "(Induction step: " << StrideAPtr <<  ")\n");
-    //DEBUG(dbgs() << "LV: Distance for " << *InstMap[AIdx] << " to "
-            //<< *InstMap[BIdx] << ": " << *Dist << "\n");
+    DEBUG_LA_XX(errs() << "LV: Src Scev: " << *Src << "Sink Scev: " << *Sink
+            << "(Induction step: " << StrideAPtr <<  ")\n");
+    DEBUG_LA_XX(errs() << "LV: Distance for " << *InstMap[AIdx] << " to "
+            << *InstMap[BIdx] << ": " << *Dist << "\n");
 
     // Need consecutive accesses. We don't want to vectorize
     // "A[B[i]] += ..." and similar code or pointer arithmetic that could wrap in
     // the address space.
     if (!StrideAPtr || !StrideBPtr || StrideAPtr != StrideBPtr){
-        //DEBUG(dbgs() << "Non-consecutive pointer access\n");
+        DEBUG_LA_XX(errs() << "Non-consecutive pointer access\n");
         return true;
     }
 
     const SCEVConstant *C = dyn_cast<SCEVConstant>(Dist);
     if (!C) {
-        //DEBUG(dbgs() << "LV: Dependence because of non constant distance\n");
+        DEBUG_LA_XX(errs() << "LV: Dependence because of non constant distance\n");
         return true;
     }
 
@@ -1304,7 +1310,7 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
                  ATy != BTy))
             return true;
 
-        //DEBUG(dbgs() << "LV: Dependence is negative: NoDep\n");
+        DEBUG_LA_XX(errs() << "LV: Dependence is negative: NoDep\n");
         return false;
     }
 
@@ -1313,7 +1319,7 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
     if (Val == 0) {
         if (ATy == BTy)
             return false;
-        //DEBUG(dbgs() << "LV: Zero dependence difference but different types");
+        DEBUG_LA_XX(errs() << "LV: Zero dependence difference but different types");
         return true;
     }
 
@@ -1321,8 +1327,8 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
 
     // Positive distance bigger than max vectorization factor.
     if (ATy != BTy) {
-        //DEBUG(dbgs() <<
-                //"LV: ReadWrite-Write positive dependency with different types");
+        DEBUG_LA_XX(errs() <<
+                "LV: ReadWrite-Write positive dependency with different types");
         return false;
     }
 
@@ -1333,8 +1339,8 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
     // bigger than the currrent maximum size.
     if (Distance < 2*TypeByteSize ||
             2*TypeByteSize > MaxSafeDepDistBytes) {
-        //DEBUG(dbgs() << "LV: Failure because of Positive distance "
-                //<< Val.getSExtValue() << "\n");
+        DEBUG_LA_XX(errs() << "LV: Failure because of Positive distance "
+                << Val.getSExtValue() << "\n");
         return true;
     }
 
@@ -1346,8 +1352,8 @@ bool MemoryDepChecker::isDependent(const MemAccessInfo &A, unsigned AIdx,
             couldPreventStoreLoadForward(Distance, TypeByteSize))
         return true;
 
-    //DEBUG(dbgs() << "LV: Positive distance " << Val.getSExtValue() <<
-            //" with max VF=" << MaxSafeDepDistBytes/TypeByteSize << "\n");
+    DEBUG_LA_XX(errs() << "LV: Positive distance " << Val.getSExtValue() <<
+            " with max VF=" << MaxSafeDepDistBytes/TypeByteSize << "\n");
 
     return false;
 }
@@ -1497,7 +1503,7 @@ getIntrinsicIDForCall(CallInst *CI, const TargetLibraryInfo *TLI) {
 
 // Adopted from LoopVectorize.cpp (2013-08-06)
 bool
-LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
+LoopAnalyzer::canVectorizeMemory(Loop* TheLoop, bool& hasUnknownCall)
 {
     assert (TheLoop);
     typedef SmallVector<Value*, 16> ValueVector;
@@ -1535,13 +1541,16 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
                 // vectorize a loop if it contains known function calls that don't set
                 // the flag. Therefore, it is safe to ignore this read from memory.
                 CallInst *Call = dyn_cast<CallInst>(it);
-                if (Call && getIntrinsicIDForCall(Call, mTLI))
+                if (Call) {
+                    if (!getIntrinsicIDForCall(Call, mTLI)) hasUnknownCall = true;
                     continue;
+                }
 
                 LoadInst *Ld = dyn_cast<LoadInst>(it);
-                if (!Ld) return false;
+                if (!Ld)
+                    return false;
                 if (!Ld->isSimple() && !IsAnnotatedParallel) {
-                    //DEBUG(dbgs() << "LV: Found a non-simple load.\n");
+                    DEBUG_LA_XX(errs() << "LV: Found a non-simple load.\n");
                     return false;
                 }
                 Loads.push_back(Ld);
@@ -1552,9 +1561,10 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
             // Save 'store' instructions. Abort if other instructions write to memory.
             if (it->mayWriteToMemory()) {
                 StoreInst *St = dyn_cast<StoreInst>(it);
-                if (!St) return false;
+                if (!St)
+                    return false;
                 if (!St->isSimple() && !IsAnnotatedParallel) {
-                    //DEBUG(dbgs() << "LV: Found a non-simple store.\n");
+                    DEBUG_LA_XX(errs() << "LV: Found a non-simple store.\n");
                     return false;
                 }
                 Stores.push_back(St);
@@ -1569,7 +1579,7 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
     // Check if we see any stores. If there are no stores, then we don't
     // care if the pointers are *restrict*.
     if (!Stores.size()) {
-        //DEBUG(dbgs() << "LV: Found a read-only loop!\n");
+        DEBUG_LA_XX(errs() << "LV: Found a read-only loop!\n");
         return true;
     }
 
@@ -1589,9 +1599,10 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
         Value* Ptr = ST->getPointerOperand();
 
         //if (isUniform(Ptr)) {
-            ////DEBUG(dbgs() << "LV: We don't allow storing to uniform addresses\n");
-            //return false;
-        //}
+        if (mSCEV->isLoopInvariant(mSCEV->getSCEV(Ptr), TheLoop)) {
+            DEBUG_LA_XX(errs() << "LV: We don't allow storing to uniform addresses\n");
+            return false;
+        }
 
         // If we did *not* see this pointer before, insert it to  the read-write
         // list. At this phase it is only a 'write' list.
@@ -1602,9 +1613,9 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
     }
 
     if (IsAnnotatedParallel) {
-        //DEBUG(dbgs()
-                //<< "LV: A loop annotated parallel, ignore memory dependency "
-                //<< "checks.\n");
+        DEBUG_LA_XX(errs()
+                << "LV: A loop annotated parallel, ignore memory dependency "
+                << "checks.\n");
         return true;
     }
 
@@ -1631,7 +1642,7 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
     // If we write (or read-write) to a single destination and there are no
     // other reads in this loop then is it safe to vectorize.
     if (NumReadWrites == 1 && NumReads == 0) {
-        //DEBUG(dbgs() << "LV: Found a write-only loop!\n");
+        DEBUG_LA_XX(errs() << "LV: Found a write-only loop!\n");
         return true;
     }
 
@@ -1648,8 +1659,8 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
         CanDoRT = Accesses.canCheckPtrAtRT(mPtrRtCheck, NumComparisons, mSCEV, TheLoop);
 
 
-    //DEBUG(dbgs() << "LV: We need to do " << NumComparisons <<
-            //" pointer comparisons.\n");
+    DEBUG_LA_XX(errs() << "LV: We need to do " << NumComparisons <<
+            " pointer comparisons.\n");
 
     // If we only have one set of dependences to check pointers among we don't
     // need a runtime check.
@@ -1665,12 +1676,12 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
     }
 
     if (CanDoRT) {
-        //DEBUG(dbgs() << "LV: We can perform a memory runtime check if needed.\n");
+        DEBUG_LA_XX(errs() << "LV: We can perform a memory runtime check if needed.\n");
     }
 
     if (NeedRTCheck && !CanDoRT) {
-        //DEBUG(dbgs() << "LV: We can't vectorize because we can't find " <<
-                //"the array bounds.\n");
+        DEBUG_LA_XX(errs() << "LV: We can't vectorize because we can't find " <<
+                "the array bounds.\n");
         mPtrRtCheck.reset();
         return false;
     }
@@ -1680,14 +1691,14 @@ LoopAnalyzer::canVectorizeMemory(Loop* TheLoop)
     bool CanVecMem = true;
     unsigned MaxSafeDepDistBytes = -1U;
     if (Accesses.isDependencyCheckNeeded()) {
-        //DEBUG(dbgs() << "LV: Checking memory dependencies\n");
+        DEBUG_LA_XX(errs() << "LV: Checking memory dependencies\n");
         CanVecMem = DepChecker.areDepsSafe(DependentAccesses,
                 Accesses.getDependenciesToCheck());
         MaxSafeDepDistBytes = DepChecker.getMaxSafeDepDistBytes();
     }
 
-    //DEBUG(dbgs() << "LV: We "<< (NeedRTCheck ? "" : "don't") <<
-            //" need a runtime memory check.\n");
+    DEBUG_LA_XX(errs() << "LV: We "<< (NeedRTCheck ? "" : "don't") <<
+            " need a runtime memory check.\n");
 
     return CanVecMem;
 }
@@ -1851,9 +1862,10 @@ LoopAnalyzer::analyzeLoop(Loop*        loop,
     if (!isVectorizable) return NOT_VECTORIZABLE;
 
     // For this analysis, take memory dependencies into account to prevent false positives.
-    if (!canVectorizeMemory(loop))
+    bool hasUnknownCall = false;
+    if (!canVectorizeMemory(loop, hasUnknownCall))
     {
-        out << "  has non-vectorizable memory access operations!\n";
+        out << "  has at least one non-vectorizable memory access operation!\n";
         return NOT_VECTORIZABLE;
     }
 
@@ -1991,6 +2003,11 @@ LoopAnalyzer::analyzeLoop(Loop*        loop,
     // Defaults are "trivial" (no loop-carried dependencies), or "common" (simple reductions).
     LoopType loopType = redVars.empty() ? VECTORIZABLE_TRIVIAL : VECTORIZABLE_COMMON;
 
+    if (hasUnknownCall)
+    {
+        out << "  has at least one unknown call!\n";
+    }
+
     if (rMultiOpSame)
     {
         out << "  has at least one reduction with multiple update operations of same type!\n";
@@ -2015,18 +2032,622 @@ LoopAnalyzer::analyzeLoop(Loop*        loop,
         loopType = VECTORIZABLE_NOISE;
     }
 
-    // Dump a single line with all information.
-    out << "  summary: "
+    // Create a single line with all information.
+    std::stringstream sstr;
+    sstr << "  summary: "
         << loopTypeToString(loopType)
+        << (hasUnknownCall ? " UNKNOWN_CALL" : "")
         << (rMultiOpSame ? " MULTI_OP_SAME" : "")
         << (rMultiOpNonSame ? " MULTI_OP_NON_SAME" : "")
         << (rNonCAUpdateOp ? " NON_CA_UPDATE" : "")
         << (rDependsOnControlFlow ? " CF_DEP" : "")
         << " IDENTIFIER=" << preheaderBB->getParent()->getParent()->getModuleIdentifier()
-        << "#" << preheaderBB->getParent()->getName()
-        << "\n";
+        << "#" << preheaderBB->getParent()->getName().str();
+
+    const std::string infoLine = sstr.str();
+
+    // Dump line to loop_analysis.txt.
+    out << infoLine << "\n";
+
+    // Instrument the loop to measure its runtime to identify those loops
+    // that are actually interesting for vectorization.
+    if (mInstrument && loopType == VECTORIZABLE_NOISE)
+    {
+        instrumentLoop(loop, infoLine);
+    }
 
     return loopType;
+}
+
+void
+LoopAnalyzer::instrumentLoop(Loop* loop, const std::string& infoLine)
+{
+    assert (loop);
+
+    BasicBlock* preheaderBB = loop->getLoopPreheader();
+    BasicBlock* exitBB      = loop->getExitBlock();
+
+    Module* mod = preheaderBB->getParent()->getParent();
+    LLVMContext& context = mod->getContext();
+
+    // Type Definitions
+    ArrayType* i8x30arrTy = ArrayType::get(IntegerType::get(context, 8), 30);
+    ArrayType* i8x2arrTy = ArrayType::get(IntegerType::get(context, 8), 2);
+    PointerType* i8PtrTy = PointerType::get(IntegerType::get(context, 8), 0);
+
+    StructType* timevalStructTy = mod->getTypeByName("struct.timeval");
+    if (!timevalStructTy)
+    {
+        timevalStructTy = StructType::create(context, "struct.timeval");
+    }
+    std::vector<Type*> elems;
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    if (timevalStructTy->isOpaque())
+    {
+        timevalStructTy->setBody(elems, /*isPacked=*/false);
+    }
+
+    StructType* rusageStructTy = mod->getTypeByName("struct.rusage");
+    if (!rusageStructTy)
+    {
+        rusageStructTy = StructType::create(context, "struct.rusage");
+    }
+
+    elems.clear();
+    elems.push_back(timevalStructTy);
+    elems.push_back(timevalStructTy);
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    if (rusageStructTy->isOpaque())
+    {
+        rusageStructTy->setBody(elems, /*isPacked=*/false);
+    }
+
+    StructType* iofileStructTy = mod->getTypeByName("struct._IO_FILE");
+    if (!iofileStructTy) {
+        iofileStructTy = StructType::create(context, "struct._IO_FILE");
+    }
+    std::vector<Type*>StructTy_struct__IO_FILE_fields;
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 32));
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+
+    StructType* iomarkerStructTy = mod->getTypeByName("struct._IO_marker");
+    if (!iomarkerStructTy)
+    {
+        iomarkerStructTy = StructType::create(context, "struct._IO_marker");
+    }
+    elems.clear();
+    PointerType* iomarkerStructPtrTy = PointerType::get(iomarkerStructTy, 0);
+
+    elems.push_back(iomarkerStructPtrTy);
+    PointerType* iofileStructPtrTy = PointerType::get(iofileStructTy, 0);
+
+    elems.push_back(iofileStructPtrTy);
+    elems.push_back(IntegerType::get(context, 32));
+    if (iomarkerStructTy->isOpaque()) {
+        iomarkerStructTy->setBody(elems, /*isPacked=*/false);
+    }
+
+    StructTy_struct__IO_FILE_fields.push_back(iomarkerStructPtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(iofileStructPtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 32));
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 32));
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 64));
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 16));
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 8));
+
+    StructTy_struct__IO_FILE_fields.push_back(ArrayType::get(IntegerType::get(context, 8), 1));
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 64));
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(i8PtrTy);
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 64));
+    StructTy_struct__IO_FILE_fields.push_back(IntegerType::get(context, 32));
+
+    StructTy_struct__IO_FILE_fields.push_back(ArrayType::get(IntegerType::get(context, 8), 20));
+    if (iofileStructTy->isOpaque()) {
+        iofileStructTy->setBody(StructTy_struct__IO_FILE_fields, /*isPacked=*/false);
+    }
+
+    std::vector<Type*> params;
+    params.push_back(IntegerType::get(context, 32));
+    params.push_back(PointerType::get(rusageStructTy, 0));
+    FunctionType* getrusageFuncTy = FunctionType::get(
+            /*Result=*/IntegerType::get(context, 32),
+            /*Params=*/params,
+            /*isVarArg=*/false);
+
+    params.clear();
+    params.push_back(i8PtrTy);
+    params.push_back(i8PtrTy);
+    FunctionType* fopenFnTy = FunctionType::get(
+            /*Result=*/iofileStructPtrTy,
+            /*Params=*/params,
+            /*isVarArg=*/false);
+
+    params.clear();
+    params.push_back(iofileStructPtrTy);
+    params.push_back(i8PtrTy);
+    FunctionType* fprintfFnTy = FunctionType::get(
+            /*Result=*/IntegerType::get(context, 32),
+            /*Params=*/params,
+            /*isVarArg=*/true);
+
+    params.clear();
+    params.push_back(iofileStructPtrTy);
+    FunctionType* fcloseFnTy = FunctionType::get(
+            /*Result=*/IntegerType::get(context, 32),
+            /*Params=*/params,
+            /*isVarArg=*/false);
+
+
+    // Function Declarations
+
+    Function* func_getrusage = mod->getFunction("getrusage");
+    if (!func_getrusage) {
+        func_getrusage = Function::Create(
+                /*Type=*/getrusageFuncTy,
+                /*Linkage=*/GlobalValue::ExternalLinkage,
+                /*Name=*/"getrusage", mod); // (external, no body)
+        func_getrusage->setCallingConv(CallingConv::C);
+    }
+    AttributeSet nounwindAttrSet;
+    {
+        SmallVector<AttributeSet, 4> Attrs;
+        AttributeSet PAS;
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoUnwind);
+            PAS = AttributeSet::get(context, ~0U, B);
+        }
+
+        Attrs.push_back(PAS);
+        nounwindAttrSet = AttributeSet::get(context, Attrs);
+
+    }
+    func_getrusage->setAttributes(nounwindAttrSet);
+
+    Function* func_fopen = mod->getFunction("fopen");
+    if (!func_fopen) {
+        func_fopen = Function::Create(
+                /*Type=*/fopenFnTy,
+                /*Linkage=*/GlobalValue::ExternalLinkage,
+                /*Name=*/"fopen", mod); // (external, no body)
+        func_fopen->setCallingConv(CallingConv::C);
+    }
+    AttributeSet func_fopen_PAL;
+    {
+        SmallVector<AttributeSet, 4> Attrs;
+        AttributeSet PAS;
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoAlias);
+            PAS = AttributeSet::get(context, 0U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoCapture);
+            PAS = AttributeSet::get(context, 1U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoCapture);
+            PAS = AttributeSet::get(context, 2U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoUnwind);
+            PAS = AttributeSet::get(context, ~0U, B);
+        }
+
+        Attrs.push_back(PAS);
+        func_fopen_PAL = AttributeSet::get(context, Attrs);
+
+    }
+    func_fopen->setAttributes(func_fopen_PAL);
+
+    Function* func_fprintf = mod->getFunction("fprintf");
+    if (!func_fprintf) {
+        func_fprintf = Function::Create(
+                /*Type=*/fprintfFnTy,
+                /*Linkage=*/GlobalValue::ExternalLinkage,
+                /*Name=*/"fprintf", mod); // (external, no body)
+        func_fprintf->setCallingConv(CallingConv::C);
+    }
+    AttributeSet func_fprintf_PAL;
+    {
+        SmallVector<AttributeSet, 4> Attrs;
+        AttributeSet PAS;
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoCapture);
+            PAS = AttributeSet::get(context, 1U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoCapture);
+            PAS = AttributeSet::get(context, 2U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoUnwind);
+            PAS = AttributeSet::get(context, ~0U, B);
+        }
+
+        Attrs.push_back(PAS);
+        func_fprintf_PAL = AttributeSet::get(context, Attrs);
+
+    }
+    func_fprintf->setAttributes(func_fprintf_PAL);
+
+    Function* func_fclose = mod->getFunction("fclose");
+    if (!func_fclose) {
+        func_fclose = Function::Create(
+                /*Type=*/fcloseFnTy,
+                /*Linkage=*/GlobalValue::ExternalLinkage,
+                /*Name=*/"fclose", mod); // (external, no body)
+        func_fclose->setCallingConv(CallingConv::C);
+    }
+    AttributeSet func_fclose_PAL;
+    {
+        SmallVector<AttributeSet, 4> Attrs;
+        AttributeSet PAS;
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoCapture);
+            PAS = AttributeSet::get(context, 1U, B);
+        }
+
+        Attrs.push_back(PAS);
+        {
+            AttrBuilder B;
+            B.addAttribute(Attribute::NoUnwind);
+            PAS = AttributeSet::get(context, ~0U, B);
+        }
+
+        Attrs.push_back(PAS);
+        func_fclose_PAL = AttributeSet::get(context, Attrs);
+
+    }
+    func_fclose->setAttributes(func_fclose_PAL);
+
+
+    // Global Variable Declarations
+
+    GlobalVariable* fileNameStrGlobal = new GlobalVariable(/*Module=*/*mod,
+            /*Type=*/i8x30arrTy,
+            /*isConstant=*/true,
+            /*Linkage=*/GlobalValue::PrivateLinkage,
+            /*Initializer=*/0, // has initializer, specified below
+            /*Name=*/".filenameStr");
+    fileNameStrGlobal->setAlignment(1);
+
+    GlobalVariable* wStrGlobal = new GlobalVariable(/*Module=*/*mod,
+            /*Type=*/i8x2arrTy,
+            /*isConstant=*/true,
+            /*Linkage=*/GlobalValue::PrivateLinkage,
+            /*Initializer=*/0, // has initializer, specified below
+            /*Name=*/".wStr");
+    wStrGlobal->setAlignment(1);
+
+    // Constant & Global Variable Definitions
+    Constant *const_string_filename = ConstantDataArray::getString(context, "loop_performance_analysis.txt", true);
+    Constant *const_string_w = ConstantDataArray::getString(context, "a", true); // "a" = Append to file.
+    ConstantInt* const_i32_0 = ConstantInt::get(context, APInt(32, StringRef("0"), 10));
+    ConstantInt* const_i64_0 = ConstantInt::get(context, APInt(64, StringRef("0"), 10));
+    ConstantInt* const_i32_1 = ConstantInt::get(context, APInt(32, StringRef("1"), 10));
+    ConstantInt* const_i64_1000 = ConstantInt::get(context, APInt(64, StringRef("1000"), 10));
+    ConstantFP* const_double_1000 = ConstantFP::get(context, APFloat(1.000000e+03));
+    ConstantFP* const_double_0_5 = ConstantFP::get(context, APFloat(5.000000e-01));
+
+    std::vector<Constant*> constVec;
+    constVec.push_back(const_i64_0);
+    constVec.push_back(const_i64_0);
+    Constant* fileNameStr = ConstantExpr::getGetElementPtr(fileNameStrGlobal, constVec);
+    fileNameStrGlobal->setInitializer(const_string_filename);
+
+    constVec.clear();
+    constVec.push_back(const_i64_0);
+    constVec.push_back(const_i64_0);
+    Constant* wStr = ConstantExpr::getGetElementPtr(wStrGlobal, constVec);
+    wStrGlobal->setInitializer(const_string_w);
+
+
+    // Instrument the loop.
+//#define LA_USE_GETRUSAGE
+#ifdef LA_USE_GETRUSAGE
+    {
+        // Create alloca for rusage struct.
+        Instruction* allocaPos = preheaderBB->getParent()->getEntryBlock().getFirstNonPHI();
+        AllocaInst* usagePtr = new AllocaInst(rusageStructTy, "usage", allocaPos);
+        usagePtr->setAlignment(8);
+
+        // The first call to getrusage comes before the loop starts:
+        Instruction* insertBefore = preheaderBB->getTerminator();
+
+        // getrusage(RUSAGE_SELF, &usage);
+        std::vector<Value*> valueVec;
+        valueVec.push_back(const_i32_0);
+        valueVec.push_back(usagePtr);
+        CallInst* getrusageStartCall = CallInst::Create(func_getrusage, valueVec, "getrusageStart", insertBefore);
+        getrusageStartCall->setCallingConv(CallingConv::C);
+        getrusageStartCall->setTailCall(false);
+        getrusageStartCall->setAttributes(nounwindAttrSet);
+
+        // timeval start = usage.ru_utime;
+        valueVec.clear();
+        valueVec.push_back(const_i64_0);
+        valueVec.push_back(const_i32_0);
+        valueVec.push_back(const_i32_0);
+        Instruction* ptr_start4_sroa_0_0_idx = GetElementPtrInst::Create(usagePtr, valueVec, "start4.sroa.0.0.idx", insertBefore);
+        LoadInst* int64_start4_sroa_0_0_copyload = new LoadInst(ptr_start4_sroa_0_0_idx, "start4.sroa.0.0.copyload", false, insertBefore);
+        int64_start4_sroa_0_0_copyload->setAlignment(8);
+        valueVec.clear();
+        valueVec.push_back(const_i64_0);
+        valueVec.push_back(const_i32_0);
+        valueVec.push_back(const_i32_1);
+        Instruction* ptr_start4_sroa_1_8_idx17 = GetElementPtrInst::Create(usagePtr, valueVec, "start4.sroa.1.8.idx17", insertBefore);
+        LoadInst* int64_start4_sroa_1_8_copyload = new LoadInst(ptr_start4_sroa_1_8_idx17, "start4.sroa.1.8.copyload", false, insertBefore);
+        int64_start4_sroa_1_8_copyload->setAlignment(8);
+
+
+        // The second call to getrusage comes after the loop is finished:
+        insertBefore = exitBB->getFirstNonPHI();
+
+        // getrusage(RUSAGE_SELF, &usage);
+        valueVec.clear();
+        valueVec.push_back(const_i32_0);
+        valueVec.push_back(usagePtr);
+        CallInst* getrusageEndCall = CallInst::Create(func_getrusage, valueVec, "getrusageEnd", insertBefore);
+        getrusageEndCall->setCallingConv(CallingConv::C);
+        getrusageEndCall->setTailCall(false);
+        getrusageEndCall->setAttributes(nounwindAttrSet);
+
+        // timeval end = usage.ru_utime;
+        LoadInst* int64_end4_sroa_0_0_copyload = new LoadInst(ptr_start4_sroa_0_0_idx, "end4.sroa.0.0.copyload", false, insertBefore);
+        int64_end4_sroa_0_0_copyload->setAlignment(8);
+        LoadInst* int64_end4_sroa_1_8_copyload = new LoadInst(ptr_start4_sroa_1_8_idx17, "end4.sroa.1.8.copyload", false, insertBefore);
+        int64_end4_sroa_1_8_copyload->setAlignment(8);
+        // Calculate elapsed time.
+        // const long seconds  = end.tv_sec  - start.tv_sec;
+        // const long useconds = end.tv_usec - start.tv_usec;
+        // const long millisecs = ((seconds) * 1000 + useconds/1000.0) + 0.5;
+        // const double secs = (double)millisecs / 1000.0;
+        BinaryOperator* int64_sub = BinaryOperator::Create(Instruction::Sub, int64_end4_sroa_0_0_copyload, int64_start4_sroa_0_0_copyload, "sub", insertBefore);
+        BinaryOperator* int64_sub6 = BinaryOperator::Create(Instruction::Sub, int64_end4_sroa_1_8_copyload, int64_start4_sroa_1_8_copyload, "sub6", insertBefore);
+        BinaryOperator* int64_mul = BinaryOperator::Create(Instruction::Mul, int64_sub, const_i64_1000, "mul", insertBefore);
+        CastInst* double_conv = new SIToFPInst(int64_mul, Type::getDoubleTy(context), "conv", insertBefore);
+        CastInst* double_conv7 = new SIToFPInst(int64_sub6, Type::getDoubleTy(context), "conv7", insertBefore);
+        BinaryOperator* double_div = BinaryOperator::Create(Instruction::FDiv, double_conv7, const_double_1000, "div", insertBefore);
+        BinaryOperator* double_add = BinaryOperator::Create(Instruction::FAdd, double_div, double_conv, "add", insertBefore);
+        BinaryOperator* double_add8 = BinaryOperator::Create(Instruction::FAdd, double_add, const_double_0_5, "add8", insertBefore);
+        CastInst* int64_conv9 = new FPToSIInst(double_add8, IntegerType::get(context, 64), "conv9", insertBefore);
+        CastInst* double_conv10 = new SIToFPInst(int64_conv9, Type::getDoubleTy(context), "conv10", insertBefore);
+        BinaryOperator* timeInSeconds = BinaryOperator::Create(Instruction::FDiv, double_conv10, const_double_1000, "div11", insertBefore);
+
+        // Write elapsed time to file.
+
+        // FILE* file = fopen("loop_performance_analysis.txt", "w");
+        valueVec.clear();
+        valueVec.push_back(fileNameStr);
+        valueVec.push_back(wStr);
+        CallInst* fopenCall = CallInst::Create(func_fopen, valueVec, "fopen", insertBefore);
+        fopenCall->setCallingConv(CallingConv::C);
+        fopenCall->setTailCall(false);
+
+        // fprintf(file, "(infoLine) -- execution time: %f seconds\n", secs);
+        std::stringstream sstr;
+        sstr << infoLine << " -- execution time: %f seconds\n"; // \x0A instead of \n?
+        const std::string printLine = sstr.str();
+        Constant *const_string_exectime = ConstantDataArray::getString(context, printLine, true);
+        GlobalVariable* exectimeStrGlobal = new GlobalVariable(/*Module=*/*mod,
+                /*Type=*/ArrayType::get(IntegerType::get(context, 8), printLine.length()+1),
+                /*isConstant=*/true,
+                /*Linkage=*/GlobalValue::PrivateLinkage,
+                /*Initializer=*/0, // has initializer, specified below
+                /*Name=*/".exectimeStr");
+        exectimeStrGlobal->setAlignment(1);
+        exectimeStrGlobal->setInitializer(const_string_exectime);
+        constVec.clear();
+        constVec.push_back(const_i64_0);
+        constVec.push_back(const_i64_0);
+        Constant* execTimeStr = ConstantExpr::getGetElementPtr(exectimeStrGlobal, constVec);
+
+        valueVec.clear();
+        valueVec.push_back(fopenCall);
+        valueVec.push_back(execTimeStr);
+        valueVec.push_back(timeInSeconds);
+        CallInst* fprintfCall = CallInst::Create(func_fprintf, valueVec, "fprintf", insertBefore);
+        fprintfCall->setCallingConv(CallingConv::C);
+        fprintfCall->setTailCall(false);
+
+        // fclose(file);
+        CallInst* fcloseCall = CallInst::Create(func_fclose, fopenCall, "fclose", insertBefore);
+        fcloseCall->setCallingConv(CallingConv::C);
+        fcloseCall->setTailCall(false);
+    }
+#else
+    StructType* timespecStructTy = mod->getTypeByName("struct.timespec");
+    if (!timespecStructTy)
+    {
+        timespecStructTy = StructType::create(context, "struct.timespec");
+    }
+    elems.clear();
+    elems.push_back(IntegerType::get(context, 64));
+    elems.push_back(IntegerType::get(context, 64));
+    if (timespecStructTy->isOpaque())
+    {
+        timespecStructTy->setBody(elems, /*isPacked=*/false);
+    }
+
+    params.clear();
+    params.push_back(IntegerType::get(context, 32));
+    params.push_back(PointerType::get(timespecStructTy, 0));
+    FunctionType* clockgettimeFuncTy = FunctionType::get(
+            /*Result=*/IntegerType::get(context, 32),
+            /*Params=*/params,
+            /*isVarArg=*/false);
+
+    Function* func_clock_gettime = mod->getFunction("clock_gettime");
+    if (!func_clock_gettime) {
+        func_clock_gettime = Function::Create(
+                /*Type=*/clockgettimeFuncTy,
+                /*Linkage=*/GlobalValue::ExternalLinkage,
+                /*Name=*/"clock_gettime", mod); // (external, no body)
+        func_clock_gettime->setCallingConv(CallingConv::C);
+    }
+    func_getrusage->setAttributes(nounwindAttrSet);
+
+    ConstantInt* const_i32_2 = ConstantInt::get(context, APInt(32, StringRef("2"), 10));
+
+    {
+        // Create alloca for timespec start/end structs.
+        Instruction* allocaPos = preheaderBB->getParent()->getEntryBlock().getFirstNonPHI();
+        AllocaInst* timespecStartPtr = new AllocaInst(timespecStructTy, "timespec.start", allocaPos);
+        AllocaInst* timespecEndPtr = new AllocaInst(timespecStructTy, "timespec.end", allocaPos);
+        timespecStartPtr->setAlignment(8);
+        timespecEndPtr->setAlignment(8);
+
+        // The first call to clock_gettime comes before the loop starts:
+        Instruction* insertBefore = preheaderBB->getTerminator();
+
+        // clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &start);
+        std::vector<Value*> valueVec;
+        valueVec.push_back(const_i32_2);
+        valueVec.push_back(timespecStartPtr);
+        CallInst* clockgettimeStartCall = CallInst::Create(func_clock_gettime, valueVec, "clock_gettime.start", insertBefore);
+        clockgettimeStartCall->setCallingConv(CallingConv::C);
+        clockgettimeStartCall->setTailCall(false);
+        clockgettimeStartCall->setAttributes(nounwindAttrSet);
+
+        // The second call to getrusage comes after the loop is finished:
+        insertBefore = exitBB->getFirstNonPHI();
+
+        // clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &end);
+        valueVec.clear();
+        valueVec.push_back(const_i32_2);
+        valueVec.push_back(timespecEndPtr);
+        CallInst* clockgettimeEndCall = CallInst::Create(func_clock_gettime, valueVec, "clock_gettime.end", insertBefore);
+        clockgettimeEndCall->setCallingConv(CallingConv::C);
+        clockgettimeEndCall->setTailCall(false);
+        clockgettimeEndCall->setAttributes(nounwindAttrSet);
+
+        // Calculate elapsed time.
+        // const long seconds  = end.tv_sec  - start.tv_sec;
+        // const long nseconds = end.tv_nsec - start.tv_nsec;
+        // const long millisecs = ((seconds) * 1000 + nseconds/1000000.0) + 0.5;
+        // const double secs = (double)millisecs / 1000.0;
+        valueVec.clear();
+        valueVec.push_back(const_i64_0);
+        valueVec.push_back(const_i32_0);
+        Instruction* endGEP0 = GetElementPtrInst::Create(timespecEndPtr, valueVec, "end.tv_sec.ptr", insertBefore);
+        LoadInst* endLoad0 = new LoadInst(endGEP0, "end.tv_sec", false, insertBefore);
+        endLoad0->setAlignment(8);
+        Instruction* startGEP0 = GetElementPtrInst::Create(timespecStartPtr, valueVec, "start.tv_sec.ptr", insertBefore);
+        LoadInst* startLoad0 = new LoadInst(startGEP0, "start.tv_sec", false, insertBefore);
+        startLoad0->setAlignment(8);
+        BinaryOperator* sub0 = BinaryOperator::Create(Instruction::Sub, endLoad0, startLoad0, "secs", insertBefore);
+
+        valueVec.clear();
+        valueVec.push_back(const_i64_0);
+        valueVec.push_back(const_i32_1);
+        Instruction* endGEP1 = GetElementPtrInst::Create(timespecEndPtr, valueVec, "end.tv_nsec.ptr", insertBefore);
+        LoadInst* endLoad1 = new LoadInst(endGEP1, "end.tv_nsec", false, insertBefore);
+        endLoad1->setAlignment(8);
+        Instruction* startGEP1 = GetElementPtrInst::Create(timespecStartPtr, valueVec, "start.tv_nsec.ptr", insertBefore);
+        LoadInst* startLoad1 = new LoadInst(startGEP1, "start.tv_nsec", false, insertBefore);
+        startLoad1->setAlignment(8);
+        BinaryOperator* sub1 = BinaryOperator::Create(Instruction::Sub, endLoad1, startLoad1, "nsecs", insertBefore);
+
+        BinaryOperator* mul = BinaryOperator::Create(Instruction::Mul, sub0, const_i64_1000, "mul", insertBefore);
+        CastInst* double_conv0 = new SIToFPInst(mul, Type::getDoubleTy(context), "conv0", insertBefore);
+        CastInst* double_conv1 = new SIToFPInst(sub1, Type::getDoubleTy(context), "conv1", insertBefore);
+        BinaryOperator* double_div = BinaryOperator::Create(Instruction::FDiv, double_conv1, const_double_1000, "div", insertBefore);
+        BinaryOperator* double_add = BinaryOperator::Create(Instruction::FAdd, double_div, double_conv0, "add", insertBefore);
+        BinaryOperator* millisecs = BinaryOperator::Create(Instruction::FAdd, double_add, const_double_0_5, "millisecs", insertBefore);
+        CastInst* int64_conv9 = new FPToSIInst(millisecs, IntegerType::get(context, 64), "conv9", insertBefore);
+        CastInst* double_conv10 = new SIToFPInst(int64_conv9, Type::getDoubleTy(context), "conv10", insertBefore);
+        BinaryOperator* timeInSeconds = BinaryOperator::Create(Instruction::FDiv, double_conv10, const_double_1000, "secs", insertBefore);
+
+        // Write elapsed time to file.
+
+        // FILE* file = fopen("loop_performance_analysis.txt", "w");
+        valueVec.clear();
+        valueVec.push_back(fileNameStr);
+        valueVec.push_back(wStr);
+        CallInst* fopenCall = CallInst::Create(func_fopen, valueVec, "fopen", insertBefore);
+        fopenCall->setCallingConv(CallingConv::C);
+        fopenCall->setTailCall(false);
+
+        // fprintf(file, "(infoLine) -- execution time: %f seconds\n", secs);
+        std::stringstream sstr;
+        sstr << infoLine << " -- execution time: %f seconds\n"; // \x0A instead of \n?
+        const std::string printLine = sstr.str();
+        Constant *const_string_exectime = ConstantDataArray::getString(context, printLine, true);
+        GlobalVariable* exectimeStrGlobal = new GlobalVariable(/*Module=*/*mod,
+                /*Type=*/ArrayType::get(IntegerType::get(context, 8), printLine.length()+1),
+                /*isConstant=*/true,
+                /*Linkage=*/GlobalValue::PrivateLinkage,
+                /*Initializer=*/0, // has initializer, specified below
+                /*Name=*/".exectimeStr");
+        exectimeStrGlobal->setAlignment(1);
+        exectimeStrGlobal->setInitializer(const_string_exectime);
+        constVec.clear();
+        constVec.push_back(const_i64_0);
+        constVec.push_back(const_i64_0);
+        Constant* execTimeStr = ConstantExpr::getGetElementPtr(exectimeStrGlobal, constVec);
+
+        valueVec.clear();
+        valueVec.push_back(fopenCall);
+        valueVec.push_back(execTimeStr);
+        valueVec.push_back(timeInSeconds);
+        CallInst* fprintfCall = CallInst::Create(func_fprintf, valueVec, "fprintf", insertBefore);
+        fprintfCall->setCallingConv(CallingConv::C);
+        fprintfCall->setTailCall(false);
+
+        // fclose(file);
+        CallInst* fcloseCall = CallInst::Create(func_fclose, fopenCall, "fclose", insertBefore);
+        fcloseCall->setCallingConv(CallingConv::C);
+        fcloseCall->setTailCall(false);
+    }
+#endif
+
+    outs() << "instrumented loop: " << infoLine << "\n";
 }
 
 } // namespace llvm

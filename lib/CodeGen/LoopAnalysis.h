@@ -21,11 +21,12 @@ namespace loopanalysis {
 
 class LoopAnalysis {
 public:
-  LoopAnalysis(Module *M);
+  LoopAnalysis(Module *M, const bool instrument);
   ~LoopAnalysis();
   void Analyze();
 private:
-  Module       *Mod;
+  Module*    Mod;
+  const bool Instrument;
 };
 
 }  // namespace loopanalysis
