@@ -141,8 +141,7 @@ struct NoiseExtractor : public FunctionPass {
 
   template<unsigned SetSize>
   bool resolveMarkers(BasicBlock*                        block,
-                      SmallPtrSet<BasicBlock*, SetSize>& visitedBlocks,
-                      const bool                         isTopLevel)
+                      SmallPtrSet<BasicBlock*, SetSize>& visitedBlocks)
   {
     if (visitedBlocks.count(block)) return false;
     visitedBlocks.insert(block);
@@ -172,7 +171,7 @@ struct NoiseExtractor : public FunctionPass {
         for (typename SmallPtrSet<BasicBlock*, SetSize>::iterator it=region.begin(),
             E=region.end(); it!=E; ++it)
         {
-            if (resolveMarkers<SetSize>(*it, visitedBlocks, false))
+            if (resolveMarkers<SetSize>(*it, visitedBlocks))
             {
                 iterate = true;
                 break;
@@ -202,7 +201,7 @@ struct NoiseExtractor : public FunctionPass {
             "There should be only one call to an extracted function");
     assert (isa<CallInst>(*extractedFn->use_begin()));
     CallInst* call = cast<CallInst>(*extractedFn->use_begin());
-    noise::NoiseFnInfo* nfi = new noise::NoiseFnInfo(extractedFn, call, !isTopLevel);
+    noise::NoiseFnInfo* nfi = new noise::NoiseFnInfo(extractedFn, call, true);
     noiseFnInfoVec->push_back(nfi);
 
     //outs() << "extracted function: " << *extractedFn << "\n";
@@ -240,10 +239,9 @@ struct NoiseExtractor : public FunctionPass {
     while (iterate)
     {
       iterate = false;
-      const bool isTopLevel = !getNoiseFunctionAttributeMDN(F, *MD);
       for (Function::iterator BB = F.begin(), BBE=F.end(); BB!=BBE; ++BB)
       {
-        if (resolveMarkers(BB, visitedBlocks, isTopLevel))
+        if (resolveMarkers(BB, visitedBlocks))
         {
           iterate = true;
           break;
