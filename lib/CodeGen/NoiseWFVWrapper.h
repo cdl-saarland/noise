@@ -62,7 +62,6 @@ public:
 
   unsigned mVectorizationFactor;
   bool mUseAVX;
-  bool mUseDivergenceAnalysis;
   bool mVerbose;
 
   struct ReductionUpdate
@@ -127,7 +126,6 @@ public:
 
   explicit NoiseWFVWrapper(const unsigned vectorizationWidth=4,
                            const bool     useAVX=false,
-                           const bool     useDivergenceAnalysis=true,
                            const bool     verbose=false);
   virtual ~NoiseWFVWrapper();
 

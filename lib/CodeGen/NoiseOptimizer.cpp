@@ -444,14 +444,11 @@ void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Regis
         (unsigned)NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : 4U;
     bool       useAVX = NoiseOptimizations::HasPassArg(Opt, 1U) &&
         NoiseOptimizations::GetPassArgAsInt(Opt, 1U);
-    bool       useDivergenceAnalysis = NoiseOptimizations::HasPassArg(Opt, 2U) ?
-        NoiseOptimizations::GetPassArgAsInt(Opt, 2U) : true;
     const bool verbose = false;
 
     // Add WFV pass wrapper.
     Passes.add(new NoiseWFVWrapper(vectorizationWidth,
                                    useAVX,
-                                   useDivergenceAnalysis,
                                    verbose));
 #endif
   } else if(pass == "loop-fusion") {

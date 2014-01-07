@@ -94,13 +94,11 @@ createNoiseWFVWrapperPass()
 
 NoiseWFVWrapper::NoiseWFVWrapper(const unsigned vectorizationWidth,
                                  const bool     useAVX,
-                                 const bool     useDivergenceAnalysis,
                                  const bool     verbose)
 : FunctionPass(ID),
   mFinished(false),
   mVectorizationFactor(vectorizationWidth),
   mUseAVX(useAVX),
-  mUseDivergenceAnalysis(useDivergenceAnalysis),
   mVerbose(verbose)
 {
   initializeNoiseWFVWrapperPass(*PassRegistry::getPassRegistry());
@@ -2002,7 +2000,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                           simdFn,
                                           mVectorizationFactor,
                                           maskPosition,
-                                          mUseDivergenceAnalysis,
+                                          false, false, false,
                                           mVerbose);
 
   // Add semantics for SSE/AVX builtins.
