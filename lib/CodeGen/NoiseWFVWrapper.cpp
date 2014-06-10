@@ -2604,8 +2604,8 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
     // where the one update operation references the other phi.
     // This results in an empty reductionSCC, which is actually correct since this is
     // no real reduction.
-    //if (reductionSCC->empty()) continue;
-    assert (!reductionSCC->empty());
+    // Ignore this SCC and try to continue.
+    if (reductionSCC->empty()) continue;
     gatherReductionUpdateInfo(*reductionSCC, reductionPhi, latchBB, domTree);
 
     redVar->mUpdates = reductionSCC;
