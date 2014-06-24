@@ -724,6 +724,17 @@ void NoiseOptimizer::PerformOptimization()
     InlineFunctionInfo IFI;
     InlineFunction(nfi->mCall, IFI);
 
+    // Are there additional uses left?
+    // This is required in cases in which further optimizations created additional
+    // references to this function. However, we additionally track the main call (mCall)
+    // to know the origin of this function
+    for (Value::use_iterator it = noiseFn->use_begin(), e = noiseFn->use_end(); it != e; ++it)
+    {
+      CallInst* instr = cast<CallInst>(*it);
+      if(instr->getParent()->getParent() != parentFn)
+        InlineFunction(instr, IFI);
+    }
+
     // Remove the now inlined noise function again.
     assert (noiseFn->use_empty());
     noiseFn->eraseFromParent();
