@@ -106,10 +106,10 @@ void NoiseCodeGenerator::EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S)
   switch(S.getStmtClass())
   {
     case Stmt::CompoundStmtClass:
-      Generator->EmitCompoundStmt((CompoundStmt&)S);
+      Generator->EmitCompoundStmt((const CompoundStmt&)S);
       break;
     case Stmt::ForStmtClass:
-      Generator->EmitForStmt((ForStmt&)S);
+      Generator->EmitForStmt((const ForStmt&)S);
       break;
     default:
       assert( false && "trying to noise not supported stmt" );
