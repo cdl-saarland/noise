@@ -15,12 +15,6 @@
 #include "CGNoise.h"
 #include "NoiseOptimization.h"
 
-#ifdef COMPILE_NOISE_WFV_WRAPPER
-#include "NoiseWFVWrapper.h"
-#endif
-#include "NoiseFusion.h"
-#include "NoiseSpecializer.h"
-
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -44,16 +38,16 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/Instrumentation.h"
 #include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
-#include "llvm/Transforms/Utils/UnrollLoop.h"
 #include "llvm/Transforms/Utils/Cloning.h" // CloneFunction()
 #include "llvm/IR/Module.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h" // FunctionType
 #include "llvm/IR/Constants.h" // UndefValue
 #include "llvm/IR/Instructions.h" // CallInst
+
+#include "NoiseInliner.h"
 
 #include <iostream>
 #include <sstream>
@@ -99,27 +93,7 @@ const MDNode* getNoiseFunctionAttributeMDN(const Function&    function,
 
 namespace llvm {
 
-// Collects all blocks between the block "block" and the end block "endBB"
-// TODO: There's functionality inside LLVM for this: llvm::Region
-template<unsigned SetSize>
-void collectBlocks(BasicBlock* block,
-                   BasicBlock* endBB,
-                   SmallPtrSet<BasicBlock*, SetSize>& region)
-{
-  if (region.count(block)) return;
-  region.insert(block);
-
-  if (block == endBB) return;
-
-  TerminatorInst* terminator = block->getTerminator();
-  for (unsigned i=0, e=terminator->getNumSuccessors(); i<e; ++i)
-  {
-    collectBlocks<SetSize>(terminator->getSuccessor(i), endBB, region);
-  }
-}
-
 void initializeNoiseExtractorPass(PassRegistry&);
-void initializeNoiseInlinerPass(PassRegistry&);
 
 struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
@@ -256,95 +230,14 @@ struct NoiseExtractor : public FunctionPass {
   }
 };
 
-// This custom inlining pass is required since the built-in functionality
-// cannot inline functions which are in different modules
-// TODO: This should not be necessary anymore.
-struct NoiseInliner : public FunctionPass {
-public:
-  static char ID; // Pass identification, replacement for typeid
-
-  SmallVector<std::string, 2> functionNames;
-  SmallPtrSet<Function*, 2>   functions;
-
-  explicit NoiseInliner(SmallVector<std::string, 2>* fnNames=0)
-  : FunctionPass(ID) {
-    initializeNoiseInlinerPass(*PassRegistry::getPassRegistry());
-    if (fnNames) functionNames.insert(functionNames.begin(), fnNames->begin(), fnNames->end());
-  }
-
-  virtual ~NoiseInliner()
-  { }
-
-  virtual bool runOnFunction(Function &F)
-  {
-    const bool inlineAll = functionNames.empty();
-
-    // Get Functions from input strings (if any).
-    Module* mod = F.getParent();
-    for (SmallVector<std::string, 2>::iterator it=functionNames.begin(),
-         E=functionNames.end(); it!=E; ++it)
-    {
-      Function* fn = mod->getFunction(*it);
-      if (!fn)
-      {
-        errs() << "ERROR: Function requested for inlining does not exist in module: '"
-          << *it << "'!\n";
-        abort();
-      }
-
-      functions.insert(fn);
-    }
-
-    // Collect blocks that belong to the marked region.
-    SmallPtrSet<BasicBlock*, 32> functionRegion;
-    collectBlocks<32>(&F.front(), &F.back(), functionRegion);
-
-    // For all specified functions, collect all calls within the marked code segment.
-    // If no function names were given, collect all calls to any function.
-    SmallVector<CallInst*, 32> calls;
-    for (SmallPtrSet<BasicBlock*, 32>::iterator it = functionRegion.begin(),
-         e = functionRegion.end(); it != e; ++it)
-    {
-      for(BasicBlock::iterator I=(*it)->begin(), IE=(*it)->end(); I!=IE; ++I)
-      {
-        if (!isa<CallInst>(I)) continue;
-        CallInst* call = cast<CallInst>(I);
-        if (!inlineAll && !functions.count(call->getCalledFunction())) continue;
-        calls.push_back(call);
-      }
-    }
-
-    // Inline each of the collected calls.
-    for(SmallVector<CallInst*, 32>::iterator it = calls.begin(),
-        e = calls.end(); it != e; ++it)
-    {
-      InlineFunctionInfo IFI;
-      InlineFunction(*it, IFI);
-    }
-
-    return true;
-  }
-
-  virtual void getAnalysisUsage(AnalysisUsage &AU) const {
-  }
-};
-
 char NoiseExtractor::ID = 0;
-char NoiseInliner::ID = 0;
-}
 
-// Pass declarations
+} // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseExtractor, "noise-extract",
                       "Extract code blocks into noise functions", false, false)
 INITIALIZE_PASS_END(NoiseExtractor, "noise-extract",
                     "Extract code blocks into noise functions", false, false)
-
-INITIALIZE_PASS_BEGIN(NoiseInliner, "noise-inline",
-                      "Forces inlining of calls", false, false)
-INITIALIZE_PASS_END(NoiseInliner, "noise-inline",
-                    "Forces inlining of calls", false, false)
-
 
 namespace llvm {
 namespace noise {
@@ -368,115 +261,6 @@ NoiseOptimization* NoiseFnInfo::GetOptimization(size_t i) {
 
 size_t NoiseFnInfo::GetNumOptimizations() const {
   return mOptDesc->getNumOperands();
-}
-
-void NoiseOptimizations::Instantiate(NoiseOptimization* Opt, PassRegistry* Registry,
-                                     FunctionPassManager& Passes)
-{
-  const StringRef pass = GetPassName(Opt);
-  if(pass == "inline") {
-    SmallVector<std::string, 2> fnNames;
-    for (unsigned i=0, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
-      std::string fnName = NoiseOptimizations::GetPassArgAsString(Opt, i);
-      fnNames.push_back(fnName);
-    }
-    Passes.add(new NoiseInliner(&fnNames));
-  } else if(pass == "unroll") {
-    const int count = NoiseOptimizations::HasPassArg(Opt, 0U) ?
-      NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : -1;
-
-    outs() << "Running pass: indvars\n";
-    outs() << "Running pass: loop-rotate\n";
-
-    Passes.add(createIndVarSimplifyPass()); // TODO: Shouldn't this be left to the user?
-    Passes.add(createLoopRotatePass()); // TODO: Shouldn't this be left to the user?
-    Passes.add(createLoopUnrollPass(-1, count, false));
-  } else if(pass == "opt") {
-    PassManagerBuilder builder;
-    // use 2 instead of 3 in order to avoid the creation of passes which
-    // are incompatible with our pass setup
-    // during (the invocation of the populateModulePassManager method)
-    builder.OptLevel = 2U;
-    builder.SizeLevel = 0U;
-    builder.DisableUnitAtATime = true;
-    builder.populateFunctionPassManager(Passes);
-    builder.populateModulePassManager(Passes);
-  } else if(pass == "specialize") {
-    // pass = "specialize(x,0,1,13)"
-
-    assert (NoiseOptimizations::GetNumPassArgs(Opt) > 1 &&
-            "expected at least two arguments for specialized dispatching!");
-    const std::string variable = NoiseOptimizations::GetPassArgAsString(Opt, 0U);
-    SmallVector<int, 4>* values = new SmallVector<int, 4>();
-    for (unsigned i=1, e=NoiseOptimizations::GetNumPassArgs(Opt); i<e; ++i) {
-      values->push_back(NoiseOptimizations::GetPassArgAsInt(Opt, i));
-    }
-
-    Passes.add(new NoiseSpecializer(variable, values));
-  } else if(pass == "wfv" || pass == "wfv-vectorize") {
-#ifndef COMPILE_NOISE_WFV_WRAPPER
-    errs() << "ERROR: No support for WFV is available!\n";
-    abort();
-#else
-    outs() << "Running pass: loop-simplify\n";
-    outs() << "Running pass: lowerswitch\n";
-    outs() << "Running pass: indvars\n";
-    outs() << "Running pass: lcssa\n";
-
-    // Add preparatory passes for WFV.
-    Passes.add(createLoopSimplifyPass());
-    Passes.add(createLowerSwitchPass());
-    // Add induction variable simplification pass.
-    Passes.add(createIndVarSimplifyPass());
-    // Convert to loop-closed SSA form to simplify applicability analysis.
-    Passes.add(createLCSSAPass());
-
-    // WFV may receive argument to specify vectorization width, whether to
-    // use AVX and whether to use the divergence analysis.
-    // "wfv-vectorize"          -> width 4, do not use avx, use divergence analysis (default)
-    // "wfv-vectorize (4,0,1)"  -> width 4, do not use avx, use divergence analysis (default)
-    // "wfv-vectorize (8,1,1)"  -> width 8, use avx, use divergence analysis
-    // "wfv-vectorize (8,1)"    -> width 8, use avx, use divergence analysis
-    // "wfv-vectorize (16,0,0)" -> width 16, do not use avx, do not use divergence analysis
-    unsigned   vectorizationWidth = NoiseOptimizations::HasPassArg(Opt, 0U) ?
-        (unsigned)NoiseOptimizations::GetPassArgAsInt(Opt, 0U) : 4U;
-    bool       useAVX = NoiseOptimizations::HasPassArg(Opt, 1U) &&
-        NoiseOptimizations::GetPassArgAsInt(Opt, 1U);
-    const bool verbose = false;
-
-    // Add WFV pass wrapper.
-    Passes.add(new NoiseWFVWrapper(vectorizationWidth,
-                                   useAVX,
-                                   verbose));
-#endif
-  } else if(pass == "loop-fusion") {
-    Passes.add(createLoopSimplifyPass());
-    Passes.add(new NoiseFusion());
-  } else {
-    const PassInfo* info = Registry->getPassInfo(pass);
-    if(!info) {
-      errs() << "ERROR: Pass not found: " << pass << "\n";
-      abort();
-    }
-    Pass* pass = info->createPass();
-    if(info->isAnalysis())
-      Passes.add(pass);
-    else
-    {
-      switch(pass->getPassKind()) {
-        case PT_BasicBlock:
-        case PT_Function:
-        case PT_Loop:
-        case PT_Region:
-          Passes.add(pass);
-          break;
-        default:
-          errs() << "ERROR: \"" << pass->getPassName() << "\" (" << GetPassName(Opt) << ") is not a function pass\n";
-          abort();
-      }
-    }
-  }
-  outs() << "Running pass: " << GetPassName(Opt) << "\n";
 }
 
 // Noise Optimizer
@@ -628,8 +412,10 @@ void createDummyVarNameCalls(Module*            module,
       for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
       {
         NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
-        if (NoiseOptimizations::GetPassName(noiseOpt) != "specialize") continue;
-        StringRef passArg = NoiseOptimizations::GetPassArgAsString(noiseOpt, 0);
+        NoiseOptimizationInfo info(noiseOpt);
+        if (info.GetType() != NOISE_OPTIMIZATION_TYPE_SPECIALIZE)
+          continue;
+        StringRef passArg = info.GetArgAsString(0);
         specializeVarNames.insert(passArg.str());
       }
     }
@@ -645,9 +431,10 @@ void createDummyVarNameCalls(Module*            module,
       for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
       {
         NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
-        if (NoiseOptimizations::GetPassName(noiseOpt) != "specialize") continue;
-        StringRef passArg = NoiseOptimizations::GetPassArgAsString(noiseOpt, 0);
-        specializeVarNames.insert(passArg.str());
+        NoiseOptimizationInfo info(noiseOpt);
+        if (info.GetType() != NOISE_OPTIMIZATION_TYPE_SPECIALIZE)
+          continue;
+        specializeVarNames.insert(info.GetArgAsString(0).str());
       }
     }
 
@@ -744,17 +531,18 @@ void NoiseOptimizer::PerformOptimization()
 {
   // Initialize all passes linked into all libraries (see InitializePasses.h).
   // This way, they are registered so we can add them via getPassInfo().
-  initializeCore(*PassRegistry::getPassRegistry());
-  initializeTransformUtils(*PassRegistry::getPassRegistry());
-  initializeScalarOpts(*PassRegistry::getPassRegistry());
-  initializeVectorization(*PassRegistry::getPassRegistry());
-  initializeInstCombine(*PassRegistry::getPassRegistry());
-  initializeIPO(*PassRegistry::getPassRegistry());
-  initializeInstrumentation(*PassRegistry::getPassRegistry());
-  initializeAnalysis(*PassRegistry::getPassRegistry());
-  initializeIPA(*PassRegistry::getPassRegistry());
-  initializeCodeGen(*PassRegistry::getPassRegistry());
-  initializeTarget(*PassRegistry::getPassRegistry());
+  PassRegistry &registry = *PassRegistry::getPassRegistry();
+  initializeCore(registry);
+  initializeTransformUtils(registry);
+  initializeScalarOpts(registry);
+  initializeVectorization(registry);
+  initializeInstCombine(registry);
+  initializeIPO(registry);
+  initializeInstrumentation(registry);
+  initializeAnalysis(registry);
+  initializeIPA(registry);
+  initializeCodeGen(registry);
+  initializeTarget(registry);
 
   PrettyStackTraceString CrashInfo("NOISE: Optimizing functions");
 
@@ -905,13 +693,14 @@ void NoiseOptimizer::PerformOptimization()
       << noiseFn->getName() << "': \n";
 
     // Run requested noise passes.
-    FunctionPassManager NoisePasses(Mod);
-    NoisePasses.add(new DataLayout(Mod));
-
+    NoiseOptimizations optimizations(registry);
     for(size_t i = 0, e = nfi->GetNumOptimizations(); i < e; ++i) {
       NoiseOptimization* noiseOpt = nfi->GetOptimization(i);
-      NoiseOptimizations::Instantiate(noiseOpt, Registry, NoisePasses);
+      optimizations.Register(noiseOpt);
     }
+    FunctionPassManager NoisePasses(Mod);
+    NoisePasses.add(new DataLayout(Mod));
+    optimizations.Populate(NoisePasses);
 
     // TODO: Remove this when reaching "production" state or so.
     NoisePasses.add(createVerifierPass());
@@ -945,11 +734,9 @@ void NoiseOptimizer::PerformOptimization()
       // TODO: This may disturb user experience.
       FunctionPassManager PM(Mod);
       PM.add(new DataLayout(Mod));
-      PM.add(createTypeBasedAliasAnalysisPass());
-      PM.add(createBasicAliasAnalysisPass());
-      PM.add(createCFGSimplificationPass());
-      PM.add(createScalarReplAggregatesPass());
-      PM.add(createEarlyCSEPass());
+      NoiseOptimizations defaultOpts(registry);
+      defaultOpts.RegisterDefaultOpts();
+      defaultOpts.Populate(PM);
       PM.run(*parentFn);
     }
 

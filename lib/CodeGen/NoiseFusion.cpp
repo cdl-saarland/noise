@@ -30,17 +30,11 @@
 #include "llvm/IR/Constants.h" // UndefValue
 #include "llvm/IR/Instructions.h" // CallInst
 
-#include <sstream>
-
 using namespace llvm;
 
 namespace llvm {
 
-NoiseFusion::NoiseFusion()
-: FunctionPass(ID)
-{
-    initializeNoiseFusionPass(*PassRegistry::getPassRegistry());
-}
+void initializeNoiseFusionPass(PassRegistry&);
 
 class Sorter {
 public:
@@ -53,37 +47,6 @@ public:
 
   DominatorTree *mDomTree;
 };
-
-bool
-NoiseFusion::runOnFunction(Function &F) {
-  mModule   = F.getParent();
-  mContext  = &F.getContext();
-  mLoopInfo = &getAnalysis<LoopInfo>();
-  mDomTree  = &getAnalysis<DominatorTree>();
-
-  typedef LoopInfoBase<BasicBlock, Loop> LIB;
-  LIB& Base = mLoopInfo->getBase();
-
-  size_t NumLoops = std::distance(Base.begin(), Base.end());
-  if (NumLoops <= 1)
-    return true;
-
-  std::vector<const Loop*> Loops(NumLoops);
-  std::copy(Base.begin(), Base.end(), Loops.begin());
-  std::sort(Loops.begin(), Loops.end(), Sorter(mDomTree));
-
-  const Loop *Loop1 = Loops.front();
-  PreHeader1 = Loop1->getLoopPreheader();
-  Header1 = Loop1->getHeader(); 
-  Latch1 = Loop1->getLoopLatch(); 
-  HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
-  int ExitIndex = Loop1->contains(HeaderBranch1->getSuccessor(0)) ? 1 : 0;
-
-  for (std::vector<const Loop*>::const_iterator Loop2 = Loops.begin() + 1, e = Loops.end(); Loop2 != e; ++Loop2)
-    fuse(ExitIndex, *Loop2);
-
-  return true;
-}
 
 template<bool early>
 static void moveTo(BasicBlock *From, BasicBlock *To) {
@@ -98,72 +61,131 @@ static void moveTo(BasicBlock *From, BasicBlock *To) {
     Is[i]->moveBefore(early ? To->getFirstNonPHI() : To->getTerminator());
 }
 
-void NoiseFusion::fuse(int ExitIndex, const Loop *Loop2) {
-  BasicBlock *PreHeader2 = Loop2->getLoopPreheader();
-  BasicBlock *Header2 = Loop2->getHeader(); 
-  BasicBlock *Latch2 = Loop2->getLoopLatch();
 
-  BranchInst *HeaderBranch2 = cast<BranchInst>(Header2->getTerminator());
-  assert(HeaderBranch2->isConditional() && HeaderBranch2->getNumSuccessors() == 2);
+class NoiseFusion : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
 
-  BasicBlock *BodyStart2 = Loop2->contains(HeaderBranch2->getSuccessor(0)) 
-                         ? HeaderBranch2->getSuccessor(0) 
-                         : HeaderBranch2->getSuccessor(1);
+  Module        *mModule;
+  LLVMContext   *mContext;
+  LoopInfo      *mLoopInfo;
+  DominatorTree *mDomTree;
 
-  // fix phi functions first
-  Latch1->replaceSuccessorsPhiUsesWith(Latch2);
-  Header2->replaceSuccessorsPhiUsesWith(Header1);
-  PreHeader2->replaceSuccessorsPhiUsesWith(PreHeader1);
+  BasicBlock    *PreHeader1;
+  BasicBlock    *Header1;
+  BranchInst    *HeaderBranch1;
+  BasicBlock    *Latch1;
 
-  // jump: Latch1 -> BodyStart2
-  BranchInst *LatchBranch1 = cast<BranchInst>(Latch1->getTerminator());
-  assert(LatchBranch1->isUnconditional() && LatchBranch1->getNumSuccessors() == 1);
-  LatchBranch1->eraseFromParent();
-  BranchInst::Create(BodyStart2, Latch1);
+  NoiseFusion()
+   : FunctionPass(ID)
+  {
+    initializeNoiseFusionPass(*PassRegistry::getPassRegistry());
+  }
+  virtual ~NoiseFusion() {}
 
-  // jump: Latch2 -> Header1
-  BranchInst *LatchBranch2 = cast<BranchInst>(Latch2->getTerminator());
-  assert(LatchBranch2->isUnconditional() && LatchBranch2->getNumSuccessors() == 1);
-  LatchBranch2->eraseFromParent();
-  BranchInst::Create(Header1, Latch2);
+  virtual bool runOnFunction(Function &F)
+  {
+    mModule = F.getParent();
+    mContext = &F.getContext();
+    mLoopInfo = &getAnalysis<LoopInfo>();
+    mDomTree = &getAnalysis<DominatorTree>();
 
-  BranchInst *HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
-  assert(HeaderBranch1->isConditional() && HeaderBranch1->getNumSuccessors() == 2);
-  Value *Cond = HeaderBranch1->getCondition();
-  BasicBlock *Targets[2] = { HeaderBranch1->getSuccessor(0), HeaderBranch1->getSuccessor(1) };
-  BasicBlock* Exit = Loop2->contains(HeaderBranch2->getSuccessor(0)) 
-                   ? HeaderBranch2->getSuccessor(1) 
-                   : HeaderBranch2->getSuccessor(0);
-  Targets[ExitIndex] = Exit;
-  HeaderBranch1->eraseFromParent();
-  HeaderBranch1 = BranchInst::Create(Targets[0], Targets[1], Cond, Header1);
+    typedef LoopInfoBase<BasicBlock, Loop> LIB;
+    LIB& Base = mLoopInfo->getBase();
 
-  // move all phis in Header2 to Header1
-  PHINode *Phi;
-  std::vector<PHINode*> Phis;
-  for (BasicBlock::iterator i = Header2->begin(); (Phi = dyn_cast<PHINode>(i)); ++i)
-    Phis.push_back(Phi);
+    size_t NumLoops = std::distance(Base.begin(), Base.end());
+    if (NumLoops <= 1)
+      return true;
 
-  for (size_t i = 0, e = Phis.size(); i != e; ++i)
-    Phis[i]->moveBefore(&Header1->front());
+    std::vector<const Loop*> Loops(NumLoops);
+    std::copy(Base.begin(), Base.end(), Loops.begin());
+    std::sort(Loops.begin(), Loops.end(), Sorter(mDomTree));
 
-  // move everything except terminator from Header2 to BodyStart2 and from PreHeader2 to PreHeader1
-  moveTo<true>(Header2, BodyStart2);
-  moveTo<false>(PreHeader2, PreHeader1);
+    const Loop *Loop1 = Loops.front();
+    PreHeader1 = Loop1->getLoopPreheader();
+    Header1 = Loop1->getHeader();
+    Latch1 = Loop1->getLoopLatch();
+    HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
+    int ExitIndex = Loop1->contains(HeaderBranch1->getSuccessor(0)) ? 1 : 0;
 
-  // erase now unreachable (pre-)headers
-  PreHeader2->eraseFromParent();
-  Header2->eraseFromParent();
+    for (std::vector<const Loop*>::const_iterator Loop2 = Loops.begin() + 1, e = Loops.end(); Loop2 != e; ++Loop2)
+      fuse(ExitIndex, *Loop2);
 
-  // make new big loop's latch current latch
-  Latch1 = Latch2;
-}
+    return true;
+  }
 
-void
-NoiseFusion::getAnalysisUsage(AnalysisUsage &AU) const
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const
+  {
+    AU.addRequired<DominatorTree>();
+    AU.addRequired<LoopInfo>();
+  }
+
+  void fuse(int ExitIndex, const Loop *Loop2)
+  {
+    BasicBlock *PreHeader2 = Loop2->getLoopPreheader();
+    BasicBlock *Header2 = Loop2->getHeader();
+    BasicBlock *Latch2 = Loop2->getLoopLatch();
+
+    BranchInst *HeaderBranch2 = cast<BranchInst>(Header2->getTerminator());
+    assert(HeaderBranch2->isConditional() && HeaderBranch2->getNumSuccessors() == 2);
+
+    BasicBlock *BodyStart2 = Loop2->contains(HeaderBranch2->getSuccessor(0))
+      ? HeaderBranch2->getSuccessor(0)
+      : HeaderBranch2->getSuccessor(1);
+
+    // fix phi functions first
+    Latch1->replaceSuccessorsPhiUsesWith(Latch2);
+    Header2->replaceSuccessorsPhiUsesWith(Header1);
+    PreHeader2->replaceSuccessorsPhiUsesWith(PreHeader1);
+
+    // jump: Latch1 -> BodyStart2
+    BranchInst *LatchBranch1 = cast<BranchInst>(Latch1->getTerminator());
+    assert(LatchBranch1->isUnconditional() && LatchBranch1->getNumSuccessors() == 1);
+    LatchBranch1->eraseFromParent();
+    BranchInst::Create(BodyStart2, Latch1);
+
+    // jump: Latch2 -> Header1
+    BranchInst *LatchBranch2 = cast<BranchInst>(Latch2->getTerminator());
+    assert(LatchBranch2->isUnconditional() && LatchBranch2->getNumSuccessors() == 1);
+    LatchBranch2->eraseFromParent();
+    BranchInst::Create(Header1, Latch2);
+
+    BranchInst *HeaderBranch1 = cast<BranchInst>(Header1->getTerminator());
+    assert(HeaderBranch1->isConditional() && HeaderBranch1->getNumSuccessors() == 2);
+    Value *Cond = HeaderBranch1->getCondition();
+    BasicBlock *Targets[2] = { HeaderBranch1->getSuccessor(0), HeaderBranch1->getSuccessor(1) };
+    BasicBlock* Exit = Loop2->contains(HeaderBranch2->getSuccessor(0))
+      ? HeaderBranch2->getSuccessor(1)
+      : HeaderBranch2->getSuccessor(0);
+    Targets[ExitIndex] = Exit;
+    HeaderBranch1->eraseFromParent();
+    HeaderBranch1 = BranchInst::Create(Targets[0], Targets[1], Cond, Header1);
+
+    // move all phis in Header2 to Header1
+    PHINode *Phi;
+    std::vector<PHINode*> Phis;
+    for (BasicBlock::iterator i = Header2->begin(); (Phi = dyn_cast<PHINode>(i)); ++i)
+      Phis.push_back(Phi);
+
+    for (size_t i = 0, e = Phis.size(); i != e; ++i)
+      Phis[i]->moveBefore(&Header1->front());
+
+    // move everything except terminator from Header2 to BodyStart2 and from PreHeader2 to PreHeader1
+    moveTo<true>(Header2, BodyStart2);
+    moveTo<false>(PreHeader2, PreHeader1);
+
+    // erase now unreachable (pre-)headers
+    PreHeader2->eraseFromParent();
+    Header2->eraseFromParent();
+
+    // make new big loop's latch current latch
+    Latch1 = Latch2;
+  }
+};
+
+Pass* createNoiseFusionPass()
 {
-  AU.addRequired<DominatorTree>();
-  AU.addRequired<LoopInfo>();
+  return new NoiseFusion();
 }
 
 char NoiseFusion::ID = 0;

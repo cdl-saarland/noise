@@ -61,9 +61,102 @@
 //#define DEBUG_NOISE_WFV(x) do { x } while (0)
 #define DEBUG_NOISE_WFV(x) ((void)0)
 
-using namespace llvm;
-
 namespace llvm {
+
+void initializeNoiseWFVWrapperPass(PassRegistry&);
+
+struct NoiseWFVWrapper : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
+
+  bool             mFinished;
+
+  Module*          mModule;
+  LLVMContext*     mContext;
+  DominatorTree*   mDomTree;
+  LoopInfo*        mLoopInfo;
+  ScalarEvolution* mSCEV;
+
+  unsigned mVectorizationFactor;
+  bool mUseAVX;
+  bool mVerbose;
+
+  struct ReductionUpdate
+  {
+    ~ReductionUpdate();
+
+    // The update operation.
+    Instruction*      mOperation;
+    // The operands that are *not* part of the reduction SCC.
+    typedef SmallVector<Value*, 2> OtherOperandsVec;
+    OtherOperandsVec* mOtherOperands;
+    // The users of this update operation that are *not* part of the reduction SCC (if any).
+    typedef SetVector<Instruction*> ResultUsersVec;
+    ResultUsersVec*   mResultUsers;
+    // The alloca of the scalar result of this reduction operation (given
+    // as output parameter to call).
+    Instruction*      mIntermediateResultPtr;
+  };
+
+  typedef MapVector<Instruction*, ReductionUpdate*> RedUpMapType;
+
+  struct ReductionVariable
+  {
+    ~ReductionVariable();
+
+    // The reduction phi in the loop header.
+    PHINode*      mPhi;
+    // The start value (phi operand from pre header).
+    Value*        mStartVal;
+    // All update operations that belong to the reduction SCC.
+    RedUpMapType* mUpdates;
+    // The final reduction result user (if any).
+    PHINode*      mResultUser;
+
+    // The position where the reduction operations will be performed after WFV.
+    Instruction*  mReductionPos;
+    // The scalar reduction function (dummy declaration only).
+    Function*     mReductionFn;
+    // The call to the scalar reduction function.
+    CallInst*     mReductionFnCall;
+    // The SIMD reduction function.
+    Function*     mReductionFnSIMD;
+
+    // The alloca that stores the final reduction result in the original function.
+    AllocaInst*   mResultPtr;
+
+    // The argument of the SIMD reduction function that corresponds to the reduction phi.
+    Argument*     mPhiArg;
+    // The argument of the SIMD reduction function that corresponds to the result pointer.
+    Argument*     mOutArg;
+    // The store instruction that writes back the final reduction result to mOutArg.
+    StoreInst*    mStoreBack;
+    // The value that goes back to the reduction phi from the latch in the original function.
+    Instruction*  mBackEdgeVal;
+
+    // Store information whether this reduction can be optimized in the classic way.
+    bool          mCanOptimizeWithVector;
+    unsigned      mCommonOpcode;
+  };
+
+  typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
+
+  explicit NoiseWFVWrapper(const unsigned vectorizationWidth=4,
+                           const bool     useAVX=false,
+                           const bool     verbose=false);
+  virtual ~NoiseWFVWrapper();
+
+  virtual bool runOnFunction(Function &F);
+
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const;
+
+  bool runWFV(Function* noiseFn);
+
+  void collectReductionVariables(RedVarVecType&       redVars,
+                                 PHINode*             indVarPhi,
+                                 const Loop&          loop,
+                                 const DominatorTree& domTree);
+};
 
 NoiseWFVWrapper::ReductionUpdate::~ReductionUpdate()
 {
@@ -141,6 +234,11 @@ NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
   AU.addRequired<DominatorTree>();
   AU.addRequired<LoopInfo>();
   AU.addRequired<ScalarEvolution>();
+}
+
+Pass* createNoiseWFVPass(const unsigned vectorizationWidth, const bool useAVX, const bool verbose)
+{
+  return new NoiseWFVWrapper(vectorizationWidth, useAVX, verbose);
 }
 
 

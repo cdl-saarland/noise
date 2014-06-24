@@ -16,6 +16,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace llvm {
 
@@ -23,7 +24,8 @@ namespace llvm {
   class Value;
   class MDNode;
   class PassRegistry;
-  class FunctionPassManager;
+  class Pass;
+  class PassManagerBase;
 
 namespace noise {
 
@@ -42,21 +44,61 @@ namespace noise {
    -> NumOperands = NumArgs() - 1
    */
 
+#define NOISEOPTIMIZATION_TYPES(X) \
+  X( OPT, opt ) \
+  X( INLINE, inline ) \
+  X( LOOPUNROLL, unroll ) \
+  X( LOOPFUSION, loop-fusion ) \
+  X( SPECIALIZE, specialize ) \
+  X( VECTORIZE, wfv )
+
+  enum NoiseOptimizationType {
+#define TYPE_ELEM(Type, Name) \
+    NOISE_OPTIMIZATION_TYPE_ ## Type,
+    NOISEOPTIMIZATION_TYPES(TYPE_ELEM)
+#undef TYPE_ELEM
+    NOISE_OPTIMIZATION_TYPE_LLVMPASS
+  };
+
+  class NoiseOptimizationInfo {
+  public:
+    NoiseOptimizationInfo(NoiseOptimization *Opt);
+
+    NoiseOptimizationType GetType() const { return type; }
+
+    StringRef GetPassName() const;
+    size_t GetNumArgs() const;
+    Value* GetArg(size_t i) const;
+    bool HasArg(size_t i) const;
+
+    int GetArgAsInt(size_t i) const;
+    StringRef GetArgAsString(size_t i) const;
+
+    Value* operator[](size_t i) const {
+        return GetArg(i);
+    }
+
+  private:
+    NoiseOptimization *opt;
+    NoiseOptimizationType type;
+  };
+
   class NoiseOptimizations {
   public:
-    static MDNode* CreateOptimization(LLVMContext& C, ArrayRef<Value*> Values);
+    NoiseOptimizations(PassRegistry &Registry);
 
-    static StringRef GetPassName(NoiseOptimization* Opt);
-    static size_t GetNumPassArgs(NoiseOptimization* Opt);
+    static NoiseOptimization* CreateOptimization(LLVMContext &C, ArrayRef<Value*> Values);
 
-    static bool HasPassArg(NoiseOptimization* Opt, size_t i);
-    static Value* GetPassArg(NoiseOptimization* Opt, size_t i);
+    void Register(NoiseOptimization *Opt);
+    void Register(Pass *Pass);
+    void RegisterDefaultOpts();
+    void Populate(PassManagerBase &Manager);
 
-    static int GetPassArgAsInt(NoiseOptimization* Opt, size_t i);
-    static StringRef GetPassArgAsString(NoiseOptimization* Opt, size_t i);
+    PassRegistry& GetRegistry() { return registry; }
 
-    static void Instantiate(NoiseOptimization* Opt, PassRegistry* Registry,
-                            FunctionPassManager& Passes);
+  private:
+    PassRegistry &registry;
+    std::vector<Pass*> passes;
   };
 
 }  // end namespace noise
