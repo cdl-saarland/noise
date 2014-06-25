@@ -162,7 +162,8 @@ bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
 
   // It can happen that our call is referenced by multiple users, and thus,
   // we only have to ensure that at least one user exists.
-  assert (specializeCall->getNumUses() >= 1);
+  assert (specializeCall->getNumUses() >= 1 &&
+          "Variable could not be specialized since it was not declared as mutable within the current scope.");
 
   // If this is a compound statement, there is one more indirection
   // because of the extracted function.

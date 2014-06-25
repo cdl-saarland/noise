@@ -393,7 +393,6 @@ Function* createDummyFunction(Function* noiseFn)
     return dummyFn;
 }
 
-
 void createDummyVarNameCalls(Module*            module,
                              const NamedMDNode& MD)
 {
@@ -494,30 +493,33 @@ void createDummyVarNameCalls(Module*            module,
             continue;
           else
           {
-            // reset block as this block cannot contain the first store
+            // Reset block as this block cannot contain the first store
             curBlock = 0;
           }
 
-          // remember store values
+          // Remember store values
           assert (storeI->getPointerOperand() == I);
           firstStore = storeI;
           specializedVal = storeI->getValueOperand();
         }
-        assert (curBlock && "cannot find unique use of specialized variable");
+        assert (curBlock && "Cannot find unique use of specialized variable");
         assert (specializedVal);
 
         CallInst* call = CallInst::Create(dummyFn,
                                           ArrayRef<Value*>(specializedVal),
                                           "specializeCall", I);
-        I->moveBefore(call);
         call->setDoesNotAccessMemory();
         call->setDoesNotThrow();
 
         // In the first reachable use of I that is a store,
         // replace the operand by our call.
+        Value* op = firstStore->getOperand(0);
+        assert((dyn_cast<ConstantInt>(op) || dyn_cast<Argument>(op) || dyn_cast<AllocaInst>(op) || dyn_cast<LoadInst>(op)) &&
+          "Cannot specialize variables that depend on non-constant primitive values");
+        // Wire our specialization function
         firstStore->setOperand(0, call);
-
-        // TODO: check for related code that has to be moved out of the noise region
+        // Place the instruction before the origin I
+        I->moveBefore(call);
       }
     }
   }
