@@ -33,14 +33,29 @@ using namespace llvm;
 
 namespace llvm {
 
-#if 0
-Pass*
-createNoiseSpecializerPass()
-{
-    return new NoiseSpecializer();
-}
-#endif
+void initializeNoiseSpecializerPass(PassRegistry&);
 
+struct NoiseSpecializer : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
+
+  Module                   *mModule;
+  LLVMContext              *mContext;
+  const std::string         mVariable;
+  const SmallVector<int, 4> mValues;
+
+  NoiseSpecializer();
+  NoiseSpecializer(StringRef                  variable,
+                   const SmallVector<int, 4> &values);
+
+  virtual ~NoiseSpecializer();
+
+  virtual bool runOnFunction(Function &F);
+
+  virtual void getAnalysisUsage(AnalysisUsage &AU) const;
+
+  bool runSpecializer(Function* noiseFn);
+};
 
 NoiseSpecializer::NoiseSpecializer()
 : FunctionPass(ID), mVariable(""), mValues(0)
@@ -49,8 +64,8 @@ NoiseSpecializer::NoiseSpecializer()
     initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
 }
 
-NoiseSpecializer::NoiseSpecializer(const std::string&         variable,
-                                   const SmallVector<int, 4>* values)
+NoiseSpecializer::NoiseSpecializer(StringRef                  variable,
+                                   const SmallVector<int, 4> &values)
 : FunctionPass(ID), mVariable(variable), mValues(values)
 {
     initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
@@ -60,8 +75,7 @@ NoiseSpecializer::~NoiseSpecializer()
 {
 }
 
-bool
-NoiseSpecializer::runOnFunction(Function &F)
+bool NoiseSpecializer::runOnFunction(Function &F)
 {
   mModule   = F.getParent();
   mContext  = &F.getContext();
@@ -77,16 +91,40 @@ NoiseSpecializer::runOnFunction(Function &F)
   return success;
 }
 
-void
-NoiseSpecializer::getAnalysisUsage(AnalysisUsage &AU) const
+void NoiseSpecializer::getAnalysisUsage(AnalysisUsage &AU) const {}
+
+static CallInst* determineSpecializeCall(Function *NoiseFn, CallInst *SpecializeCall)
 {
+  CallInst *noiseFnCall = 0;
+  for (Value::use_iterator it = SpecializeCall->use_begin(),
+    e = SpecializeCall->use_end(); it != e && !noiseFnCall; ++it)
+  {
+    CallInst *call = dyn_cast<CallInst>(*it);
+    if (!call)
+      continue;
+    if (call->getCalledFunction() == NoiseFn)
+      noiseFnCall = call;
+  }
+  return noiseFnCall;
 }
 
-
-bool
-NoiseSpecializer::runSpecializer(Function* noiseFn)
+static Value* determineSpecializationValue(Function *NoiseFn, CallInst *Call, Value *SpecializeCall)
 {
-  assert (noiseFn);
+  Argument* specializeCallArg = 0;
+  Function::arg_iterator A = NoiseFn->arg_begin();
+  for (CallInst::op_iterator OP = Call->op_begin(),
+    OPE = Call->op_end(); OP != OPE && !specializeCallArg; ++OP, ++A)
+  {
+    if (*OP == SpecializeCall)
+      specializeCallArg = A;
+  }
+  assert(specializeCallArg);
+  return specializeCallArg;
+}
+
+bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
+{
+  assert (NoiseFn);
   //-------------------------------------------------------------------------//
   // Get the expected name of the specialize function.
   std::stringstream sstr;
@@ -96,7 +134,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   //-------------------------------------------------------------------------//
   // Find the Noise specialize call for this variable and the corresponding
   // argument where it is given to the noise function.
-  Module* module = noiseFn->getParent();
+  Module* module = NoiseFn->getParent();
   Function* specializeFn = module->getFunction(specializeFnName);
   assert (specializeFn && "could not find specialize function");
   assert (std::distance(specializeFn->arg_begin(), specializeFn->arg_end()) == 1 &&
@@ -128,37 +166,28 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
 
   // If this is a compound statement, there is one more indirection
   // because of the extracted function.
-  const bool isFnAttr = cast<Instruction>(*specializeCall->use_begin())->getParent()->getParent() == noiseFn;
   Value* specializeCallVal = 0;
+  const bool isFnAttr = cast<Instruction>(*specializeCall->use_begin())->getParent()->getParent() == NoiseFn;
   if (isFnAttr)
   {
     specializeCallVal = specializeCall->getOperand(0);
   }
   else
   {
-    CallInst* noiseFnCall = cast<CallInst>(*specializeCall->use_begin());
-
-    Argument* specializeCallArg = 0;
-    Function::arg_iterator A = noiseFn->arg_begin();
-    for (CallInst::op_iterator OP=noiseFnCall->op_begin(),
-         OPE=noiseFnCall->op_end(); OP!=OPE; ++OP, ++A)
-    {
-        if (*OP != specializeCall) continue;
-        specializeCallArg = A;
-        break;
-    }
-    assert (specializeCallArg);
-    specializeCallVal = specializeCallArg;
+    // Find proper function call for specialization
+    CallInst* noiseFnCall = determineSpecializeCall(NoiseFn, specializeCall);
+    assert (noiseFnCall && "Could not find proper call to specialization function");
+    specializeCallVal = determineSpecializationValue(NoiseFn, noiseFnCall, specializeCall);
   }
 
   //-------------------------------------------------------------------------//
   // Create new function for switch statement.
-  const unsigned numVariants = mValues->size();
+  const unsigned numVariants = mValues.size();
 
-  Function* switchFn = Function::Create(noiseFn->getFunctionType(),
+  Function* switchFn = Function::Create(NoiseFn->getFunctionType(),
                                         Function::ExternalLinkage,
                                         "switch_fn",
-                                        noiseFn->getParent());
+                                        NoiseFn->getParent());
 
   BasicBlock* entryBB = BasicBlock::Create(*mContext, "noiseSpecializeBegin", switchFn);
 
@@ -171,8 +200,8 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   {
       ValueToValueMapTy valueMap;
       Function::arg_iterator destI = switchFn->arg_begin();
-      for (Function::const_arg_iterator I = noiseFn->arg_begin(),
-          E = noiseFn->arg_end(); I != E; ++I)
+      for (Function::const_arg_iterator I = NoiseFn->arg_begin(),
+          E = NoiseFn->arg_end(); I != E; ++I)
       {
           if (valueMap.count(I) == 0)          // Is this argument preserved?
           {
@@ -184,7 +213,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
       ClonedCodeInfo               clonedFInfo;
       const char*                  nameSuffix = ".";
       CloneFunctionInto(switchFn,
-                        noiseFn,
+                        NoiseFn,
                         valueMap,
                         false,
                         returns,
@@ -192,7 +221,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
                         &clonedFInfo);
 
       // Store the mapped entry block.
-      entryBlocks.push_back(cast<BasicBlock>(valueMap[&noiseFn->getEntryBlock()]));
+      entryBlocks.push_back(cast<BasicBlock>(valueMap[&NoiseFn->getEntryBlock()]));
 
       // Store the mapped exit block.
       assert (returns.size() == 1);
@@ -207,7 +236,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
 
       // Replace uses of specializeCallVal in each variant by the corresponding value.
       ConstantInt* onVal = ConstantInt::get(variableType,
-                                            (*mValues)[i],
+                                            mValues[i],
                                             true);
       if (Argument* arg = dyn_cast<Argument>(mappedVal))
       {
@@ -232,7 +261,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   for (unsigned i=0; i<numVariants; ++i)
   {
       ConstantInt* onVal = ConstantInt::get(variableType,
-                                            (*mValues)[i],
+                                            mValues[i],
                                             true);
       BasicBlock* destBB = entryBlocks[i];
       switchInst->addCase(onVal, destBB);
@@ -251,9 +280,9 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
 
   //-------------------------------------------------------------------------//
   // Replace body of old function with new function.
-  noiseFn->deleteBody();
+  NoiseFn->deleteBody();
   ValueToValueMapTy valueMap;
-  Function::arg_iterator destI = noiseFn->arg_begin();
+  Function::arg_iterator destI = NoiseFn->arg_begin();
   for (Function::const_arg_iterator I = switchFn->arg_begin(),
        E = switchFn->arg_end(); I != E; ++I)
   {
@@ -267,7 +296,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   SmallVector<ReturnInst*, 2>  returns;
   ClonedCodeInfo               clonedFInfo;
   const char*                  nameSuffix = ".";
-  CloneFunctionInto(noiseFn,
+  CloneFunctionInto(NoiseFn,
                     switchFn,
                     valueMap,
                     false,
@@ -285,7 +314,7 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
          UE=specializeFn->use_end(); U!=UE; )
     {
       CallInst* useI = cast<CallInst>(*U++);
-      if (useI->getParent()->getParent() != noiseFn) continue;
+      if (useI->getParent()->getParent() != NoiseFn) continue;
       Value* value = useI->getOperand(0);
       useI->replaceAllUsesWith(value);
       useI->eraseFromParent();
@@ -302,9 +331,13 @@ NoiseSpecializer::runSpecializer(Function* noiseFn)
   return true;
 }
 
-
-
 char NoiseSpecializer::ID = 0;
+
+Pass* createNoiseSpecializerPass(StringRef variable, const SmallVector<int, 4> &values)
+{
+  return new NoiseSpecializer(variable.str(), values);
+}
+
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialized-dispatch",

@@ -151,11 +151,11 @@ static void InitBuiltinPass_SPECIALIZE(const NoiseOptimizationInfo &Info, NoiseO
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_SPECIALIZE);
   assert (Info.GetNumArgs() > 1 && "expected at least two arguments for specialized dispatching!");
   const std::string variable = Info.GetArgAsString(0U);
-  SmallVector<int, 4>* values = new SmallVector<int, 4>();
+  SmallVector<int, 4> values;
   for (unsigned i=1, e=Info.GetNumArgs(); i<e; ++i) {
-    values->push_back(Info.GetArgAsInt(i));
+    values.push_back(Info.GetArgAsInt(i));
   }
-  Opt.Register(new NoiseSpecializer(Info.GetArgAsString(0U), values));
+  Opt.Register(createNoiseSpecializerPass(Info.GetArgAsString(0U), values));
 }
 
 static void InitBuiltinPass_VECTORIZE(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
