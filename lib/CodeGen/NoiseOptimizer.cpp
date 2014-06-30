@@ -565,6 +565,8 @@ void NoiseOptimizer::PerformOptimization()
     PM.add(createTypeBasedAliasAnalysisPass());
     PM.add(createBasicAliasAnalysisPass());
     PM.add(createScalarReplAggregatesPass());
+    PM.add(createLoopSimplifyPass());
+    PM.add(createIndVarSimplifyPass());
     PM.run(*Mod);
   }
 
@@ -744,7 +746,6 @@ void NoiseOptimizer::PerformOptimization()
 
     {
       // Perform some standard optimizations after inlining.
-      // TODO: This may disturb user experience.
       FunctionPassManager PM(Mod);
       PM.add(new DataLayout(Mod));
       NoiseOptimizations defaultOpts(registry);
@@ -920,11 +921,9 @@ void NoiseOptimizer::Reassemble()
       // TODO: This may disturb user experience.
       PassManager PM;
       PM.add(new DataLayout(Mod));
-      PM.add(createTypeBasedAliasAnalysisPass());
-      PM.add(createBasicAliasAnalysisPass());
-      PM.add(createCFGSimplificationPass());
-      PM.add(createScalarReplAggregatesPass());
-      PM.add(createEarlyCSEPass());
+      NoiseOptimizations defaultOpts(*PassRegistry::getPassRegistry());
+      defaultOpts.RegisterDefaultOpts();
+      defaultOpts.Populate(PM);
       PM.run(*Mod);
     }
 
