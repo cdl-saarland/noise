@@ -193,9 +193,9 @@ char NoiseFusion::ID = 0;
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseFusion, "noise-loop-fusion",
-                      "Loop fusion for noise attributed loops", false, false)
+                      "Loop fusion", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_DEPENDENCY(LoopSimplify)
 INITIALIZE_PASS_END(NoiseFusion, "noise-loop-fusion",
-                      "Loop fusion for noise attributed loops", false, false)
+                      "Loop fusion", false, false)

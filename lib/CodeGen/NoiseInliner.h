@@ -19,6 +19,9 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace llvm {
+namespace noise {
+  class NoiseDiagnostics;
+}
 
 class Pass;
 class BasicBlock;
@@ -30,7 +33,8 @@ void collectBlocks(BasicBlock* block,
                    BasicBlock* endBB,
                    SmallPtrSet<BasicBlock*, SetSize>& region);
 
-Pass* createNoiseInlinerPass(SmallVector<std::string, 2> &fnNames);
+Pass* createNoiseInlinerPass(SmallVector<std::string, 2> &fnNames,
+                             noise::NoiseDiagnostics &Diag);
 
 }
 

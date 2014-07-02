@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "NoiseOptimization.h"
+
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassManagers.h"
@@ -29,6 +30,8 @@
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+
 #include "NoiseInliner.h"
 #ifdef COMPILE_NOISE_WFV_WRAPPER
 #include "NoiseWFVWrapper.h"
@@ -36,8 +39,79 @@
 #include "NoiseFusion.h"
 #include "NoiseSpecializer.h"
 
+using namespace clang;
+
 namespace llvm {
 namespace noise {
+
+// TODO: move theses messages to tablegen files from clang
+
+#define NOISEDIAG_MSGS(X) \
+  X( invalid_opt,           "Invalid noise optimization " ) \
+  X( invalid_nested_return, "Marked compound statements must not contain return statements." ) \
+  \
+  X( specialize_multiple_var_with_same_name, "Specialization of multiple variables of same name (%0) not supported." ) \
+  X( specialize_no_use_of_specialized_var, "Cannot find unique use of specialized variable %0." ) \
+  X( specialize_depend_on_non_primitive_value, "Cannot specialize variable %0 that depends on non-constant primitive value." ) \
+  X( specialize_two_arguments_expected, "At least two arguments required for specialization." ) \
+  X( specialize_variable_no_longer_available, "Variable %0 no longer available. Inlined?" ) \
+  X( specialize_must_be_integer_value, "Specialization variable %0 must be of integer type." ) \
+  X( specialize_must_be_mutable, "Variable %0 could not be specialized since it was not declared as mutable within the current scope." ) \
+  \
+  X( inline_cannot_find_func, "Function %0 requested for inlining does not exist in module.\\Did you forget to mark the function as external ''C''?" ) \
+  \
+  X( wfv_not_available, "WFV not available. Recompile noise with WFV support." ) \
+  X( wfv_failed, "WFV failed." ) \
+  X( wfv_non_simplified_loops, "Vectorization of non-simplified loop not supported." ) \
+  X( wfv_multiple_exits, "Vectorization of loop with multiple exits not supported." ) \
+  X( wfv_exiting_not_header, "Expected exiting block to be the loop header." ) \
+  X( wfv_cannot_place_reduction_call, "Placing of reduction call is impossible for variable %0." ) \
+  X( wfv_loop_body_does_not_depend_on_induction, "Loop body seems to be independent of induction variable." ) \
+  X( wfv_bad_common_reduction_found, "Bad common reduction operation found. Should be a simple operation (+, *)." ) \
+  X( wfv_not_more_reduction_users_outside_loop, "Must not have more than one reduction user outside the loop." )\
+  X( wfv_multiple_backedges, "Vectorization of loops with multiple back edges not supported." ) \
+  X( wfv_reverse_induction, "Vectorization of loops with reverse induction not supported." ) \
+  X( wfv_pointer_induction, "Vectorization of loops with pointer induction variable not supported." ) \
+  X( wfv_multiple_inductions, "Vectorization of loops with multiple induction variables not supported." ) \
+  X( wfv_non_canonical_induction, "Vectorization of loops without canonical induction variable not supported." ) \
+  X( wfv_induction_update_in_header, "Expected induction variable update operation in latch or header block." ) \
+  X( wfv_induction_update_no_int_addition, "Vectorization of loop with induction variable update operation that is no integer addition not supported." ) \
+  X( wfv_induction_no_simple_increment, "Vectorization of loop with induction variable update operation that is no simple increment not supported." ) \
+  \
+  X( pass_not_found, "The requested pass %0 could not be found." ) \
+  X( pass_not_a_function_pass, "The requested pass %0 is not a function pass." )
+
+#define DIAG_MSG(Type, M) \
+static const char *msg_ ## Type = M;
+  NOISEDIAG_MSGS(DIAG_MSG)
+#undef DIAG_MSG
+
+NoiseDiagnostics::NoiseDiagnostics()
+  : diagOpts(new DiagnosticOptions)
+  , diag(new DiagnosticsEngine(IntrusiveRefCntPtr<DiagnosticIDs>(new DiagnosticIDs), &*diagOpts,
+    new TextDiagnosticPrinter(llvm::errs(), &*diagOpts)))
+#define DIAG_ELEM(Type, IsError) \
+  , err_ ## Type(diag->getCustomDiagID(IsError ? DiagnosticsEngine::Error : DiagnosticsEngine::Warning, \
+                 std::string(msg_ ## Type)))
+    NOISEDIAG_TYPES(DIAG_ELEM)
+#undef DIAG_ELEM
+{}
+
+size_t NoiseDiagnostics::GetNumErrors() const
+{
+  return diag->getClient()->getNumErrors();
+}
+
+DiagnosticBuilder NoiseDiagnostics::Report(unsigned ID)
+{
+  return diag->Report(ID);
+}
+
+void NoiseDiagnostics::TerminateOnError()
+{
+  if (GetNumErrors() > 0)
+    exit(1);
+}
 
 NoiseOptimizationInfo::NoiseOptimizationInfo(NoiseOptimization* Opt)
   : opt(Opt)
@@ -125,7 +199,7 @@ static void InitBuiltinPass_INLINE(const NoiseOptimizationInfo &Info, NoiseOptim
     std::string fnName = Info.GetArgAsString(i);
     fnNames.push_back(fnName);
   }
-  Opt.Register(createNoiseInlinerPass(fnNames));
+  Opt.Register(createNoiseInlinerPass(fnNames, Opt.GetDiag()));
 }
 
 static void InitBuiltinPass_LOOPUNROLL(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
@@ -149,21 +223,25 @@ static void InitBuiltinPass_SPECIALIZE(const NoiseOptimizationInfo &Info, NoiseO
 {
   // pass = "specialize(x,0,1,13)"
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_SPECIALIZE);
-  assert (Info.GetNumArgs() > 1 && "expected at least two arguments for specialized dispatching!");
+  if (Info.GetNumArgs() < 2)
+  {
+    Opt.GetDiag().Report(Opt.GetDiag().err_specialize_two_arguments_expected);
+    return;
+  }
+
   const std::string variable = Info.GetArgAsString(0U);
   SmallVector<int, 4> values;
   for (unsigned i=1, e=Info.GetNumArgs(); i<e; ++i) {
     values.push_back(Info.GetArgAsInt(i));
   }
-  Opt.Register(createNoiseSpecializerPass(Info.GetArgAsString(0U), values));
+  Opt.Register(createNoiseSpecializerPass(Info.GetArgAsString(0U), values, Opt.GetDiag()));
 }
 
 static void InitBuiltinPass_VECTORIZE(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
 {
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_VECTORIZE);
 #ifndef COMPILE_NOISE_WFV_WRAPPER
-  errs() << "ERROR: No support for WFV is available!\n";
-  abort();
+  Opt.GetDiag().Report(Opt.GetDiag().err_wfv_not_available);
 #else
 
   // Add preparatory passes for WFV.
@@ -186,7 +264,7 @@ static void InitBuiltinPass_VECTORIZE(const NoiseOptimizationInfo &Info, NoiseOp
   const bool verbose = false;
 
   // Add WFV pass wrapper.
-  Opt.Register(createNoiseWFVPass(vectorizationWidth, useAVX, verbose));
+  Opt.Register(createNoiseWFVPass(vectorizationWidth, useAVX, verbose, &Opt.GetDiag()));
 #endif
 }
 
@@ -195,8 +273,8 @@ static void InitBuiltinPass_LLVMPASS(const NoiseOptimizationInfo &Info, NoiseOpt
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_LLVMPASS);
   const PassInfo* info = Opt.GetRegistry().getPassInfo(Info.GetPassName());
   if(!info) {
-    errs() << "ERROR: Pass not found: " << Info.GetPassName() << "\n";
-    abort();
+    Opt.GetDiag().Report(Opt.GetDiag().err_pass_not_found).AddString(Info.GetPassName());
+    return;
   }
   Pass* pass = info->createPass();
   if (info->isAnalysis())
@@ -211,14 +289,14 @@ static void InitBuiltinPass_LLVMPASS(const NoiseOptimizationInfo &Info, NoiseOpt
         Opt.Register(pass);
         break;
       default:
-        errs() << "ERROR: \"" << pass->getPassName() << "\" (" << Info.GetPassName() << ") is not a function pass\n";
-        abort();
+        Opt.GetDiag().Report(Opt.GetDiag().err_pass_not_a_function_pass).AddString(Info.GetPassName());
+        return;
     }
   }
 }
 
-NoiseOptimizations::NoiseOptimizations(PassRegistry &Registry)
-  : registry(Registry)
+NoiseOptimizations::NoiseOptimizations(PassRegistry &Registry, NoiseDiagnostics &Diag)
+  : registry(Registry), diag(Diag)
 {}
 
 void NoiseOptimizations::Register(NoiseOptimization *Opt) {

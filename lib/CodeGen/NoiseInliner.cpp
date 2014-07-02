@@ -11,8 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "NoiseInliner.h"
-
 #include "llvm/Pass.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/IR/Module.h"
@@ -20,6 +18,9 @@
 #include "llvm/IR/Function.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include "NoiseInliner.h"
+#include "NoiseOptimization.h"
 
 using namespace llvm;
 
@@ -50,14 +51,15 @@ public:
 
   SmallVector<std::string, 2> functionNames;
   SmallPtrSet<Function*, 2>   functions;
+  noise::NoiseDiagnostics     *Diag;
 
   explicit NoiseInliner()
     : FunctionPass(ID) {
     initializeNoiseInlinerPass(*PassRegistry::getPassRegistry());
   }
 
-  explicit NoiseInliner(SmallVector<std::string, 2> &fnNames)
-  : FunctionPass(ID), functionNames(fnNames) {
+  explicit NoiseInliner(SmallVector<std::string, 2> &fnNames, noise::NoiseDiagnostics &Diag)
+  : FunctionPass(ID), functionNames(fnNames), Diag(&Diag) {
     initializeNoiseInlinerPass(*PassRegistry::getPassRegistry());
   }
 
@@ -76,9 +78,9 @@ public:
       Function* fn = mod->getFunction(*it);
       if (!fn)
       {
-        errs() << "ERROR: Function requested for inlining does not exist in module: '"
-          << *it << "'!\n";
-        abort();
+        clang::DiagnosticBuilder builder = Diag->Report(Diag->err_inline_cannot_find_func);
+        builder.AddString(*it);
+        continue;
       }
 
       functions.insert(fn);
@@ -111,6 +113,8 @@ public:
       InlineFunction(*it, IFI);
     }
 
+    Diag->TerminateOnError();
+
     return true;
   }
 
@@ -118,8 +122,8 @@ public:
   }
 };
 
-Pass* createNoiseInlinerPass(SmallVector<std::string, 2> &fnNames) {
-  return new NoiseInliner(fnNames);
+Pass* createNoiseInlinerPass(SmallVector<std::string, 2> &fnNames, noise::NoiseDiagnostics &Diag) {
+  return new NoiseInliner(fnNames, Diag);
 }
 
 char NoiseInliner::ID = 0;
@@ -127,6 +131,6 @@ char NoiseInliner::ID = 0;
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseInliner, "noise-inline",
-                      "Forces inlining of calls", false, false)
+                      "Inline functions", false, false)
 INITIALIZE_PASS_END(NoiseInliner, "noise-inline",
-                    "Forces inlining of calls", false, false)
+                    "Inline functions", false, false)

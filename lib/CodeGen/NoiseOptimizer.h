@@ -15,6 +15,7 @@
 #define CLANG_CODEGEN_NOISEOPTIMIZER_H
 
 #include "llvm/ADT/SmallVector.h"
+
 #include "NoiseOptimization.h"
 
 namespace llvm {
@@ -44,7 +45,7 @@ namespace noise {
       mReinline(reinline), mOptDesc(0)
     {}
 
-    void UpdateOptDesc(MDNode* OptDesc);
+    void UpdateOptDesc(MDNode* OptDesc, NoiseDiagnostics &Diag);
 
     size_t GetNumOptimizations() const;
     NoiseOptimization* GetOptimization(size_t i);
@@ -52,7 +53,7 @@ namespace noise {
 
   typedef SmallVector<NoiseFnInfo*, 4> NoiseFnInfoVecType;
 
-  class NoiseOptimizer {
+  class NoiseOptimizer : public NoiseDiagnostics {
   public:
     NoiseOptimizer(Module *M);
     ~NoiseOptimizer();

@@ -11,8 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "NoiseSpecializer.h"
-
+#include <sstream>
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -27,7 +26,8 @@
 #include "llvm/IR/Constants.h" // UndefValue
 #include "llvm/IR/Instructions.h" // CallInst
 
-#include <sstream>
+#include "NoiseSpecializer.h"
+#include "NoiseOptimization.h"
 
 using namespace llvm;
 
@@ -43,10 +43,12 @@ public:
   LLVMContext              *mContext;
   const std::string         mVariable;
   const SmallVector<int, 4> mValues;
+  noise::NoiseDiagnostics  *Diag;
 
   NoiseSpecializer();
   NoiseSpecializer(StringRef                  variable,
-                   const SmallVector<int, 4> &values);
+                   const SmallVector<int, 4> &values,
+                   noise::NoiseDiagnostics   &Diag);
 
   virtual ~NoiseSpecializer();
 
@@ -65,30 +67,22 @@ NoiseSpecializer::NoiseSpecializer()
 }
 
 NoiseSpecializer::NoiseSpecializer(StringRef                  variable,
-                                   const SmallVector<int, 4> &values)
-: FunctionPass(ID), mVariable(variable), mValues(values)
+                                   const SmallVector<int, 4> &values,
+                                   noise::NoiseDiagnostics   &Diag)
+  : FunctionPass(ID), mVariable(variable), mValues(values), Diag(&Diag)
 {
     initializeNoiseSpecializerPass(*PassRegistry::getPassRegistry());
 }
 
 NoiseSpecializer::~NoiseSpecializer()
-{
-}
+{ }
 
 bool NoiseSpecializer::runOnFunction(Function &F)
 {
   mModule   = F.getParent();
   mContext  = &F.getContext();
 
-  const bool success = runSpecializer(&F);
-
-  if (!success)
-  {
-    errs() << "ERROR: Specialized dispatching failed!\n";
-  }
-
-  // If not successful, nothing changed.
-  return success;
+  return runSpecializer(&F);
 }
 
 void NoiseSpecializer::getAnalysisUsage(AnalysisUsage &AU) const {}
@@ -146,8 +140,7 @@ bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
   {
     // The value of the specialized call is already inlined and no longer
     // available.
-    // TODO: produce warning
-    outs() << "Variable '" << mVariable << "' no longer available. Inlined?\n";
+    Diag->Report(Diag->err_specialize_variable_no_longer_available).AddString(mVariable);
     return true;
   }
 
@@ -156,14 +149,20 @@ bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
 
   CallInst* specializeCall = cast<CallInst>(*specializeFn->use_begin());
 
-  assert (specializeCall->getType()->isIntegerTy() &&
-          "specialized dispatch currently only implemented for integer values");
+  if (!specializeCall->getType()->isIntegerTy())
+  {
+    Diag->Report(Diag->err_specialize_must_be_integer_value).AddString(mVariable);
+    return false;
+  }
   IntegerType* variableType = cast<IntegerType>(specializeCall->getType());
 
   // It can happen that our call is referenced by multiple users, and thus,
   // we only have to ensure that at least one user exists.
-  assert (specializeCall->getNumUses() >= 1 &&
-          "Variable could not be specialized since it was not declared as mutable within the current scope.");
+  if (specializeCall->getNumUses() < 1)
+  {
+    Diag->Report(Diag->err_specialize_must_be_mutable).AddString(mVariable);
+    return false;
+  }
 
   // If this is a compound statement, there is one more indirection
   // because of the extracted function.
@@ -250,8 +249,6 @@ bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
       }
   }
 
-  //BasicBlock* exitBB = BasicBlock::Create(*mContext, "noiseSpecializeEnd", switchFn);
-
   //-------------------------------------------------------------------------//
   // Create switch statement.
   SwitchInst* switchInst = SwitchInst::Create(mappedVal,
@@ -334,14 +331,14 @@ bool NoiseSpecializer::runSpecializer(Function *NoiseFn)
 
 char NoiseSpecializer::ID = 0;
 
-Pass* createNoiseSpecializerPass(StringRef variable, const SmallVector<int, 4> &values)
+Pass* createNoiseSpecializerPass(StringRef variable, const SmallVector<int, 4> &values, noise::NoiseDiagnostics &Diag)
 {
-  return new NoiseSpecializer(variable.str(), values);
+  return new NoiseSpecializer(variable.str(), values, Diag);
 }
 
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseSpecializer, "noise-specialized-dispatch",
-                      "Specialized dispatching for noise functions", false, false)
+                      "Specialized dispatching", false, false)
 INITIALIZE_PASS_END(NoiseSpecializer, "noise-specialized-dispatch",
-                    "Specialized dispatching for noise functions", false, false)
+                    "Specialized dispatching", false, false)

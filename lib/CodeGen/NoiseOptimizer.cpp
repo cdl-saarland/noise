@@ -52,6 +52,7 @@
 #include <iostream>
 #include <sstream>
 
+using namespace clang;
 using namespace llvm;
 
 namespace {
@@ -98,15 +99,18 @@ void initializeNoiseExtractorPass(PassRegistry&);
 struct NoiseExtractor : public FunctionPass {
   static char ID; // Pass identification, replacement for typeid
 
-  noise::NoiseFnInfoVecType* noiseFnInfoVec;
-  NamedMDNode*               MD;
+  noise::NoiseFnInfoVecType *noiseFnInfoVec;
+  NamedMDNode               *MD;
   SmallSet<Function*, 64>    createdFunctions;
-  Module*                    Mod;
-  LLVMContext*               Context;
+  Module                    *Mod;
+  LLVMContext               *Context;
+  noise::NoiseDiagnostics   *Diag;
 
-  NoiseExtractor(noise::NoiseFnInfoVecType* noiseFuncInfoVec=0,
-                 NamedMDNode*               mdNode=0)
-  : FunctionPass(ID), noiseFnInfoVec(noiseFuncInfoVec), MD(mdNode) {
+  NoiseExtractor(noise::NoiseFnInfoVecType *NoiseFuncInfoVec=0,
+                 NamedMDNode               *MdNode=0,
+                 noise::NoiseDiagnostics   *Diag = 0)
+   : FunctionPass(ID), noiseFnInfoVec(NoiseFuncInfoVec), MD(MdNode), Diag(Diag)
+  {
     initializeNoiseExtractorPass(*PassRegistry::getPassRegistry());
   }
 
@@ -160,9 +164,10 @@ struct NoiseExtractor : public FunctionPass {
     {
       if (!isa<ReturnInst>((*it)->getTerminator())) continue;
 
-      errs() << "ERROR: Marked region must not contain a 'return' statement!\n";
-      abort();
+      Diag->Report(Diag->err_invalid_nested_return) << (*it)->getParent()->getName();
     }
+
+    Diag->TerminateOnError();
 
     // Create new function from the marked range.
     SmallVector<BasicBlock*, SetSize> regionVec(region.begin(), region.end());
@@ -177,9 +182,6 @@ struct NoiseExtractor : public FunctionPass {
     CallInst* call = cast<CallInst>(*extractedFn->use_begin());
     noise::NoiseFnInfo* nfi = new noise::NoiseFnInfo(extractedFn, call, true);
     noiseFnInfoVec->push_back(nfi);
-
-    //outs() << "extracted function: " << *extractedFn << "\n";
-    //outs() << "source function: " << *call->getParent()->getParent() << "\n";
 
     // Create global (function) metadata for the new function from the statement attribute.
     assert(Mod);
@@ -244,12 +246,16 @@ namespace noise {
 
 // NoiseFnInfo
 
-void NoiseFnInfo::UpdateOptDesc(MDNode* OptDesc)
+void NoiseFnInfo::UpdateOptDesc(MDNode* OptDesc, NoiseDiagnostics &Diag)
 {
   // according to the description from NoiseOptimization.h
   size_t numOps = OptDesc->getNumOperands();
-  for(size_t i = 0; i < numOps; ++i)
-    assert( isa<NoiseOptimization>(OptDesc->getOperand(i)) && "invalid noise opt" );
+  for (size_t i = 0; i < numOps; ++i)
+  {
+    Value *value = OptDesc->getOperand(i);
+    if (!isa<NoiseOptimization>(value))
+      Diag.Report(Diag.err_invalid_opt) << value;
+  }
 
   mOptDesc = OptDesc;
 }
@@ -281,22 +287,6 @@ NoiseOptimizer::~NoiseOptimizer()
   }
   delete NoiseMod;
 }
-
-struct NoisePassListener : public PassRegistrationListener {
-
-  NoisePassListener() {}
-
-  virtual ~NoisePassListener() {}
-
-  virtual void passRegistered(const PassInfo *) {}
-
-  void enumeratePasses();
-
-  virtual void passEnumerate(const PassInfo * p)
-  {
-    outs() << p->getPassArgument() << " (" << p->getPassName() << ")\n";
-  }
-};
 
 namespace {
 
@@ -394,7 +384,8 @@ Function* createDummyFunction(Function* noiseFn)
 }
 
 void createDummyVarNameCalls(Module*            module,
-                             const NamedMDNode& MD)
+                             const NamedMDNode& MD,
+                             NoiseDiagnostics &Diag)
 {
   // Handle noise specialize attributes.
   for (Module::iterator F=module->begin(), FE=module->end(); F!=FE; ++F)
@@ -462,8 +453,11 @@ void createDummyVarNameCalls(Module*            module,
         sstr << "__noise_specialize_" << varName;
         const std::string& specializeFnName = sstr.str();
 
-        assert (!module->getFunction(specializeFnName) &&
-                "specialization of multiple variables of same name not implemented!");
+        if (module->getFunction(specializeFnName))
+        {
+          DiagnosticBuilder builder = Diag.Report(Diag.err_specialize_multiple_var_with_same_name);
+          builder.AddString(varName);
+        }
 
         Type* type = I->getType();
         FunctionType* fType = FunctionType::get(type->getPointerElementType(),
@@ -502,7 +496,12 @@ void createDummyVarNameCalls(Module*            module,
           firstStore = storeI;
           specializedVal = storeI->getValueOperand();
         }
-        assert (curBlock && "Cannot find unique use of specialized variable");
+        if (!curBlock)
+        {
+          DiagnosticBuilder builder = Diag.Report(Diag.err_specialize_no_use_of_specialized_var);
+          builder.AddString(varName);
+          continue;
+        }
         assert (specializedVal);
 
         CallInst* call = CallInst::Create(dummyFn,
@@ -514,14 +513,19 @@ void createDummyVarNameCalls(Module*            module,
         // In the first reachable use of I that is a store,
         // replace the operand by our call.
         Value* op = firstStore->getOperand(0);
-        assert((dyn_cast<ConstantInt>(op) || dyn_cast<Argument>(op) || dyn_cast<AllocaInst>(op) || dyn_cast<LoadInst>(op)) &&
-          "Cannot specialize variables that depend on non-constant primitive values");
+        if (!dyn_cast<ConstantInt>(op) && !dyn_cast<Argument>(op) && !dyn_cast<AllocaInst>(op) && !dyn_cast<LoadInst>(op))
+        {
+          DiagnosticBuilder builder = Diag.Report(Diag.err_specialize_no_use_of_specialized_var);
+          builder.AddString(varName);
+          continue;
+        }
         // Wire our specialization function
         firstStore->setOperand(0, call);
         // Place the instruction before the origin I
         I->moveBefore(call);
       }
     }
+    Diag.TerminateOnError();
   }
 }
 
@@ -551,7 +555,7 @@ void NoiseOptimizer::PerformOptimization()
   // Before transforming to SROA, create dummy calls for phases like
   // specialize that need to have a mapping of variable names to SSA
   // values.
-  createDummyVarNameCalls(Mod, *MD);
+  createDummyVarNameCalls(Mod, *MD, *this);
 
   {
     // Perform some standard optimizations upfront.
@@ -574,7 +578,7 @@ void NoiseOptimizer::PerformOptimization()
   // These functions look exactly like functions with noise function attribute.
   {
     PassManager PM;
-    PM.add(new NoiseExtractor(&noiseFnInfoVec, MD));
+    PM.add(new NoiseExtractor(&noiseFnInfoVec, MD, this));
     PM.run(*Mod);
   }
 
@@ -605,7 +609,7 @@ void NoiseOptimizer::PerformOptimization()
       noiseFnInfoVec.push_back(nfi);
     }
 
-    nfi->UpdateOptDesc(GetNoiseOptDesc(functionMDN));
+    nfi->UpdateOptDesc(GetNoiseOptDesc(functionMDN), *this);
     assert (nfi->mOptDesc);
 
     // Make sure that no other optimizations than the requested ones are
@@ -690,14 +694,10 @@ void NoiseOptimizer::PerformOptimization()
       (*it)->eraseFromParent();
     }
 
-    // Display all available passes.
-    //NoisePassListener list;
-    //Registry->enumerateWith(&list);
-    outs() << "Running noise optimizations on function '"
-      << noiseFn->getName() << "': \n";
+    outs() << "Running noise optimizations on function '" << noiseFn->getName() << "': \n";
 
     // Run requested noise passes.
-    NoiseOptimizations optimizations(registry);
+    NoiseOptimizations optimizations(registry, *this);
     for(size_t i = 0, e = nfi->GetNumOptimizations(); i < e; ++i) {
       NoiseOptimization* noiseOpt = nfi->GetOptimization(i);
       optimizations.Register(noiseOpt);
@@ -705,6 +705,7 @@ void NoiseOptimizer::PerformOptimization()
     FunctionPassManager NoisePasses(Mod);
     NoisePasses.add(new DataLayout(Mod));
     optimizations.Populate(NoisePasses);
+    TerminateOnError();
 
     // TODO: Remove this when reaching "production" state or so.
     NoisePasses.add(createVerifierPass());
@@ -748,18 +749,16 @@ void NoiseOptimizer::PerformOptimization()
       // Perform some standard optimizations after inlining.
       FunctionPassManager PM(Mod);
       PM.add(new DataLayout(Mod));
-      NoiseOptimizations defaultOpts(registry);
+      NoiseOptimizations defaultOpts(registry, *this);
       defaultOpts.RegisterDefaultOpts();
       defaultOpts.Populate(PM);
       PM.run(*parentFn);
+      TerminateOnError();
     }
-
-    //outs() << "module after reinlining: " << *Mod << "\n";
   }
 
   // At this point, all noise functions that were not "top level" are
   // inlined and erased.
-  //outs() << "module after passes: " << *Mod << "\n";
 
   // Finally, move all "top-level" noise functions into a different
   // module and set calls to them to an external declaration. This is to
@@ -804,23 +803,6 @@ void NoiseOptimizer::PerformOptimization()
     // This is only valid for non-function noise.
     if (call) call->setCalledFunction(nfi->mOrigFn);
   }
-
-  // If we have moved top-level functions that include calls to "compound
-  // noise" functions, we also have to move the declarations of those callees.
-  // The declarations in question are those that have a use in the NoiseMod.
-  for (unsigned i=0, e=noiseFnInfoVec.size(); i<e; ++i)
-  {
-    NoiseFnInfo* nfi      = noiseFnInfoVec[i];
-    Function*    noiseFn  = nfi->mMovedFn;
-
-    // If this is no top level function, continue.
-    if (!noiseFn) continue;
-
-    // TODO: What is this?!
-  }
-
-  //outs() << "module after outsourcing: " << *Mod << "\n";
-  //outs() << "noise module after outsourcing: " << *NoiseMod << "\n";
 }
 
 void NoiseOptimizer::Reassemble()
@@ -918,16 +900,14 @@ void NoiseOptimizer::Reassemble()
 
     {
       // Perform some standard optimizations after inlining.
-      // TODO: This may disturb user experience.
       PassManager PM;
       PM.add(new DataLayout(Mod));
-      NoiseOptimizations defaultOpts(*PassRegistry::getPassRegistry());
+      NoiseOptimizations defaultOpts(*PassRegistry::getPassRegistry(), *this);
       defaultOpts.RegisterDefaultOpts();
       defaultOpts.Populate(PM);
       PM.run(*Mod);
+      TerminateOnError();
     }
-
-    //outs() << "module after post inlining std opts: " << *Mod << "\n";
   }
 }
 
@@ -937,7 +917,6 @@ void NoiseOptimizer::Finalize()
   // TODO: Only if we know that there is only noise metadata inside.
   // TODO: If we don't do this, CodeGenPasses->run() fails with an assertion.
   MD->eraseFromParent();
-  outs() << "\nmodule after noise: " << *Mod;
 }
 
 }

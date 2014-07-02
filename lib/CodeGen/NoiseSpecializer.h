@@ -20,9 +20,14 @@
 using namespace llvm;
 
 namespace llvm {
+namespace noise {
+  class NoiseDiagnostics;
+}
 
 class Pass;
-Pass* createNoiseSpecializerPass(StringRef variable, const SmallVector<int, 4> &values);
+Pass* createNoiseSpecializerPass(StringRef variable,
+                                 const SmallVector<int, 4> &values,
+                                 noise::NoiseDiagnostics &Diag);
 
 }
 

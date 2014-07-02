@@ -24,12 +24,15 @@
 class RedVarVecType;
 
 namespace llvm {
-
+namespace noise {
+  class NoiseDiagnostics;
+}
 class Pass;
 
-Pass* createNoiseWFVPass(const unsigned vectorizationWidth=4,
-                         const bool     useAVX=false,
-                         const bool     verbose=false);
+Pass* createNoiseWFVPass(const unsigned           vectorizationWidth=4,
+                         const bool               useAVX=false,
+                         const bool               verbose=false,
+                         noise::NoiseDiagnostics *Diag = 0);
 
 
 }

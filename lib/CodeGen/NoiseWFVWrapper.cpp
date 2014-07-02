@@ -13,8 +13,6 @@
 
 #ifdef COMPILE_NOISE_WFV_WRAPPER
 
-#include "NoiseWFVWrapper.h"
-
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
 #include "llvm/PassRegistry.h"
@@ -58,7 +56,9 @@
 
 #include <wfvInterface.h>
 
-//#define DEBUG_NOISE_WFV(x) do { x } while (0)
+#include "NoiseWFVWrapper.h"
+#include "NoiseOptimization.h"
+
 #define DEBUG_NOISE_WFV(x) ((void)0)
 
 namespace llvm {
@@ -69,17 +69,18 @@ struct NoiseWFVWrapper : public FunctionPass {
 public:
   static char ID; // Pass identification, replacement for typeid
 
-  bool             mFinished;
+  bool                     mFinished;
 
-  Module*          mModule;
-  LLVMContext*     mContext;
-  DominatorTree*   mDomTree;
-  LoopInfo*        mLoopInfo;
-  ScalarEvolution* mSCEV;
+  Module*                  mModule;
+  LLVMContext*             mContext;
+  DominatorTree*           mDomTree;
+  LoopInfo*                mLoopInfo;
+  ScalarEvolution*         mSCEV;
 
   unsigned mVectorizationFactor;
   bool mUseAVX;
   bool mVerbose;
+  noise::NoiseDiagnostics *Diag;
 
   struct ReductionUpdate
   {
@@ -141,9 +142,10 @@ public:
 
   typedef SmallVector<ReductionVariable*, 2> RedVarVecType;
 
-  explicit NoiseWFVWrapper(const unsigned vectorizationWidth=4,
-                           const bool     useAVX=false,
-                           const bool     verbose=false);
+  explicit NoiseWFVWrapper(const unsigned           vectorizationWidth = 4,
+                           const bool               useAVX = false,
+                           const bool               verbose = false,
+                           noise::NoiseDiagnostics *Diag = 0);
   virtual ~NoiseWFVWrapper();
 
   virtual bool runOnFunction(Function &F);
@@ -152,7 +154,7 @@ public:
 
   bool runWFV(Function* noiseFn);
 
-  void collectReductionVariables(RedVarVecType&       redVars,
+  bool collectReductionVariables(RedVarVecType&       redVars,
                                  PHINode*             indVarPhi,
                                  const Loop&          loop,
                                  const DominatorTree& domTree);
@@ -176,23 +178,16 @@ NoiseWFVWrapper::ReductionVariable::~ReductionVariable()
   delete mUpdates;
 }
 
-#if 0
-Pass*
-createNoiseWFVWrapperPass()
-{
-  return new NoiseWFVWrapper();
-}
-#endif
-
-
-NoiseWFVWrapper::NoiseWFVWrapper(const unsigned vectorizationWidth,
-                                 const bool     useAVX,
-                                 const bool     verbose)
+NoiseWFVWrapper::NoiseWFVWrapper(const unsigned           vectorizationWidth,
+                                 const bool               useAVX,
+                                 const bool               verbose,
+                                 noise::NoiseDiagnostics *Diag)
 : FunctionPass(ID),
   mFinished(false),
   mVectorizationFactor(vectorizationWidth),
   mUseAVX(useAVX),
-  mVerbose(verbose)
+  mVerbose(verbose),
+  Diag(Diag)
 {
   initializeNoiseWFVWrapperPass(*PassRegistry::getPassRegistry());
 }
@@ -217,10 +212,9 @@ NoiseWFVWrapper::runOnFunction(Function &F)
   const bool success = runWFV(&F);
 
   if (!success)
-  {
-    errs() << "ERROR: WFV failed!\n";
-    abort();
-  }
+    Diag->Report(Diag->err_wfv_failed);
+
+  Diag->TerminateOnError();
 
   // If not successful, nothing changed.
   // TODO: Make sure this is correct, e.g. by re-inlining the extracted
@@ -236,9 +230,9 @@ NoiseWFVWrapper::getAnalysisUsage(AnalysisUsage &AU) const
   AU.addRequired<ScalarEvolution>();
 }
 
-Pass* createNoiseWFVPass(const unsigned vectorizationWidth, const bool useAVX, const bool verbose)
+Pass* createNoiseWFVPass(const unsigned vectorizationWidth, const bool useAVX, const bool verbose, noise::NoiseDiagnostics *Diag)
 {
-  return new NoiseWFVWrapper(vectorizationWidth, useAVX, verbose);
+  return new NoiseWFVWrapper(vectorizationWidth, useAVX, verbose, Diag);
 }
 
 
@@ -388,12 +382,13 @@ cloneLoop(Loop*              loop,
 
 template<unsigned S>
 Function*
-extractLoopBody(Loop*                        loop,
-                PHINode*                     indVarPhi,
-                Instruction*&                indVarUpdate,
+extractLoopBody(Loop                        *loop,
+                PHINode                     *indVarPhi,
+                Instruction                *&indVarUpdate,
                 const unsigned               vectorizationFactor,
-                DominatorTree*               domTree,
-                SmallVector<BasicBlock*, S>& loopBody)
+                DominatorTree               *domTree,
+                SmallVector<BasicBlock*, S> &loopBody,
+                noise::NoiseDiagnostics     &Diag)
 {
   assert (loop && indVarPhi);
   assert (loopBody.empty());
@@ -401,14 +396,18 @@ extractLoopBody(Loop*                        loop,
   BasicBlock* headerBB    = loop->getHeader();
   BasicBlock* latchBB     = loop->getLoopLatch();
   BasicBlock* exitingBB   = loop->getExitingBlock();
-  assert (loop->getLoopPreheader() && headerBB && latchBB &&
-          "vectorization of non-simplified loop not supported!");
-  assert (exitingBB &&
-          "vectorization of loop with multiple exits not supported!");
-  assert (exitingBB == headerBB &&
-          "expected exiting block to be the loop header!");
+
+  if (!loop->getLoopPreheader() || !headerBB || !latchBB)
+    Diag.Report(Diag.err_wfv_non_simplified_loops);
+  if (!exitingBB)
+    Diag.Report(Diag.err_wfv_multiple_exits);
+  if (exitingBB != headerBB)
+    Diag.Report(Diag.err_wfv_exiting_not_header);
 
   const bool indVarUpdateInLatch = indVarUpdate->getParent() == latchBB;
+
+  if (Diag.GetNumErrors() > 0)
+    return 0;
 
   // Collect all blocks that are definitely part of the body.
   std::vector<BasicBlock*>& blocks = loop->getBlocksVector();
@@ -1306,17 +1305,19 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   BasicBlock* latchBB     = loop->getLoopLatch();
   BasicBlock* exitBB      = loop->getExitBlock();
   BasicBlock* exitingBB   = loop->getExitingBlock();
-  assert (preheaderBB && headerBB && latchBB &&
-          "vectorization of non-simplified loop not supported!");
+
+  if (!loop->getLoopPreheader() || !headerBB || !latchBB)
+    Diag->Report(Diag->err_wfv_non_simplified_loops);
+  if (!exitingBB || !exitBB)
+    Diag->Report(Diag->err_wfv_multiple_exits);
+
+  if (loop->getNumBackEdges() != 1)
+    Diag->Report(Diag->err_wfv_multiple_backedges);
+
   assert (loop->isLoopSimplifyForm() &&
           "vectorization of non-simplified loop not supported!");
   assert (loop->isLCSSAForm(*mDomTree) &&
           "vectorization of loops not in LCSSA form not supported!");
-
-  assert (loop->getNumBackEdges() == 1 &&
-          "vectorization of loops with multiple back edges not supported!");
-  assert (exitBB && exitingBB &&
-          "vectorization of loops with multiple exits not supported!");
 
   //-------------------------------------------------------------------------//
 
@@ -1345,7 +1346,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
       if (type->isIntegerTy() && stepRec->isAllOnesValue())
       {
-        errs() << "WARNING: vectorization of loop with reverse induction not implemented!\n";
+        Diag->Report(Diag->err_wfv_reverse_induction);
         continue;
       }
 
@@ -1353,14 +1354,13 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
 
       if (type->isPointerTy())
       {
-        errs() << "WARNING: vectorization of loop with pointer induction not implemented!\n";
+        Diag->Report(Diag->err_wfv_pointer_induction);
         continue;
       }
 
       if (indVarPhi)
       {
-        errs() << "WARNING: vectorization of loop with multiple "
-            << "induction variables not implemented!\n";
+        Diag->Report(Diag->err_wfv_multiple_inductions);
         continue;
       }
 
@@ -1368,24 +1368,34 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     }
   }
 
-  assert (indVarPhi &&
-          "vectorization of loops without canonical induction variable not supported!");
+  if (!indVarPhi)
+  {
+    Diag->Report(Diag->err_wfv_non_canonical_induction);
+    return false;
+  }
   assert (isa<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB)) &&
           "expected induction variable update value to be an instruction!");
   Instruction* indVarUpdate = cast<Instruction>(indVarPhi->getIncomingValueForBlock(latchBB));
-  assert ((indVarUpdate->getParent() == latchBB || indVarUpdate->getParent() == headerBB) &&
-          "expected induction variable update operation in latch or header block!");
+  if (!(indVarUpdate->getParent() == latchBB || indVarUpdate->getParent() == headerBB))
+  {
+    Diag->Report(Diag->err_wfv_induction_update_in_header);
+    return false;
+  }
 
-  // TODO: These should return gracefully.
   // TODO: These should eventually be replaced by generation of fixup code.
-  assert (indVarUpdate->getOpcode() == Instruction::Add &&
-          "vectorization of loop with induction variable update operation that is no integer addition not supported!");
-  assert ((indVarUpdate->getOperand(0) == indVarPhi ||
-           indVarUpdate->getOperand(1) == indVarPhi) &&
-          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
-  assert ((indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
-           indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)) &&
-          "vectorization of loop with induction variable update operation that is no simple increment not supported!");
+  if (indVarUpdate->getOpcode() != Instruction::Add)
+  {
+    Diag->Report(Diag->err_wfv_induction_update_no_int_addition);
+    return false;
+  }
+  if (!(indVarUpdate->getOperand(0) == indVarPhi ||
+        indVarUpdate->getOperand(1) == indVarPhi) ||
+      !(indVarUpdate->getOperand(0) == ConstantInt::get(indVarUpdate->getType(), 1U) ||
+        indVarUpdate->getOperand(1) == ConstantInt::get(indVarUpdate->getType(), 1U)))
+  {
+    Diag->Report(Diag->err_wfv_induction_no_simple_increment);
+    return false;
+  }
 
   // Do some sanity checks to test assumptions about our construction.
   assert (preheaderBB == &noiseFn->getEntryBlock() ||
@@ -1402,7 +1412,8 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   // TODO: There's a problem with store-load chains that we don't detect
   //       to be part of the SCC! Make sure we are conservative with that.
   RedVarVecType redVars;
-  collectReductionVariables(redVars, indVarPhi, *loop, *mDomTree);
+  if (!collectReductionVariables(redVars, indVarPhi, *loop, *mDomTree))
+    return false;
 
   // Print info & check sanity.
   assert (redVars.empty() || noiseFn == (*redVars.begin())->mPhi->getParent()->getParent());
@@ -1769,12 +1780,10 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
                                          indVarUpdate,
                                          mVectorizationFactor,
                                          mDomTree,
-                                         loopBody);
+                                         loopBody,
+                                         *Diag);
   if (!loopBodyFn)
-  {
-    errs() << "ERROR: Loop body extraction failed!\n";
     return false;
-  }
   assert (indVarUpdate);
 
   // Update preheaderBB and latchBB.
@@ -1891,9 +1900,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     redVar.mReductionPos = getCallInsertPosition(redVar, earliestPos, latestPos);
     if (!redVar.mReductionPos)
     {
-      errs() << "ERROR: Placing of reduction call is impossible for variable: "
-          << *redVar.mPhi << "\n";
-      assert (false && "placing of reduction call is impossible!");
+      Diag->Report(Diag->err_wfv_cannot_place_reduction_call).AddString(redVar.mPhi->getName());
       return false;
     }
 
@@ -2076,7 +2083,12 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     newParamTypes.push_back(type);
 
   }
-  assert (indVarArg && "loop body independent of induction variable!?");
+  if (!indVarArg)
+  {
+    Diag->Report(Diag->err_wfv_loop_body_does_not_depend_on_induction);
+    return false;
+  }
+  assert(indVarArg);
   FunctionType* simdFnType = FunctionType::get(newReturnType, newParamTypes, false);
 
   // Create new name.
@@ -2252,8 +2264,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
       }
       default:
       {
-        errs() << "ERROR: Bad common operation for 'simple' reduction found!\n";
-        assert (false && "should never happen!");
+        Diag->Report(Diag->err_wfv_bad_common_reduction_found);
         return false;
       }
     }
@@ -2564,7 +2575,7 @@ gatherConditions(BasicBlock*                  block,
     }
     else
     {
-      assert (false && "not implemented!");
+      assert (false && "cannot gather condition - not implemented!");
     }
   }
 
@@ -2661,7 +2672,7 @@ isCAUpdateOp(const unsigned opcode)
 } // unnamed namespace
 
 // TODO: Make sure there is no interference between reduction variables.
-void
+bool
 NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
                                            PHINode*             indVarPhi,
                                            const Loop&          loop,
@@ -2721,8 +2732,11 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
         continue;
       }
 
-      assert (!redVar->mResultUser &&
-              "must not have more than one reduction user outside the loop!");
+      if (redVar->mResultUser)
+      {
+        Diag->Report(Diag->err_wfv_not_more_reduction_users_outside_loop);
+        return false;
+      }
       redVar->mResultUser = exitPhi;
     }
 
@@ -2782,8 +2796,11 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
       assert (isa<Instruction>(*U));
       Instruction* useI = cast<Instruction>(*U);
       if (loop.contains(useI->getParent())) continue;
-      assert (useI == redVar->mResultUser &&
-              "must not have more than one reduction user outside the loop!");
+      if (useI != redVar->mResultUser)
+      {
+        Diag->Report(Diag->err_wfv_not_more_reduction_users_outside_loop);
+        return false;
+      }
     }
 
     // The other information is only inserted later.
@@ -2797,6 +2814,7 @@ NoiseWFVWrapper::collectReductionVariables(RedVarVecType&       redVars,
 
     redVars.push_back(redVar);
   }
+  return true;
 }
 
 
@@ -2804,12 +2822,12 @@ char NoiseWFVWrapper::ID = 0;
 } // namespace llvm
 
 INITIALIZE_PASS_BEGIN(NoiseWFVWrapper, "wfv-wrapper",
-                      "wrapper pass around WFV library", false, false)
+                      "Whole-Function Vectorization", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(LoopInfo)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
 INITIALIZE_PASS_END(NoiseWFVWrapper, "wfv-wrapper",
-                    "wrapper pass around WFV library", false, false)
+                    "Whole-Function Vectorization", false, false)
 
 #endif
 
