@@ -56,11 +56,12 @@ namespace noise {
   class NoiseOptimizer : public NoiseDiagnostics {
   public:
     NoiseOptimizer(Module *M);
-    ~NoiseOptimizer();
+    virtual ~NoiseOptimizer();
 
     void PerformOptimization();
     void Reassemble();
     void Finalize();
+    virtual Module* GetModule() { return Mod; }
 
   private:
     Module       *Mod;

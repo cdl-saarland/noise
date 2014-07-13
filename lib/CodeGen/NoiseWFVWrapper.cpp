@@ -1295,8 +1295,12 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   //-------------------------------------------------------------------------//
 
   // Get the only outermost loop of this function.
-  assert (std::distance(mLoopInfo->begin(), mLoopInfo->end()) == 1 &&
-          "expected exactly one top level loop in noise function!");
+  if (std::distance(mLoopInfo->begin(), mLoopInfo->end()) != 1)
+  {
+      Diag->Report(Diag->err_wfv_one_top_level_loop);
+      return false;
+  }
+
   Loop* loop = *mLoopInfo->begin();
   assert (loop);
 

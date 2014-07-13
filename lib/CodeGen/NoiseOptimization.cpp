@@ -77,6 +77,7 @@ namespace noise {
   X( wfv_induction_update_in_header, "Expected induction variable update operation in latch or header block." ) \
   X( wfv_induction_update_no_int_addition, "Vectorization of loop with induction variable update operation that is no integer addition not supported." ) \
   X( wfv_induction_no_simple_increment, "Vectorization of loop with induction variable update operation that is no simple increment not supported." ) \
+  X( wfv_one_top_level_loop, "Expected exactly one top level loop in noise function." ) \
   \
   X( pass_not_found, "The requested pass %0 could not be found." ) \
   X( pass_not_a_function_pass, "The requested pass %0 is not a function pass." )
@@ -97,6 +98,9 @@ NoiseDiagnostics::NoiseDiagnostics()
 #undef DIAG_ELEM
 {}
 
+NoiseDiagnostics::~NoiseDiagnostics()
+{}
+
 size_t NoiseDiagnostics::GetNumErrors() const
 {
   return diag->getClient()->getNumErrors();
@@ -110,7 +114,22 @@ DiagnosticBuilder NoiseDiagnostics::Report(unsigned ID)
 void NoiseDiagnostics::TerminateOnError()
 {
   if (GetNumErrors() > 0)
+  {
+    Module *module = GetModule();
+    if (module)
+    {
+      std::string error;
+      llvm::raw_fd_ostream out("noise_dump.ll", error);
+      if (error.empty())
+        module->print(out, NULL);
+      else
+      {
+        llvm::outs() << "Cannot write output dump: " << error << "\n";
+        module->dump();
+      }
+    }
     exit(1);
+  }
 }
 
 NoiseOptimizationInfo::NoiseOptimizationInfo(NoiseOptimization* Opt)
@@ -178,7 +197,6 @@ private:
 
 static void InitBuiltinPass_OPT(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
 {
-  assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_OPT);
   PassManagerBuilder builder;
   // use 2 instead of 3 in order to avoid the creation of passes which
   // are incompatible with our pass setup
@@ -217,6 +235,10 @@ static void InitBuiltinPass_LOOPFUSION(const NoiseOptimizationInfo &Info, NoiseO
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_LOOPFUSION);
   Opt.Register(createLoopSimplifyPass());
   Opt.Register(createNoiseFusionPass());
+  //Opt.Register(createIndVarSimplifyPass());
+  //Opt.Register(createLoopSimplifyPass());
+  //Opt.Register(createLowerSwitchPass());
+  //InitBuiltinPass_OPT(Info, Opt);
 }
 
 static void InitBuiltinPass_SPECIALIZE(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
@@ -325,7 +347,6 @@ void NoiseOptimizations::RegisterDefaultOpts() {
   Register(createBasicAliasAnalysisPass());
   Register(createCFGSimplificationPass());
   Register(createScalarReplAggregatesPass());
-  Register(createEarlyCSEPass());
 }
 
 void NoiseOptimizations::Populate(PassManagerBase &Manager) {
@@ -333,6 +354,7 @@ void NoiseOptimizations::Populate(PassManagerBase &Manager) {
     outs() << "Running pass: " << (*it)->getPassName() << "\n";
     Manager.add(*it);
   }
+  outs() << "\n";
 }
 
 }

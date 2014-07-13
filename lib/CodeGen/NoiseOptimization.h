@@ -30,6 +30,7 @@ namespace llvm {
   class PassRegistry;
   class Pass;
   class PassManagerBase;
+  class Module;
 
 namespace noise {
 
@@ -64,6 +65,7 @@ namespace noise {
   X( wfv_induction_update_in_header, true) \
   X( wfv_induction_update_no_int_addition, true) \
   X( wfv_induction_no_simple_increment, true) \
+  X( wfv_one_top_level_loop, true) \
   \
   X( pass_not_found, true ) \
   X( pass_not_a_function_pass, true )
@@ -72,10 +74,12 @@ namespace noise {
   class NoiseDiagnostics {
   public:
     NoiseDiagnostics();
+    virtual ~NoiseDiagnostics();
 
     clang::DiagnosticBuilder Report(unsigned ID);
     void TerminateOnError();
     size_t GetNumErrors() const;
+    virtual llvm::Module* GetModule() { return NULL; }
 
   private:
     IntrusiveRefCntPtr<clang::DiagnosticOptions> diagOpts;
