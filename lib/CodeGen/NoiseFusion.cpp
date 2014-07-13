@@ -179,8 +179,8 @@ public:
     PreHeader2->eraseFromParent();
     Header2->eraseFromParent();
 
-    // make new big loop's latch current latch
-    Latch1 = Latch2;
+    // Merge bodies into one
+    MergeBlockIntoPredecessor(BodyStart2, this);
   }
 };
 
