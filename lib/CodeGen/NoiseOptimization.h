@@ -54,6 +54,7 @@ namespace noise {
   X( wfv_multiple_exits, true ) \
   X( wfv_exiting_not_header, true ) \
   X( wfv_cannot_place_reduction_call, true) \
+  X( wfv_cannot_vectorize_type, true) \
   X( wfv_loop_body_does_not_depend_on_induction, true) \
   X( wfv_bad_common_reduction_found, true) \
   X( wfv_not_more_reduction_users_outside_loop, true) \
@@ -66,6 +67,7 @@ namespace noise {
   X( wfv_induction_update_no_int_addition, true) \
   X( wfv_induction_no_simple_increment, true) \
   X( wfv_one_top_level_loop, true) \
+  X( wfv_reduction_in_fused_env, true) \
   \
   X( pass_not_found, true ) \
   X( pass_not_a_function_pass, true )

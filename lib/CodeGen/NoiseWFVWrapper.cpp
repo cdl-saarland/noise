@@ -595,13 +595,7 @@ getCallInsertPosition(const ReductionVariable& redVar,
   }
 
   if (!isPredecessor(earliestPos, latestPos))
-  {
-    errs() << "ERROR: Bad reduction found: There is no valid single position"
-        << " to perform all operations connected to reduction variable:\n"
-        << *redVar.mPhi << "\n";
-    assert (false && "Bad reduction found!");
-    return 0;
-  }
+    return NULL;
 
   return latestPos;
 }
@@ -746,7 +740,7 @@ getCallArgs(ReductionVariable&      redVar,
 // -> no pointers to pointers allowed
 // TODO: i8* should not be transformed to <4 x i8>* !
 Type*
-vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
+vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor, noise::NoiseDiagnostics *Diag)
 {
   if (oldType->isFloatingPointTy() || oldType->isIntegerTy())
   {
@@ -758,13 +752,13 @@ vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
   case Type::PointerTyID:
     {
       PointerType* pType = cast<PointerType>(oldType);
-      return PointerType::get(vectorizeSIMDType(pType->getElementType(), vectorizationFactor),
+      return PointerType::get(vectorizeSIMDType(pType->getElementType(), vectorizationFactor, Diag),
                               pType->getAddressSpace());
     }
   case Type::ArrayTyID:
     {
       ArrayType* aType = cast<ArrayType>(oldType);
-      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), vectorizationFactor),
+      return ArrayType::get(vectorizeSIMDType(aType->getElementType(), vectorizationFactor, Diag),
                             aType->getNumElements());
     }
   case Type::StructTyID:
@@ -773,16 +767,18 @@ vectorizeSIMDType(Type* oldType, const unsigned vectorizationFactor)
       std::vector<Type*> newParams;
       for (unsigned i=0; i<sType->getNumContainedTypes(); ++i)
       {
-        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), vectorizationFactor));
+        newParams.push_back(vectorizeSIMDType(sType->getElementType(i), vectorizationFactor, Diag));
       }
       return StructType::get(oldType->getContext(), newParams, sType->isPacked());
     }
 
   default:
     {
-      errs() << "\nERROR: only arguments of type float, int, pointer, "
-        << "array or struct can be vectorized, not '"
-        << *oldType << "'!\n";
+      std::string type_name;
+      llvm::raw_string_ostream out(type_name);
+      oldType->print(out);
+      Diag->Report(Diag->err_wfv_cannot_vectorize_type).AddString(type_name);
+      Diag->TerminateOnError();
       return 0;
     }
   }
@@ -888,10 +884,11 @@ replaceUpdateOpUses(Value*              mappedOp,
 //   - One output parameter per "update operation" that has at least one "result user".
 // TODO: It would be beneficial to have WFV vectorization analysis info here.
 void
-generateSIMDReductionFunction(ReductionVariable&   redVar,
-                              const unsigned       vectorizationFactor,
-                              Function*            loopBodyFn,
-                              const RedVarVecType& redVars)
+generateSIMDReductionFunction(ReductionVariable       &redVar,
+                              const unsigned          vectorizationFactor,
+                              Function*               loopBodyFn,
+                              const RedVarVecType     &redVars,
+                              noise::NoiseDiagnostics *Diag)
 {
   Type* type = redVar.mPhi->getType();
   LLVMContext& context = type->getContext();
@@ -915,7 +912,7 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
          E2=otherOperands.end(); it2!=E2; ++it2)
     {
       Value* operand = *it2;
-      Type* simdType = vectorizeSIMDType(operand->getType(), vectorizationFactor);
+      Type* simdType = vectorizeSIMDType(operand->getType(), vectorizationFactor, Diag);
       params.push_back(simdType);
       names.push_back(operand->hasName() ? operand->getName() : "otherOp");
       values.push_back(operand);
@@ -934,14 +931,14 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
     const ReductionUpdate& redUp = *it->second;
     if (redUp.mResultUsers->empty()) continue;
     Type* updateType = redUp.mOperation->getType();
-    Type* simdType = vectorizeSIMDType(updateType, vectorizationFactor);
+    Type* simdType = vectorizeSIMDType(updateType, vectorizationFactor, Diag);
     params.push_back(PointerType::getUnqual(simdType));
     names.push_back("update.result.ptr");
     values.push_back(NULL);
   }
 
   // Add dummy mask parameter (unused, only required for WFV to prevent splitting).
-  Type* maskTy = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor);
+  Type* maskTy = vectorizeSIMDType(Type::getInt1Ty(context), vectorizationFactor, Diag);
   params.push_back(maskTy);
   names.push_back("");
   values.push_back(NULL); // No value required.
@@ -1212,7 +1209,7 @@ generateSIMDReductionFunction(ReductionVariable&   redVar,
         const ReductionUpdate& redUp = *it->second;
         if (redUp.mResultUsers->empty()) continue;
         Type* updateType = redUp.mOperation->getType();
-        Type* vecType = vectorizeSIMDType(updateType, vectorizationFactor);
+        Type* vecType = vectorizeSIMDType(updateType, vectorizationFactor, Diag);
         // Create alloca.
         Instruction* allocaInsertPos = simdRedFn->getEntryBlock().getFirstNonPHI();
         AllocaInst* alloca = new AllocaInst(vecType,
@@ -1848,6 +1845,11 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
   {
     ReductionVariable& redVar = **it;
     Value* backEdgeVal = redVar.mPhi->getIncomingValueForBlock(loop->getLoopLatch());
+    if (!isa<LoadInst>(backEdgeVal))
+    {
+      Diag->Report(Diag->err_wfv_reduction_in_fused_env);
+      return false;
+    }
     assert (isa<LoadInst>(backEdgeVal));
     redVar.mBackEdgeVal = cast<Instruction>(backEdgeVal);
   }
@@ -1934,7 +1936,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     ReductionVariable& redVar = **it;
     if (redVar.mCanOptimizeWithVector) continue;
 
-    generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn, redVars);
+    generateSIMDReductionFunction(redVar, mVectorizationFactor, loopBodyFn, redVars, Diag);
     DEBUG_NOISE_WFV( outs() << "reduction var phi: " << *redVar.mPhi << "\n"; );
     DEBUG_NOISE_WFV( outs() << "  SIMD reduction function: " << *redVar.mReductionFnSIMD << "\n"; );
     assert (!verifyFunction(*redVar.mReductionFnSIMD));
@@ -2079,7 +2081,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     if (requiresVectorType)
     {
       assert (argOp != indVarPhi);
-      newParamTypes.push_back(vectorizeSIMDType(type, mVectorizationFactor));
+      newParamTypes.push_back(vectorizeSIMDType(type, mVectorizationFactor, Diag));
       continue;
     }
 
@@ -2234,7 +2236,7 @@ NoiseWFVWrapper::runWFV(Function* noiseFn)
     LLVMContext& context = redVar.mPhi->getContext();
 
     Type* oldType = redVar.mPhi->getType();
-    Type* newType = vectorizeSIMDType(oldType, mVectorizationFactor);
+    Type* newType = vectorizeSIMDType(oldType, mVectorizationFactor, Diag);
 
     // Mutate type of phi
     redVar.mPhi->mutateType(newType);

@@ -65,7 +65,9 @@ namespace noise {
   X( wfv_non_simplified_loops, "Vectorization of non-simplified loop not supported." ) \
   X( wfv_multiple_exits, "Vectorization of loop with multiple exits not supported." ) \
   X( wfv_exiting_not_header, "Expected exiting block to be the loop header." ) \
-  X( wfv_cannot_place_reduction_call, "Placing of reduction call is impossible for variable %0." ) \
+  X( wfv_cannot_place_reduction_call, "Placing of reduction call is impossible for variable %0.\n" \
+                                      "There are multiple update locations." ) \
+  X( wfv_cannot_vectorize_type, "Cannot vectorize type '%0'." ) \
   X( wfv_loop_body_does_not_depend_on_induction, "Loop body seems to be independent of induction variable." ) \
   X( wfv_bad_common_reduction_found, "Bad common reduction operation found. Should be a simple operation (+, *)." ) \
   X( wfv_not_more_reduction_users_outside_loop, "Must not have more than one reduction user outside the loop." )\
@@ -78,6 +80,8 @@ namespace noise {
   X( wfv_induction_update_no_int_addition, "Vectorization of loop with induction variable update operation that is no integer addition not supported." ) \
   X( wfv_induction_no_simple_increment, "Vectorization of loop with induction variable update operation that is no simple increment not supported." ) \
   X( wfv_one_top_level_loop, "Expected exactly one top level loop in noise function." ) \
+  X( wfv_reduction_in_fused_env , "Found reduction in a fused environment which is not supported currently.\n" \
+                                  "This can be caused by multiple fused loops with different reduction behavior." ) \
   \
   X( pass_not_found, "The requested pass %0 could not be found." ) \
   X( pass_not_a_function_pass, "The requested pass %0 is not a function pass." )
@@ -235,10 +239,8 @@ static void InitBuiltinPass_LOOPFUSION(const NoiseOptimizationInfo &Info, NoiseO
   assert(Info.GetType() == NOISE_OPTIMIZATION_TYPE_LOOPFUSION);
   Opt.Register(createLoopSimplifyPass());
   Opt.Register(createNoiseFusionPass());
-  //Opt.Register(createIndVarSimplifyPass());
-  //Opt.Register(createLoopSimplifyPass());
-  //Opt.Register(createLowerSwitchPass());
-  //InitBuiltinPass_OPT(Info, Opt);
+  Opt.Register(createIndVarSimplifyPass());
+  Opt.Register(createLoopSimplifyPass());
 }
 
 static void InitBuiltinPass_SPECIALIZE(const NoiseOptimizationInfo &Info, NoiseOptimizations &Opt)
