@@ -57,8 +57,9 @@ static void moveTo(BasicBlock *From, BasicBlock *To) {
     Is.push_back(i);
   }
 
-  for (size_t i = 0, e = Is.size(); i != e; ++i)
-    Is[i]->moveBefore(early ? To->getFirstNonPHI() : To->getTerminator());
+  for (std::vector<Instruction*>::reverse_iterator it = Is.rbegin(), e = Is.rend();
+    it != e; ++it)
+    (*it)->moveBefore(early ? To->getFirstNonPHI() : To->getTerminator());
 }
 
 
