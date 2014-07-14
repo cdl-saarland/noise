@@ -37,14 +37,20 @@ namespace noise {
 
 using namespace CodeGen;
 
-NoiseCodeGenerator::NoiseCodeGenerator(CodeGen::CodeGenFunction *generator)
-  : Generator(generator)
-  , AttrParser(generator->getLLVMContext())
+NoiseCodeGenerator::NoiseCodeGenerator(CodeGen::CodeGenFunction *Generator)
+  : Generator(Generator)
+  , AttrParser(Generator->getLLVMContext(), Generator->CGM)
 {
 }
 
 NoiseCodeGenerator::~NoiseCodeGenerator()
 {
+}
+
+void NoiseCodeGenerator::EmitError(const SourceLocation &location, const std::string &error)
+{
+  Generator->CGM.Error(location, error);
+  exit(1);
 }
 
 bool NoiseCodeGenerator::RegisterFunction(const Decl *D, llvm::Function *Fn, const CGFunctionInfo &FnInfo,
@@ -72,10 +78,10 @@ llvm::MDNode* NoiseCodeGenerator::RegisterStmt(const AttributedStmt &S)
   // try to detect noise attributes
   for(ArrayRef<const Attr*>::const_iterator it = attrs.begin(), e = attrs.end();
       it != e; ++it) {
-    if (!isa<NoiseAttr>(*it)) continue;
-    if (noiseAttr) {
-      assert (false && "must not insert more than one noise attribute per statement");
-    }
+    if (!isa<NoiseAttr>(*it))
+      continue;
+    if (noiseAttr)
+      EmitError(S.getLocStart(), "Must not insert more than one noise attribute.");
     noiseAttr = cast<NoiseAttr>(*it);
   }
   assert( noiseAttr && "noiseAttr must be set here" );
@@ -85,9 +91,9 @@ llvm::MDNode* NoiseCodeGenerator::RegisterStmt(const AttributedStmt &S)
 
 void NoiseCodeGenerator::EmitStmt(llvm::MDNode* NoiseDesc, const Stmt &S)
 {
-  assert( (S.getStmtClass() == Stmt::CompoundStmtClass ||
-           S.getStmtClass() == Stmt::ForStmtClass) &&
-          "trying to noise not supported stmt" );
+
+  if (S.getStmtClass() != Stmt::CompoundStmtClass && S.getStmtClass() != Stmt::ForStmtClass)
+    EmitError(S.getLocStart(), "Trying to noise unsupported statement.");
 
   CGBuilderTy& Builder = GetBuilder();
   llvm::LLVMContext& Context = GetModule().getContext();

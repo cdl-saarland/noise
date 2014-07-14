@@ -55,7 +55,7 @@ namespace noise {
 
   class NoiseOptimizer : public NoiseDiagnostics {
   public:
-    NoiseOptimizer(Module *M);
+    NoiseOptimizer(Module *M, clang::DiagnosticsEngine &Diag);
     virtual ~NoiseOptimizer();
 
     void PerformOptimization();

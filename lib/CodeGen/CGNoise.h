@@ -23,7 +23,7 @@ namespace noise {
 
 class NoiseCodeGenerator {
 public:
-  NoiseCodeGenerator(CodeGen::CodeGenFunction *generator);
+  NoiseCodeGenerator(CodeGen::CodeGenFunction *Generator);
   ~NoiseCodeGenerator();
 
   // Registering phase
@@ -43,6 +43,8 @@ public:
   CodeGen::CGBuilderTy& GetBuilder() { return Generator->Builder; }
 
 private:
+  void EmitError(const SourceLocation &location, const std::string &error);
+
   CodeGen::CodeGenFunction *Generator;
   llvm::noise::NoiseAttrParser AttrParser;
 };

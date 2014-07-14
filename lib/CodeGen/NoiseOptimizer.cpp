@@ -271,8 +271,9 @@ size_t NoiseFnInfo::GetNumOptimizations() const {
 
 // Noise Optimizer
 
-NoiseOptimizer::NoiseOptimizer(llvm::Module *M)
-  : Mod(M)
+NoiseOptimizer::NoiseOptimizer(llvm::Module *M, clang::DiagnosticsEngine &Diag)
+  : NoiseDiagnostics(Diag)
+  , Mod(M)
   , NoiseMod(new Module("noiseMod", Mod->getContext()))
   , Registry(PassRegistry::getPassRegistry())
   , MD(Mod->getOrInsertNamedMetadata("noise"))
@@ -402,7 +403,7 @@ void createDummyVarNameCalls(Module*            module,
       for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
       {
         NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
-        NoiseOptimizationInfo info(noiseOpt);
+        NoiseOptimizationInfo info(noiseOpt, Diag);
         if (info.GetType() != NOISE_OPTIMIZATION_TYPE_SPECIALIZE)
           continue;
         StringRef passArg = info.GetArgAsString(0);
@@ -421,7 +422,7 @@ void createDummyVarNameCalls(Module*            module,
       for (unsigned i=0, e=noiseDescStrs->getNumOperands(); i<e; ++i)
       {
         NoiseOptimization* noiseOpt = cast<MDNode>(noiseDescStrs->getOperand(i));
-        NoiseOptimizationInfo info(noiseOpt);
+        NoiseOptimizationInfo info(noiseOpt, Diag);
         if (info.GetType() != NOISE_OPTIMIZATION_TYPE_SPECIALIZE)
           continue;
         specializeVarNames.insert(info.GetArgAsString(0).str());

@@ -36,7 +36,12 @@ namespace noise {
 
 #define NOISEDIAG_TYPES(X) \
   X( invalid_opt, true ) \
+  X( invalid_noise_annotation, true ) \
   X( invalid_nested_return, true ) \
+  \
+  X( pass_expected_arg, true ) \
+  X( pass_expected_arg_of_int, true ) \
+  X( pass_expected_arg_of_string, true ) \
   \
   X( specialize_multiple_var_with_same_name, true ) \
   X( specialize_no_use_of_specialized_var, true ) \
@@ -68,6 +73,7 @@ namespace noise {
   X( wfv_induction_no_simple_increment, true) \
   X( wfv_one_top_level_loop, true) \
   X( wfv_reduction_in_fused_env, true) \
+  X( wfv_invalid_vectorization_length, true) \
   \
   X( pass_not_found, true ) \
   X( pass_not_a_function_pass, true )
@@ -75,7 +81,7 @@ namespace noise {
   // Special noise diagnostics
   class NoiseDiagnostics {
   public:
-    NoiseDiagnostics();
+    NoiseDiagnostics(clang::DiagnosticsEngine &Diag);
     virtual ~NoiseDiagnostics();
 
     clang::DiagnosticBuilder Report(unsigned ID);
@@ -84,8 +90,7 @@ namespace noise {
     virtual llvm::Module* GetModule() { return NULL; }
 
   private:
-    IntrusiveRefCntPtr<clang::DiagnosticOptions> diagOpts;
-    IntrusiveRefCntPtr<clang::DiagnosticsEngine> diag;
+    clang::DiagnosticsEngine &Diag;
 
   public:
 #define DIAG_ELEM(Type, IsError) \
@@ -127,7 +132,7 @@ namespace noise {
 
   class NoiseOptimizationInfo {
   public:
-    NoiseOptimizationInfo(NoiseOptimization *Opt);
+    NoiseOptimizationInfo(NoiseOptimization *Opt, NoiseDiagnostics &Diag);
 
     NoiseOptimizationType GetType() const { return type; }
 
@@ -139,12 +144,9 @@ namespace noise {
     int GetArgAsInt(size_t i) const;
     StringRef GetArgAsString(size_t i) const;
 
-    Value* operator[](size_t i) const {
-        return GetArg(i);
-    }
-
   private:
     NoiseOptimization *opt;
+    NoiseDiagnostics &Diag;
     NoiseOptimizationType type;
   };
 

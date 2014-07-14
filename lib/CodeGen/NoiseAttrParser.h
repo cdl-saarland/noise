@@ -15,7 +15,10 @@
 #define CLANG_CODEGEN_NOISEATTRPARSER_H
 
 namespace clang {
-    class NoiseAttr;
+  class NoiseAttr;
+  namespace CodeGen {
+    class CodeGenModule;
+  }
 }
 
 namespace llvm {
@@ -24,6 +27,8 @@ namespace llvm {
   class MDNode;
 
 namespace noise {
+
+  class NoiseDiagnostics;
 
   /*
    MDNode from the Parse method contains:
@@ -35,13 +40,14 @@ namespace noise {
 
   class NoiseAttrParser {
   public:
-    NoiseAttrParser(LLVMContext& C);
+    NoiseAttrParser(LLVMContext &C, clang::CodeGen::CodeGenModule &CGM);
     ~NoiseAttrParser();
 
-    MDNode* Parse(const clang::NoiseAttr& attr);
+    MDNode* Parse(const clang::NoiseAttr &attr);
 
   private:
-    LLVMContext& C;
+    LLVMContext &C;
+    clang::CodeGen::CodeGenModule &CGM;
   };
 
 }  // end namespace noise

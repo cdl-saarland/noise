@@ -47,8 +47,13 @@ namespace noise {
 // TODO: move theses messages to tablegen files from clang
 
 #define NOISEDIAG_MSGS(X) \
-  X( invalid_opt,           "Invalid noise optimization " ) \
-  X( invalid_nested_return, "Marked compound statements must not contain return statements." ) \
+  X( invalid_opt,              "Invalid noise optimization " ) \
+  X( invalid_noise_annotation, "Invalid noise annotation string '%0'." ) \
+  X( invalid_nested_return,    "Marked compound statements must not contain return statements." ) \
+  \
+  X( pass_expected_arg, "Expected argument for pass '%0'." ) \
+  X( pass_expected_arg_of_int, "Expected argument of type int for pass '%0'." ) \
+  X( pass_expected_arg_of_string, "Expected argument of type string for pass '%0'." ) \
   \
   X( specialize_multiple_var_with_same_name, "Specialization of multiple variables of same name (%0) not supported." ) \
   X( specialize_no_use_of_specialized_var, "Cannot find unique use of specialized variable %0." ) \
@@ -80,8 +85,9 @@ namespace noise {
   X( wfv_induction_update_no_int_addition, "Vectorization of loop with induction variable update operation that is no integer addition not supported." ) \
   X( wfv_induction_no_simple_increment, "Vectorization of loop with induction variable update operation that is no simple increment not supported." ) \
   X( wfv_one_top_level_loop, "Expected exactly one top level loop in noise function." ) \
-  X( wfv_reduction_in_fused_env , "Found reduction in a fused environment which is not supported currently.\n" \
+  X( wfv_reduction_in_fused_env , "Found reduction in a fused environment which is not supported currently." \
                                   "This can be caused by multiple fused loops with different reduction behavior." ) \
+  X( wfv_invalid_vectorization_length, "Invalid vectorization length; must be 4, 8 or 16.") \
   \
   X( pass_not_found, "The requested pass %0 could not be found." ) \
   X( pass_not_a_function_pass, "The requested pass %0 is not a function pass." )
@@ -91,12 +97,10 @@ static const char *msg_ ## Type = M;
   NOISEDIAG_MSGS(DIAG_MSG)
 #undef DIAG_MSG
 
-NoiseDiagnostics::NoiseDiagnostics()
-  : diagOpts(new DiagnosticOptions)
-  , diag(new DiagnosticsEngine(IntrusiveRefCntPtr<DiagnosticIDs>(new DiagnosticIDs), &*diagOpts,
-    new TextDiagnosticPrinter(llvm::errs(), &*diagOpts)))
+NoiseDiagnostics::NoiseDiagnostics(DiagnosticsEngine &Diag)
+  : Diag(Diag)
 #define DIAG_ELEM(Type, IsError) \
-  , err_ ## Type(diag->getCustomDiagID(IsError ? DiagnosticsEngine::Error : DiagnosticsEngine::Warning, \
+  , err_ ## Type(Diag.getCustomDiagID(IsError ? DiagnosticsEngine::Error : DiagnosticsEngine::Warning, \
                  std::string(msg_ ## Type)))
     NOISEDIAG_TYPES(DIAG_ELEM)
 #undef DIAG_ELEM
@@ -107,12 +111,12 @@ NoiseDiagnostics::~NoiseDiagnostics()
 
 size_t NoiseDiagnostics::GetNumErrors() const
 {
-  return diag->getClient()->getNumErrors();
+  return Diag.getClient()->getNumErrors();
 }
 
 DiagnosticBuilder NoiseDiagnostics::Report(unsigned ID)
 {
-  return diag->Report(ID);
+  return Diag.Report(ID);
 }
 
 void NoiseDiagnostics::TerminateOnError()
@@ -136,8 +140,9 @@ void NoiseDiagnostics::TerminateOnError()
   }
 }
 
-NoiseOptimizationInfo::NoiseOptimizationInfo(NoiseOptimization* Opt)
+NoiseOptimizationInfo::NoiseOptimizationInfo(NoiseOptimization* Opt, NoiseDiagnostics &Diag)
   : opt(Opt)
+  , Diag(Diag)
   , type(NOISE_OPTIMIZATION_TYPE_LLVMPASS)
 {
 #define TYPE_ELEM(Type, Name) \
@@ -160,6 +165,11 @@ size_t NoiseOptimizationInfo::GetNumArgs() const
 
 Value* NoiseOptimizationInfo::GetArg(size_t i) const
 {
+  if (!HasArg(i))
+  {
+    Diag.Report(Diag.err_pass_expected_arg).AddString(GetPassName());
+    return NULL;
+  }
   return opt->getOperand(i + 1U);
 }
 
@@ -170,12 +180,20 @@ bool NoiseOptimizationInfo::HasArg(size_t i) const
 
 int NoiseOptimizationInfo::GetArgAsInt(size_t i) const
 {
-  return cast<ConstantInt>(GetArg(i))->getSExtValue();
+  Value *arg = GetArg(i);
+  if (!isa<ConstantInt>(arg))
+    Diag.Report(Diag.err_pass_expected_arg_of_int).AddString(GetPassName());
+  Diag.TerminateOnError();
+  return cast<ConstantInt>(arg)->getSExtValue();
 }
 
 StringRef NoiseOptimizationInfo::GetArgAsString(size_t i) const
 {
-  return cast<MDString>(GetArg(i))->getString();
+  Value *arg = GetArg(i);
+  if (!isa<MDString>(arg))
+    Diag.Report(Diag.err_pass_expected_arg_of_string).AddString(GetPassName());
+  Diag.TerminateOnError();
+  return cast<MDString>(arg)->getString();
 }
 
 NoiseOptimization* NoiseOptimizations::CreateOptimization(LLVMContext &C, ArrayRef<Value*> Values)
@@ -278,16 +296,26 @@ static void InitBuiltinPass_VECTORIZE(const NoiseOptimizationInfo &Info, NoiseOp
 
   // WFV may receive argument to specify vectorization width, whether to
   // use AVX and whether to use the divergence analysis.
-  // "wfv-vectorize"          -> width 4, do not use avx, use divergence analysis (default)
-  // "wfv-vectorize (4,0,1)"  -> width 4, do not use avx, use divergence analysis (default)
-  // "wfv-vectorize (8,1,1)"  -> width 8, use avx, use divergence analysis
-  // "wfv-vectorize (8,1)"    -> width 8, use avx, use divergence analysis
-  // "wfv-vectorize (16,0,0)" -> width 16, do not use avx, do not use divergence analysis
+  // "wfv"        -> width 4, do not use avx
+  // "wfv (4,0)"  -> width 4, do not use avx
+  // "wfv (8,1)"  -> width 8, use avx
+  // "wfv (8,1)"  -> width 8, use avx
+  // "wfv (16,0)" -> width 16, do not use avx
   unsigned vectorizationWidth = Info.HasArg(0U) ? (unsigned)Info.GetArgAsInt(0U) : 4U;
+  switch (vectorizationWidth)
+  {
+  // Check explicit for supported vector lenghts
+  case 4:
+  case 8:
+  case 16:
+  case 32:
+    break;
+  default:
+    Opt.GetDiag().Report(Opt.GetDiag().err_wfv_invalid_vectorization_length);
+    return;
+  }
   bool useAVX = Info.HasArg(1U) && Info.GetArgAsInt(1U);
   const bool verbose = false;
-
-  // Add WFV pass wrapper.
   Opt.Register(createNoiseWFVPass(vectorizationWidth, useAVX, verbose, &Opt.GetDiag()));
 #endif
 }
@@ -324,7 +352,7 @@ NoiseOptimizations::NoiseOptimizations(PassRegistry &Registry, NoiseDiagnostics 
 {}
 
 void NoiseOptimizations::Register(NoiseOptimization *Opt) {
-  const NoiseOptimizationInfo info(Opt);
+  const NoiseOptimizationInfo info(Opt, diag);
   switch (info.GetType()) {
   case NOISE_OPTIMIZATION_TYPE_LLVMPASS:
     InitBuiltinPass_LLVMPASS(info, *this);

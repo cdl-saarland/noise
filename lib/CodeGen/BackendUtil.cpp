@@ -126,7 +126,7 @@ public:
     : Diags(_Diags), CodeGenOpts(CGOpts), TargetOpts(TOpts), LangOpts(LOpts),
       TheModule(M), CodeGenerationTime("Code Generation Time"),
       CodeGenPasses(0), PerModulePasses(0), PerFunctionPasses(0),
-      Noiser(M) {}
+      Noiser(M, _Diags) {}
 
   ~EmitAssemblyHelper() {
     delete CodeGenPasses;

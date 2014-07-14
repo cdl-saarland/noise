@@ -13,6 +13,8 @@
 
 #include "NoiseAttrParser.h"
 #include "clang/AST/Attr.h" // NoiseAttr
+#include "CodeGenFunction.h"
+#include "CodeGenModule.h"
 #include "NoiseOptimization.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Constants.h"
@@ -22,17 +24,17 @@
 namespace llvm {
 namespace noise {
 
-NoiseAttrParser::NoiseAttrParser(LLVMContext& C)
+NoiseAttrParser::NoiseAttrParser(LLVMContext &C, clang::CodeGen::CodeGenModule &CGM)
   : C(C)
-{
-}
+  , CGM(CGM)
+{ }
 
 NoiseAttrParser::~NoiseAttrParser()
 { }
 
 typedef SmallVector<Value*, 8> NoiseOptimizationVec;
 
-MDNode* NoiseAttrParser::Parse(const clang::NoiseAttr& attr)
+MDNode* NoiseAttrParser::Parse(const clang::NoiseAttr &attr)
 {
   NoiseOptimizationVec noiseOpts;
   StringRef str = attr.getOpt();
@@ -97,8 +99,11 @@ MDNode* NoiseAttrParser::Parse(const clang::NoiseAttr& attr)
         }
         // jump over additional whitespaces: b   )
         nextIndex = str.find_first_not_of(' ', nextIndex);
-        if(str[nextIndex++] != ')')
-          errs() << "unterminated argument list: " << str << "\n";
+        if(nextIndex == StringRef::npos || str[nextIndex++] != ')')
+        {
+            CGM.Error(clang::SourceLocation(), "Unterminated noise description string.");
+            break;
+        }
       }
 
     }
